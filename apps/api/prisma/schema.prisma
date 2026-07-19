@@ -1,0 +1,563 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// Single-operator product: console sessions are SUPER_ADMIN only.
+enum UserRole {
+  SUPER_ADMIN
+}
+
+enum CdnProvider {
+  LOCAL
+  QINIU
+  UPYUN
+  ALIYUN
+  S3
+}
+
+enum FileCategory {
+  IMAGE
+  DOCUMENT
+  VIDEO
+  AUDIO
+  ARCHIVE
+  CODE
+  OTHER
+}
+
+enum FileStatus {
+  ACTIVE
+  RECYCLED
+  DELETED
+  QUARANTINED
+}
+
+enum ScanStatus {
+  SKIPPED
+  PENDING
+  CLEAN
+  INFECTED
+  ERROR
+}
+
+enum DerivativeKind {
+  THUMB
+  WEBP
+  MP4_720
+  HLS
+  COVER
+}
+
+enum DerivativeStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+enum AuditAction {
+  LOGIN
+  USER_CREATE
+  USER_UPDATE
+  USER_DISABLE
+  USER_PASSWORD_CHANGE
+  USER_2FA_ENABLE
+  USER_2FA_DISABLE
+  PROJECT_CREATE
+  PROJECT_UPDATE
+  PROJECT_DELETE
+  PROJECT_MEMBER_ADD
+  PROJECT_MEMBER_UPDATE
+  PROJECT_MEMBER_REMOVE
+  PROJECT_SECRET_RESET
+  PROJECT_SECRET_CREATE
+  PROJECT_SECRET_DISABLE
+  PROJECT_EXPORT
+  PROJECT_IMPORT
+  CDN_CREATE
+  CDN_UPDATE
+  CDN_ACTIVATE
+  CDN_DELETE
+  CDN_HEALTH_CHECK
+  FILE_UPLOAD
+  FILE_DOWNLOAD
+  FILE_UPDATE
+  FILE_DELETE
+  FILE_RESTORE
+  FILE_PURGE
+  FILE_MOVE
+  FILE_COPY
+  FILE_BATCH_DELETE
+  FILE_BATCH_RESTORE
+  FILE_BATCH_PURGE
+  FILE_BATCH_MOVE
+  FILE_BATCH_COPY
+  FILE_SHARE_CREATE
+  FILE_SHARE_UPDATE
+  FILE_SHARE_DELETE
+  FILE_SHARE_DOWNLOAD
+  FILE_SCAN
+  FILE_QUARANTINE
+  FILE_PUBLISH
+  FILE_UNPUBLISH
+  SETTING_UPDATE
+  AUDIT_LOG_CLEANUP
+  TASK_CREATE
+  TASK_UPDATE
+  TASK_CANCEL
+  TASK_RETRY
+  TASK_DELETE
+  SYSTEM_HEALTH_CHECK
+  NOTIFY_TEST
+  NOTIFY_SEND
+  UPLOAD_CREDENTIAL_CREATE
+  UPLOAD_CREDENTIAL_REVOKE
+  WEBHOOK_DELIVERY
+  WEBHOOK_CREATE
+  WEBHOOK_UPDATE
+  WEBHOOK_DELETE
+  FOLDER_PUBLIC_SET
+  FOLDER_PUBLIC_UNSET
+  FOLDER_BATCH_PUBLISH
+  FILE_VERSION_CREATE
+  FILE_VERSION_RESTORE
+  STORAGE_MIGRATE
+  SESSION_REVOKE
+  LIFECYCLE_RUN
+  FOLDER_SHARE_CREATE
+  FOLDER_SHARE_UPDATE
+  FOLDER_SHARE_DELETE
+  FOLDER_SHARE_DOWNLOAD
+  NOTIFICATION_READ
+  AUDIT_EXPORT
+  FILE_QUARANTINE_RELEASE
+}
+
+model User {
+  id                 String             @id @default(cuid())
+  username           String             @unique @db.VarChar(64)
+  displayName        String             @db.VarChar(64)
+  passwordHash       String             @db.VarChar(255)
+  role               UserRole           @default(SUPER_ADMIN)
+  enabled            Boolean            @default(true)
+  mustChangePassword Boolean            @default(false)
+  totpSecret         String?            @db.VarChar(512)
+  totpEnabled        Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  uploaded           ManagedFile[]      @relation("UploadedFiles")
+  auditLogs          AuditLog[]
+  refreshTokens      RefreshToken[]
+  uploadCreds        UploadCredential[] @relation("UploadCredentialCreator")
+  notifications      Notification[]
+
+  @@index([role, enabled])
+}
+
+model Project {
+  id                   String             @id @default(cuid())
+  name                 String             @db.VarChar(128)
+  description          String?            @db.VarChar(512)
+  appId                String             @unique @db.VarChar(48)
+  appSecretHash        String             @db.VarChar(255)
+  appSecretVault       String             @db.Text
+  activeCdnConfigId    String?
+  allowedDomains       Json?
+  enabled              Boolean            @default(true)
+  notifyEnabled        Boolean            @default(true)
+  publicLibraryEnabled Boolean            @default(false)
+  publicLibrarySlug    String?            @unique @db.VarChar(64)
+  quotaBytes           BigInt?
+  quotaFiles           Int?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  deletedAt            DateTime?
+  cdnConfigs           CdnConfig[]        @relation("LegacyProjectCdnConfigs")
+  activeCdnConfig      CdnConfig?         @relation("ProjectActiveStorageConfig", fields: [activeCdnConfigId], references: [id], onDelete: SetNull)
+  files                ManagedFile[]
+  auditLogs            AuditLog[]
+  apiSecrets           ProjectSecret[]
+  tasks                Task[]
+  uploadCredentials    UploadCredential[]
+  outboundWebhooks     OutboundWebhook[]
+  folderPublicPolicies FolderPublicPolicy[]
+  lifecyclePolicies    LifecyclePolicy[]
+  folderShareLinks     FolderShareLink[]
+
+  @@index([name])
+  @@index([activeCdnConfigId])
+  @@index([publicLibraryEnabled, publicLibrarySlug])
+}
+
+model CdnConfig {
+  id             String        @id @default(cuid())
+  projectId      String?
+  provider       CdnProvider
+  name           String        @db.VarChar(128)
+  config         Json
+  active         Boolean       @default(false)
+  enabled        Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  project        Project?      @relation("LegacyProjectCdnConfigs", fields: [projectId], references: [id], onDelete: SetNull)
+  activeProjects Project[]     @relation("ProjectActiveStorageConfig")
+  files          ManagedFile[]
+
+  @@index([projectId, active])
+  @@index([enabled, provider])
+}
+
+model ManagedFile {
+  id            String           @id @default(cuid())
+  projectId     String
+  cdnConfigId   String?
+  originalName  String           @db.VarChar(255)
+  storageKey    String           @db.VarChar(512)
+  mimeType      String           @db.VarChar(128)
+  extension     String           @db.VarChar(32)
+  size          BigInt
+  category      FileCategory
+  status        FileStatus       @default(ACTIVE)
+  scanStatus    ScanStatus       @default(SKIPPED)
+  scanDetail    String?          @db.VarChar(512)
+  scannedAt     DateTime?
+  isPublic      Boolean          @default(false)
+  indexedAt     DateTime?
+  contentText   String?          @db.LongText
+  checksum      String?          @db.VarChar(128)
+  publicUrl     String?          @db.VarChar(1024)
+  remark        String?          @db.VarChar(512)
+  tags          String?          @db.VarChar(512)
+  folderPath    String?          @db.VarChar(512)
+  thumbnailUrl   String?          @db.VarChar(1024)
+  duplicateOfId  String?
+  uploadedById   String?
+  currentVersion Int              @default(1)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  deletedAt      DateTime?
+  purgeAt        DateTime?
+  project        Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cdnConfig      CdnConfig?       @relation(fields: [cdnConfigId], references: [id], onDelete: SetNull)
+  uploadedBy     User?            @relation("UploadedFiles", fields: [uploadedById], references: [id], onDelete: SetNull)
+  shareLinks     ShareLink[]
+  derivatives    FileDerivative[]
+  versions       FileVersion[]
+
+  @@index([projectId, status, category])
+  @@index([projectId, status, folderPath])
+  @@index([projectId, checksum])
+  @@index([projectId, isPublic, status])
+  @@index([projectId, scanStatus])
+  @@index([duplicateOfId])
+  @@index([originalName])
+}
+
+model FileDerivative {
+  id         String           @id @default(cuid())
+  fileId     String
+  kind       DerivativeKind
+  storageKey String           @db.VarChar(512)
+  mimeType   String           @db.VarChar(128)
+  size       BigInt           @default(0)
+  status     DerivativeStatus @default(PENDING)
+  publicUrl  String?          @db.VarChar(1024)
+  meta       Json?
+  error      String?          @db.VarChar(512)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+  file       ManagedFile      @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([fileId, kind])
+  @@index([status, createdAt])
+}
+
+model ShareLink {
+  id            String      @id @default(cuid())
+  fileId        String
+  token         String      @unique @db.VarChar(64)
+  /// Optional pretty public path suffix, e.g. "docs/readme". Unique across all shares.
+  customPath    String?     @unique @db.VarChar(200)
+  passwordHash  String?     @db.VarChar(255)
+  expiresAt     DateTime?
+  maxDownloads  Int?
+  downloadCount Int         @default(0)
+  enabled       Boolean     @default(true)
+  previewOnly   Boolean     @default(false)
+  allowedIps    Json?
+  watermarkText String?     @db.VarChar(128)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  file          ManagedFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@index([fileId, enabled])
+  @@index([expiresAt])
+}
+
+model ProjectSecret {
+  id          String    @id @default(cuid())
+  projectId   String
+  name        String    @db.VarChar(128)
+  secretHash  String    @db.VarChar(255)
+  secretVault String    @db.Text
+  enabled     Boolean   @default(true)
+  lastUsedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, enabled])
+}
+
+model UploadCredential {
+  id          String    @id @default(cuid())
+  projectId   String
+  name        String    @db.VarChar(128)
+  tokenHash   String    @unique @db.VarChar(128)
+  tokenPrefix String    @db.VarChar(16)
+  scope       Json
+  maxBytes    BigInt?
+  usedBytes   BigInt    @default(0)
+  maxFiles    Int?
+  usedFiles   Int       @default(0)
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy   User?     @relation("UploadCredentialCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([projectId, expiresAt])
+  @@index([revokedAt, expiresAt])
+}
+
+model OutboundWebhook {
+  id         String            @id @default(cuid())
+  projectId  String?
+  name       String            @db.VarChar(128)
+  url        String            @db.VarChar(1024)
+  secret     String?           @db.VarChar(255)
+  events     Json
+  enabled    Boolean           @default(true)
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  project    Project?          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([enabled])
+  @@index([projectId, enabled])
+}
+
+model WebhookDelivery {
+  id         String          @id @default(cuid())
+  webhookId  String
+  event      String          @db.VarChar(64)
+  success    Boolean
+  statusCode Int?
+  error      String?         @db.VarChar(512)
+  createdAt  DateTime        @default(now())
+  webhook    OutboundWebhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, createdAt])
+}
+
+model FolderPublicPolicy {
+  id         String   @id @default(cuid())
+  projectId  String
+  folderPath String   @db.VarChar(512)
+  isPublic   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, folderPath])
+  @@index([projectId, isPublic])
+}
+
+model FileVersion {
+  id           String      @id @default(cuid())
+  fileId       String
+  version      Int
+  storageKey   String      @db.VarChar(512)
+  cdnConfigId  String?
+  size         BigInt
+  checksum     String?     @db.VarChar(128)
+  mimeType     String      @db.VarChar(128)
+  originalName String      @db.VarChar(255)
+  createdById  String?
+  remark       String?     @db.VarChar(256)
+  createdAt    DateTime    @default(now())
+  file         ManagedFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([fileId, version])
+  @@index([fileId, createdAt])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String    @db.VarChar(160)
+  body      String?   @db.VarChar(1024)
+  level     String    @db.VarChar(16)
+  href      String?   @db.VarChar(512)
+  readAt    DateTime?
+  meta      Json?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt])
+  @@index([userId, createdAt])
+}
+
+model LifecyclePolicy {
+  id         String        @id @default(cuid())
+  projectId  String
+  name       String        @db.VarChar(128)
+  folderPath String?       @db.VarChar(512)
+  category   FileCategory?
+  ttlDays    Int
+  action     String        @db.VarChar(32)
+  enabled    Boolean       @default(true)
+  lastRunAt  DateTime?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  project    Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, enabled])
+}
+
+model FolderShareLink {
+  id            String    @id @default(cuid())
+  projectId     String
+  folderPath    String    @db.VarChar(512)
+  token         String    @unique @db.VarChar(64)
+  passwordHash  String?   @db.VarChar(255)
+  expiresAt     DateTime?
+  maxDownloads  Int?
+  downloadCount Int       @default(0)
+  enabled       Boolean   @default(true)
+  previewOnly   Boolean   @default(false)
+  allowedIps    Json?
+  watermarkText String?   @db.VarChar(128)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, folderPath, enabled])
+  @@index([expiresAt])
+}
+
+model Task {
+  id         String    @id @default(cuid())
+  projectId  String?
+  type       String    @db.VarChar(64)
+  title      String    @db.VarChar(160)
+  status     String    @db.VarChar(32)
+  progress   Int       @default(0)
+  detail     Json?
+  result     Json?
+  error      String?   @db.VarChar(1024)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  finishedAt DateTime?
+  project    Project?  @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, createdAt])
+  @@index([status, createdAt])
+  @@index([type, createdAt])
+}
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  action    AuditAction
+  actorId   String?
+  projectId String?
+  ip        String?     @db.VarChar(64)
+  userAgent String?     @db.VarChar(255)
+  detail    Json?
+  createdAt DateTime    @default(now())
+  actor     User?       @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  project   Project?    @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([action, createdAt])
+  @@index([projectId, createdAt])
+}
+
+model SystemSetting {
+  key       String   @id @db.VarChar(128)
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+/// Per-IP share-download abuse counters + manual/auto bans.
+model ShareIpStat {
+  id                 String    @id @default(cuid())
+  ip                 String    @unique @db.VarChar(64)
+  downloadCount      Int       @default(0)
+  rateLimitCount     Int       @default(0)
+  lastDownloadAt     DateTime?
+  lastRateLimitedAt  DateTime?
+  permanentBan       Boolean   @default(false)
+  banUntil           DateTime?
+  banReason          String?   @db.VarChar(512)
+  notes              String?   @db.VarChar(512)
+  lastShareId        String?   @db.VarChar(64)
+  lastFileName       String?   @db.VarChar(255)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([permanentBan, banUntil])
+  @@index([downloadCount])
+  @@index([rateLimitCount])
+  @@index([lastDownloadAt])
+  @@index([updatedAt])
+}
+
+model OpenApiNonce {
+  id        String   @id @default(cuid())
+  appId     String   @db.VarChar(48)
+  nonce     String   @db.VarChar(128)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@unique([appId, nonce])
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id           String    @id @default(cuid())
+  userId       String
+  tokenHash    String    @unique @db.VarChar(128)
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?
+  userAgent    String?   @db.VarChar(255)
+  ip           String?   @db.VarChar(64)
+  createdAt    DateTime  @default(now())
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model FileAccessDailyStat {
+  id          String   @id @default(cuid())
+  day         DateTime @db.Date
+  projectId   String
+  fileId      String?
+  refererHost String   @default("") @db.VarChar(255)
+  hits        Int      @default(0)
+  bytes       BigInt   @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([day, projectId, fileId, refererHost])
+  @@index([projectId, day])
+  @@index([day, hits])
+  @@index([day, bytes])
+}
