@@ -4,6 +4,9 @@
 # 用法:
 #   bash release-update.sh            # 自动获取最新版本并更新
 #   bash release-update.sh v0.1.0     # 更新到指定版本
+# 可选环境变量:
+#   GHCR_MIRROR=ghcr.nju.edu.cn       # 指定 ghcr 镜像源(默认自动尝试列表)
+#   PULL_TIMEOUT=180                  # 单个镜像源拉取超时秒数
 # ============================================================
 set -u
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -42,16 +45,16 @@ sed -i 's/\r$//' docker-compose.yml docker-compose.ghcr.yml
 echo "[3/5] 确定目标版本..."
 VERSION="$VERSION_ARG"
 if [ -z "$VERSION" ]; then
-  # 方式1: GitHub API 直连(海外/有代理的机器可用)
+  # 方式1: GitHub API 直连(海外或有代理时可用)
   VERSION=$(curl -fsSL --connect-timeout 6 --max-time 15 \
     "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
     | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
 fi
 if [ -z "$VERSION" ]; then
-  # 方式2: 走 gh-proxy 拉 releases atom 源(国内可用)
+  # 方式2: 南京大学 ghcr 镜像的 tags API(国内可用, 免认证)
   VERSION=$(curl -fsSL --connect-timeout 8 --max-time 20 \
-    "$GH_PROXY/https://github.com/$REPO/releases.atom" 2>/dev/null \
-    | grep -o 'releases/tag/[^<"]*' | head -1 | cut -d/ -f2 || true)
+    "https://ghcr.nju.edu.cn/v2/shifuf/unified-file-manager-api/tags/list" 2>/dev/null \
+    | grep -o '"v[0-9][0-9.]*"' | tr -d '"' | sort -V | tail -1 || true)
 fi
 if [ -z "$VERSION" ]; then
   if [ -f .ufm-version ]; then
@@ -71,8 +74,13 @@ else
 fi
 
 echo "[4/5] 拉取镜像(自动尝试多个镜像源, 单源最多 ${PULL_TIMEOUT}s)..."
+if [ -n "${GHCR_MIRROR:-}" ]; then
+  MIRRORS="$GHCR_MIRROR"
+else
+  MIRRORS="ghcr.nju.edu.cn ghcr.io"
+fi
 PULLED=0
-for MIRROR in "ghcr.io" "docker.m.daocloud.io/ghcr.io" "ghcr.nju.edu.cn" "ghcr.m.daocloud.io"; do
+for MIRROR in $MIRRORS; do
   echo "--- 尝试: $MIRROR ---"
   sed -i "s|image: [^ ]*/shifuf/unified-file-manager|image: $MIRROR/shifuf/unified-file-manager|g" docker-compose.ghcr.yml
   timeout -k 10 "$PULL_TIMEOUT" $DC pull api web
