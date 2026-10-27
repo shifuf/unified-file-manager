@@ -10,7 +10,8 @@
 
     <section class="surface">
       <div class="surface-body">
-        <div class="section-title">全局配置</div>
+        <el-tabs v-model="activeTab" class="settings-tabs">
+        <el-tab-pane label="全局配置" name="general">
         <el-form
           ref="settingsFormRef"
           v-loading="settingsLoading"
@@ -82,12 +83,9 @@
             <el-button @click="restoreSettingsForm">恢复当前值</el-button>
           </div>
         </el-form>
-      </div>
-    </section>
+        </el-tab-pane>
 
-    <section class="surface" style="margin-top: 16px">
-      <div class="surface-body">
-        <div class="section-title">自定义分享页</div>
+        <el-tab-pane label="自定义分享页" name="brand" lazy>
         <p class="section-help">
           作用于公开文件分享页 <code>/shares/:token</code> 与目录分享页
           <code>/folder-shares/:token</code>。留空标题/副标题/Logo 则不显示品牌区。
@@ -135,12 +133,9 @@
             <el-button @click="restoreBrandForm">恢复当前值</el-button>
           </div>
         </el-form>
-      </div>
-    </section>
+        </el-tab-pane>
 
-    <section class="surface" style="margin-top: 16px">
-      <div class="surface-body">
-        <div class="section-title">消息通知（对接消息推送平台）</div>
+        <el-tab-pane label="消息通知" name="notify" lazy>
         <el-form v-loading="notifyLoading" label-position="top" class="settings-form" :model="notifyForm">
           <div class="settings-grid">
             <el-form-item label="启用通知">
@@ -180,6 +175,32 @@
             <el-button :loading="notifyTesting" @click="testNotify">发送测试消息</el-button>
           </div>
         </el-form>
+        </el-tab-pane>
+
+        <el-tab-pane label="系统与更新" name="system" lazy>
+          <div v-loading="versionLoading" class="version-panel">
+            <el-descriptions :column="1" border>
+              <el-descriptions-item label="当前版本">{{ versionInfo?.currentVersion ?? '未知' }}</el-descriptions-item>
+              <el-descriptions-item label="最新版本">{{ versionInfo?.latestVersion ?? '未知' }}</el-descriptions-item>
+              <el-descriptions-item label="检查状态">
+                <el-tag v-if="versionInfo?.updateAvailable" type="warning">发现新版本 {{ versionInfo.latestVersion }}</el-tag>
+                <el-tag v-else-if="versionInfo?.state === 'available'" type="success">已是最新版本</el-tag>
+                <el-tag v-else-if="versionInfo?.state === 'not_configured'" type="info">未配置更新源</el-tag>
+                <el-tag v-else-if="versionInfo?.state === 'invalid_version'" type="danger">版本号无法解析</el-tag>
+                <el-tag v-else-if="versionInfo?.state === 'unavailable'" type="danger">更新源不可达</el-tag>
+                <el-tag v-else type="info">尚未检查</el-tag>
+              </el-descriptions-item>
+            </el-descriptions>
+            <div class="form-actions" style="margin-top: 16px">
+              <el-button type="primary" :loading="versionChecking" @click="checkVersion">检查更新</el-button>
+              <el-button @click="loadVersion">刷新</el-button>
+            </div>
+            <p class="setting-help">
+              版本信息来自服务器 UPDATE_CHECK_URL 配置的发布源（默认使用南京大学 ghcr 镜像的版本列表，国内可用；也可换成 GitHub Releases 地址），检查结果与顶栏提示一致。
+            </p>
+          </div>
+        </el-tab-pane>
+        </el-tabs>
       </div>
     </section>
   </div>
@@ -190,7 +211,7 @@ import { Check, Refresh } from '@element-plus/icons-vue';
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
 
-import { settingsApi } from '@/api/modules';
+import { settingsApi, versionApi, type VersionCheckResult } from '@/api/modules';
 import type { SharePageBrand } from '@/types';
 
 const settingsLoading = ref(false);
@@ -199,6 +220,10 @@ const brandSaving = ref(false);
 const notifyLoading = ref(false);
 const notifySaving = ref(false);
 const notifyTesting = ref(false);
+const activeTab = ref('general');
+const versionInfo = ref<VersionCheckResult | null>(null);
+const versionLoading = ref(false);
+const versionChecking = ref(false);
 const settingsFormRef = ref<FormInstance>();
 const settings = ref<Record<string, unknown>>({});
 type SystemSettingKey =
@@ -273,6 +298,34 @@ const notifyForm = reactive({
 
 async function reloadAll(): Promise<void> {
   await Promise.all([loadSettings(), loadNotify()]);
+}
+
+async function loadVersion(): Promise<void> {
+  versionLoading.value = true;
+  try {
+    versionInfo.value = await versionApi.check();
+  } catch {
+    versionInfo.value = null;
+  } finally {
+    versionLoading.value = false;
+  }
+}
+
+async function checkVersion(): Promise<void> {
+  versionChecking.value = true;
+  try {
+    versionInfo.value = await versionApi.check();
+    if (versionInfo.value.updateAvailable) {
+      ElMessage.warning(`发现新版本 ${versionInfo.value.latestVersion}`);
+    } else if (versionInfo.value.state === 'available') {
+      ElMessage.success('已是最新版本。');
+    }
+  } catch {
+    versionInfo.value = null;
+    ElMessage.error('版本检查失败，请确认服务器能访问更新源。');
+  } finally {
+    versionChecking.value = false;
+  }
 }
 
 async function loadSettings(): Promise<void> {
@@ -455,6 +508,7 @@ function readDomainAllowlist(value: unknown): string[] {
 
 onMounted(async () => {
   await reloadAll();
+  await loadVersion();
 });
 </script>
 
@@ -509,6 +563,14 @@ onMounted(async () => {
   line-height: 1.5;
 }
 
+.settings-tabs :deep(.el-tabs__content) {
+  padding-top: 8px;
+}
+
+.version-panel {
+  max-width: 560px;
+}
+
 .form-actions {
   display: flex;
   gap: 10px;
@@ -520,7 +582,15 @@ onMounted(async () => {
     grid-template-columns: 1fr;
   }
 
-  .form-actions {
+  .settings-tabs :deep(.el-tabs__content) {
+  padding-top: 8px;
+}
+
+.version-panel {
+  max-width: 560px;
+}
+
+.form-actions {
     align-items: stretch;
     flex-direction: column;
   }

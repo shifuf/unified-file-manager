@@ -454,7 +454,14 @@
       </div>
     </section>
 
-    <el-dialog v-model="storageCopyVisible" title="复制文件到其他存储" width="520px">
+    <el-dialog
+      v-model="storageCopyVisible"
+      title="复制文件到其他存储"
+      width="520px"
+      align-center
+      append-to-body
+      destroy-on-close
+    >
       <el-alert type="info" :closable="false" show-icon title="复制成功后文件归属切换到目标存储，源对象会保留。" />
       <el-select v-model="storageCopyTargetId" placeholder="请选择目标存储" style="width: 100%; margin-top: 16px">
         <el-option
