@@ -58,4 +58,23 @@ export class CreateProjectDto {
   @IsInt()
   @Min(0)
   quotaFiles?: number | null;
+
+  @ApiPropertyOptional({ description: '是否启用该项目的 WebDAV 入口' })
+  @IsOptional()
+  @IsBoolean()
+  webdavEnabled?: boolean;
+
+  @ApiPropertyOptional({ description: 'WebDAV 登录用户名（1-64 字符）' })
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  webdavUsername?: string | null;
+
+  @ApiPropertyOptional({ description: 'WebDAV 登录密码（8-128 字符）；编辑时留空表示沿用原密码' })
+  @IsOptional()
+  @IsString()
+  @MinLength(8)
+  @MaxLength(128)
+  webdavPassword?: string | null;
 }

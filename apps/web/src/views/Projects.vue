@@ -47,6 +47,13 @@
             </template>
           </el-table-column>
           <el-table-column prop="activeCdnName" label="当前存储" min-width="150" />
+          <el-table-column label="WebDAV" width="120">
+            <template #default="{ row }">
+              <el-tag :type="row.webdavEnabled ? 'success' : 'info'" size="small">
+                {{ row.webdavEnabled ? '已启用' : '未启用' }}
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="fileCount" label="文件数" width="100" />
           <el-table-column label="创建时间" min-width="170">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
@@ -107,6 +114,26 @@
         <el-form-item label="文件数配额（0=不限）">
           <el-input-number v-model="form.quotaFiles" :min="0" :step="10" controls-position="right" />
         </el-form-item>
+        <el-divider content-position="left">WebDAV</el-divider>
+        <el-form-item label="启用 WebDAV">
+          <el-switch v-model="form.webdavEnabled" active-text="开启" inactive-text="关闭" />
+          <div class="form-help">挂载地址：{{ webdavPreviewUrl }}</div>
+        </el-form-item>
+        <template v-if="form.webdavEnabled">
+          <el-form-item label="WebDAV 用户名">
+            <el-input v-model="form.webdavUsername" maxlength="64" placeholder="例如 alice" />
+          </el-form-item>
+          <el-form-item label="WebDAV 密码">
+            <el-input
+              v-model="form.webdavPassword"
+              type="password"
+              show-password
+              maxlength="128"
+              :placeholder="editingProject ? '留空则保持原密码不变' : '至少 8 位'"
+            />
+            <div class="form-help">密码仅提交时明文传输，落库为 bcrypt 哈希。</div>
+          </el-form-item>
+        </template>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -145,10 +172,10 @@
 <script setup lang="ts">
 import { Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
-import { onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 
-import { projectApi } from '@/api/modules';
+import { projectApi, webdavApi } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import type { Project } from '@/types';
 
@@ -172,14 +199,43 @@ const form = reactive({
   publicLibrarySlug: '',
   quotaMb: 0,
   quotaFiles: 0,
+  webdavEnabled: false,
+  webdavUsername: '',
+  webdavPassword: '',
 });
+const webdavPreviewUrl = computed(() => {
+
+  const id = editingProject.value?.id ?? '{projectId}';
+  return `${window.location.origin}/api/dav/${id}`;
+});
+
+const webdavStatus = reactive({ enabled: false, username: '', hasPassword: false });
+
+async function loadWebdav(projectId: string): Promise<void> {
+  try {
+    const status = await webdavApi.status(projectId);
+    webdavStatus.enabled = status.enabled;
+    webdavStatus.username = status.username ?? '';
+    webdavStatus.hasPassword = status.hasPassword;
+    form.webdavEnabled = status.enabled;
+    form.webdavUsername = status.username ?? '';
+    form.webdavPassword = '';
+  } catch {
+    webdavStatus.enabled = false;
+    webdavStatus.username = '';
+    webdavStatus.hasPassword = false;
+  }
+}
 const latestSecret = reactive({ appId: '', appSecret: '' });
+
+
 const rules: FormRules = {
   name: [
     { required: true, message: '请输入项目名称。', trigger: 'blur' },
     { min: 2, message: '项目名称至少 2 个字符。', trigger: 'blur' },
   ],
 };
+
 
 function formatTime(value: string): string {
   return new Date(value).toLocaleString();
@@ -208,6 +264,9 @@ function openCreateDialog(): void {
   form.publicLibrarySlug = '';
   form.quotaMb = 0;
   form.quotaFiles = 0;
+  form.webdavEnabled = false;
+  form.webdavUsername = '';
+  form.webdavPassword = '';
   dialogVisible.value = true;
 }
 
@@ -221,7 +280,11 @@ function openEditDialog(project: Project): void {
   form.publicLibrarySlug = project.publicLibrarySlug || '';
   form.quotaMb = project.quotaBytes ? Math.round(project.quotaBytes / 1024 / 1024) : 0;
   form.quotaFiles = project.quotaFiles || 0;
+  form.webdavEnabled = false;
+  form.webdavUsername = '';
+  form.webdavPassword = '';
   dialogVisible.value = true;
+  void loadWebdav(project.id);
 }
 
 async function submitProject(): Promise<void> {
@@ -241,7 +304,28 @@ async function submitProject(): Promise<void> {
       publicLibrarySlug: form.publicLibraryEnabled ? form.publicLibrarySlug.trim() || undefined : null,
       quotaBytes: form.quotaMb > 0 ? form.quotaMb * 1024 * 1024 : null,
       quotaFiles: form.quotaFiles > 0 ? form.quotaFiles : null,
+      // WebDAV 与项目在同一次写入中提交：任一项校验失败都不会留下半成品项目，
+      // 避免"创建报错后重试"变成两个项目。
+      webdavEnabled: form.webdavEnabled,
+      webdavUsername: form.webdavUsername.trim() || null,
+      ...(form.webdavPassword ? { webdavPassword: form.webdavPassword } : {}),
     };
+
+    if (form.webdavEnabled) {
+      if (!form.webdavUsername.trim()) {
+        ElMessage.error('启用 WebDAV 前必须填写用户名。');
+        return;
+      }
+      if (!form.webdavPassword && !webdavStatus.hasPassword) {
+        ElMessage.error('启用 WebDAV 前必须设置至少 8 位密码。');
+        return;
+      }
+      if (form.webdavPassword && form.webdavPassword.length < 8) {
+        ElMessage.error('WebDAV 密码至少 8 位。');
+        return;
+      }
+    }
+
     if (editingProject.value) {
       await projectApi.update(editingProject.value.id, payload);
       ElMessage.success('项目已更新。');

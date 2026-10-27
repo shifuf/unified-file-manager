@@ -70,6 +70,7 @@ const router = createRouter({
         { path: '/audit-logs', name: 'audit-logs', component: () => import('@/views/AuditLogs.vue') },
         { path: '/share-ip-abuse', name: 'share-ip-abuse', component: () => import('@/views/ShareIpAbuse.vue') },
         { path: '/system-health', name: 'system-health', component: () => import('@/views/SystemHealth.vue') },
+        { path: '/backups', name: 'backups', component: () => import('@/views/Backups.vue') },
         { path: '/settings', name: 'settings', component: () => import('@/views/Settings.vue') },
       ],
     },

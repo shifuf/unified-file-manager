@@ -30,6 +30,9 @@ import {
 } from '../common/utils/http-range.util';
 import { buildRequestPublicBaseUrl } from '../common/utils/origin.util';
 import { CreateShareLinkDto } from './dto/create-share-link.dto';
+import { DownloadSource } from '@prisma/client';
+
+import { DownloadStatsService } from './download-stats.service';
 import { FolderShareService } from './folder-share.service';
 
 @ApiTags('目录分享')
@@ -78,8 +81,10 @@ export class FolderShareAdminController {
 @Throttle({ limit: 600, windowMs: 60_000 })
 @Controller('folder-shares')
 export class PublicFolderSharesController {
-  constructor(private readonly folderShareService: FolderShareService) {}
-
+  constructor(
+    private readonly downloadStatsService: DownloadStatsService,
+    private readonly folderShareService: FolderShareService,
+  ) {}
   @Get(':token')
   getInfo(@Param('token') token: string): ReturnType<FolderShareService['getPublicInfo']> {
     return this.folderShareService.getPublicInfo(token);
@@ -159,6 +164,15 @@ export class PublicFolderSharesController {
       response.status(404).send('File stream not found.');
       return;
     }
+    this.downloadStatsService.record({
+      projectId: file.projectId,
+      fileId: file.id,
+      originalName: file.originalName,
+      bytes: parsed && typeof parsed === 'object' ? parsed.length : size,
+      source: DownloadSource.FOLDER_SHARE,
+      ip: clientIp,
+      userAgent: request.get('user-agent') ?? null,
+    });
     applyRangeHeaders(
       response,
       file.mimeType,

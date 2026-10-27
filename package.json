@@ -23,7 +23,8 @@
     "db:seed": "npm --workspace apps/api run db:seed",
     "package:deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-deploy.ps1",
     "package:deploy:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-deploy.ps1 -SkipBuild",
-    "backup:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/backup-full.ps1"
+    "backup:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/backup-full.ps1",
+    "test": "npm --workspace apps/api test"
   },
   "engines": {
     "node": ">=20.11.0",

@@ -21,6 +21,7 @@ import { UpyunAdapter } from '../storage/adapters/upyun.adapter';
 import type { RuntimeCdnConfig, StorageAdapter, StorageUsageSnapshot } from '../storage/storage.types';
 import { CreateCdnConfigDto } from './dto/create-cdn-config.dto';
 import { UpdateCdnConfigDto } from './dto/update-cdn-config.dto';
+import { resolveUsageValue } from '../storage/storage-policy.util';
 
 /**
  * Identity and secret fields that must be encrypted at rest and masked in API
@@ -66,6 +67,11 @@ type StorageUsageResponse = {
   storageQuotaBytes: number | null;
   trafficUsedBytes: number | null;
   trafficQuotaBytes: number | null;
+  storageUsedSource?: string;
+  storageQuotaSource?: string;
+  trafficUsedSource?: string;
+  trafficQuotaSource?: string;
+  policy?: { priority: number; failoverThresholdPercent: number; autoFailover: boolean; manualUsageUpdatedAt: string | null };
   checkedAt: string;
   message?: string;
 };
@@ -118,12 +124,14 @@ export class CdnService {
   async create(dto: CreateCdnConfigDto, user: RequestUser): Promise<Record<string, unknown>> {
     await this.assertCanManageStorage(user, true);
     await this.assertRemoteConfigHostsSafe(dto.provider, dto.config);
+    await this.assertConfigHealthy(dto.provider, dto.name, dto.config, user);
     const config = await this.prisma.cdnConfig.create({
       data: {
         provider: dto.provider,
         name: dto.name,
         config: this.secureConfig(dto.config),
         active: false,
+        ...this.storagePolicyData(dto),
       },
     });
 
@@ -143,6 +151,7 @@ export class CdnService {
   ): Promise<Record<string, unknown>> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
     await this.assertRemoteConfigHostsSafe(dto.provider, dto.config);
+    await this.assertConfigHealthy(dto.provider, dto.name, dto.config, user, projectId);
     const config = await this.prisma.cdnConfig.create({
       data: {
         projectId,
@@ -150,6 +159,7 @@ export class CdnService {
         name: dto.name,
         config: this.secureConfig(dto.config),
         active: false,
+        ...this.storagePolicyData(dto),
       },
     });
 
@@ -171,7 +181,9 @@ export class CdnService {
       : undefined;
 
     if (mergedConfig) {
-      await this.assertRemoteConfigHostsSafe(dto.provider ?? existing.provider, mergedConfig);
+      const provider = dto.provider ?? existing.provider;
+      await this.assertRemoteConfigHostsSafe(provider, mergedConfig);
+      await this.assertConfigHealthy(provider, dto.name ?? existing.name, mergedConfig, user);
     }
 
     const config = await this.prisma.cdnConfig.update({
@@ -180,6 +192,7 @@ export class CdnService {
         provider: dto.provider,
         name: dto.name,
         config: mergedConfig ? this.secureConfig(mergedConfig) : undefined,
+        ...this.storagePolicyData(dto),
       },
     });
 
@@ -205,7 +218,9 @@ export class CdnService {
       : undefined;
 
     if (mergedConfig) {
-      await this.assertRemoteConfigHostsSafe(dto.provider ?? existing.provider, mergedConfig);
+      const provider = dto.provider ?? existing.provider;
+      await this.assertRemoteConfigHostsSafe(provider, mergedConfig);
+      await this.assertConfigHealthy(provider, dto.name ?? existing.name, mergedConfig, user, projectId);
     }
 
     const config = await this.prisma.cdnConfig.update({
@@ -214,6 +229,7 @@ export class CdnService {
         provider: dto.provider,
         name: dto.name,
         config: mergedConfig ? this.secureConfig(mergedConfig) : undefined,
+        ...this.storagePolicyData(dto),
       },
     });
 
@@ -251,15 +267,27 @@ export class CdnService {
     return this.toResponse(config, project.activeCdnConfigId);
   }
 
-  async remove(configId: string, user: RequestUser): Promise<{ success: boolean }> {
+  async remove(configId: string, user: RequestUser, force = false): Promise<{ success: boolean }> {
     await this.assertCanManageStorage(user, true);
-    await this.findConfig(configId);
+    const config = await this.findConfig(configId);
     const activeProjectCount = await this.prisma.project.count({
       where: { activeCdnConfigId: configId, deletedAt: null },
     });
 
+    if (activeProjectCount > 0 && !force) {
+      throw new BadRequestException(
+        `该存储配置仍被 ${activeProjectCount} 个项目使用，请先切换项目存储，或选择“强制删除”自动解绑。`,
+      );
+    }
+
+    await this.assertNotLastLocalConfig(config);
+
     if (activeProjectCount > 0) {
-      throw new BadRequestException('该存储配置仍被项目使用，请先切换项目存储。');
+      // Detach first: projects fall back to the shared LOCAL config.
+      await this.prisma.project.updateMany({
+        where: { activeCdnConfigId: configId },
+        data: { activeCdnConfigId: null },
+      });
     }
 
     await this.prisma.cdnConfig.update({
@@ -270,21 +298,33 @@ export class CdnService {
     await this.auditService.write({
       action: AuditAction.CDN_DELETE,
       actorId: user.id,
-      detail: { configId },
+      detail: { configId, detachedProjects: activeProjectCount, forced: force },
     });
 
     return { success: true };
   }
 
-  async removeForProject(projectId: string, configId: string, user: RequestUser): Promise<{ success: boolean }> {
+  async removeForProject(
+    projectId: string,
+    configId: string,
+    user: RequestUser,
+    force = false,
+  ): Promise<{ success: boolean }> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
     await this.findProjectOwnedConfig(configId, projectId);
     const activeProjectCount = await this.prisma.project.count({
       where: { id: projectId, activeCdnConfigId: configId, deletedAt: null },
     });
 
+    if (activeProjectCount > 0 && !force) {
+      throw new BadRequestException('该存储配置正在被当前项目使用，请先切换项目存储，或选择“强制删除”自动解绑。');
+    }
+
     if (activeProjectCount > 0) {
-      throw new BadRequestException('该存储配置正在被当前项目使用，请先切换项目存储。');
+      await this.prisma.project.updateMany({
+        where: { id: projectId, activeCdnConfigId: configId },
+        data: { activeCdnConfigId: null },
+      });
     }
 
     await this.prisma.cdnConfig.update({
@@ -296,10 +336,95 @@ export class CdnService {
       action: AuditAction.CDN_DELETE,
       actorId: user.id,
       projectId,
-      detail: { configId, scope: 'project' },
+      detail: { configId, scope: 'project', forced: force },
     });
 
     return { success: true };
+  }
+
+  /** Dry-run a configuration that has not been saved yet (create dialog gate). */
+  async testDraft(
+    dto: CreateCdnConfigDto,
+    user: RequestUser,
+    projectId?: string,
+  ): Promise<Record<string, unknown>> {
+    if (projectId) {
+      await this.projectAccessService.assertProjectAccess(user, projectId, true);
+    } else {
+      await this.assertCanManageStorage(user, true);
+    }
+
+    await this.assertRemoteConfigHostsSafe(dto.provider, dto.config);
+    const checks =
+      dto.provider === CdnProvider.LOCAL
+        ? await this.testLocalConfig(dto.config)
+        : await this.testRemoteConfig(dto.provider, dto.name, dto.config);
+    const success = checks.every((check) => check.status !== 'FAIL');
+
+    await this.auditService.write({
+      action: AuditAction.CDN_HEALTH_CHECK,
+      actorId: user.id,
+      projectId,
+      detail: { provider: dto.provider, name: dto.name, success, draft: true },
+    });
+
+    return {
+      provider: dto.provider,
+      name: dto.name,
+      success,
+      checks,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Dry-run an edit: masked secrets in the dialog are replaced with the stored
+   * values so the probe tests what will actually be saved.
+   */
+  async testDraftForConfig(
+    configId: string,
+    dto: UpdateCdnConfigDto,
+    user: RequestUser,
+    projectId?: string,
+  ): Promise<Record<string, unknown>> {
+    if (projectId) {
+      await this.projectAccessService.assertProjectAccess(user, projectId, true);
+    } else {
+      await this.assertCanManageStorage(user, true);
+    }
+
+    const existing = projectId
+      ? await this.findProjectOwnedConfig(configId, projectId)
+      : await this.findConfig(configId);
+    const provider = dto.provider ?? existing.provider;
+    const name = dto.name ?? existing.name;
+    const merged = this.mergeConfigPreservingSecrets(
+      this.revealConfig(existing.config),
+      dto.config ?? {},
+    );
+
+    await this.assertRemoteConfigHostsSafe(provider, merged);
+
+    const checks =
+      provider === CdnProvider.LOCAL
+        ? await this.testLocalConfig(merged)
+        : await this.testRemoteConfig(provider, name, merged);
+    const success = checks.every((check) => check.status !== 'FAIL');
+
+    await this.auditService.write({
+      action: AuditAction.CDN_HEALTH_CHECK,
+      actorId: user.id,
+      projectId,
+      detail: { configId, provider, name, success, draft: true },
+    });
+
+    return {
+      provider,
+      name,
+      success,
+      checks,
+      checkedAt: new Date().toISOString(),
+    };
   }
 
   async test(configId: string, user: RequestUser): Promise<Record<string, unknown>> {
@@ -343,6 +468,52 @@ export class CdnService {
         return [key, value];
       }),
     );
+  }
+
+  /**
+   * Hard gate for writes: a configuration is only persisted after its own
+   * connectivity probe (upload + read + delete) has passed.
+   */
+  /** The shared LOCAL fallback must survive: without it uploads have nowhere to go. */
+  private async assertNotLastLocalConfig(config: CdnConfig): Promise<void> {
+    if (config.provider !== CdnProvider.LOCAL) {
+      return;
+    }
+
+    const remaining = await this.prisma.cdnConfig.count({
+      where: { enabled: true, provider: CdnProvider.LOCAL, id: { not: config.id } },
+    });
+
+    if (remaining === 0) {
+      throw new BadRequestException('这是最后一个可用的本地存储配置，删除后项目将无法上传，已阻止操作。');
+    }
+  }
+
+  private async assertConfigHealthy(
+    provider: CdnProvider,
+    name: string,
+    config: Record<string, unknown>,
+    user: RequestUser,
+    projectId?: string,
+  ): Promise<void> {
+    const checks =
+      provider === CdnProvider.LOCAL
+        ? await this.testLocalConfig(config)
+        : await this.testRemoteConfig(provider, name, config);
+    const failed = checks.filter((check) => check.status === 'FAIL');
+
+    await this.auditService.write({
+      action: AuditAction.CDN_HEALTH_CHECK,
+      actorId: user.id,
+      projectId,
+      detail: { provider, name, success: failed.length === 0, gate: 'create-or-update' },
+    });
+
+    if (failed.length > 0) {
+      throw new BadRequestException(
+        `存储测试未通过，无法保存：${failed.map((check) => `${check.name} - ${check.message}`).join('；')}`,
+      );
+    }
   }
 
   private async assertCanManageStorage(user: RequestUser, requireSuperAdmin: boolean): Promise<void> {
@@ -437,6 +608,19 @@ export class CdnService {
     return String(value ?? '').trim().replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase();
   }
 
+  private storagePolicyData(dto: CreateCdnConfigDto | UpdateCdnConfigDto): Pick<Prisma.CdnConfigUncheckedCreateInput, 'priority' | 'storageQuotaBytes' | 'manualStorageUsedBytes' | 'trafficQuotaBytes' | 'manualTrafficUsedBytes' | 'failoverThresholdPercent' | 'autoFailover' | 'manualUsageUpdatedAt'> {
+    const data: Pick<Prisma.CdnConfigUncheckedCreateInput, 'priority' | 'storageQuotaBytes' | 'manualStorageUsedBytes' | 'trafficQuotaBytes' | 'manualTrafficUsedBytes' | 'failoverThresholdPercent' | 'autoFailover' | 'manualUsageUpdatedAt'> = {};
+    if (dto.priority !== undefined) data.priority = dto.priority;
+    if (dto.storageQuotaBytes !== undefined) data.storageQuotaBytes = dto.storageQuotaBytes === null ? null : BigInt(dto.storageQuotaBytes);
+    if (dto.manualStorageUsedBytes !== undefined) data.manualStorageUsedBytes = dto.manualStorageUsedBytes === null ? null : BigInt(dto.manualStorageUsedBytes);
+    if (dto.trafficQuotaBytes !== undefined) data.trafficQuotaBytes = dto.trafficQuotaBytes === null ? null : BigInt(dto.trafficQuotaBytes);
+    if (dto.manualTrafficUsedBytes !== undefined) data.manualTrafficUsedBytes = dto.manualTrafficUsedBytes === null ? null : BigInt(dto.manualTrafficUsedBytes);
+    if (dto.failoverThresholdPercent !== undefined) data.failoverThresholdPercent = dto.failoverThresholdPercent;
+    if (dto.autoFailover !== undefined) data.autoFailover = dto.autoFailover;
+    if (dto.manualStorageUsedBytes !== undefined || dto.manualTrafficUsedBytes !== undefined) data.manualUsageUpdatedAt = new Date();
+    return data;
+  }
+
   private secureConfig(config: Record<string, unknown>): Prisma.InputJsonObject {
     const cryptoKey = getAppCryptoKey(this.configService);
     return Object.fromEntries(
@@ -511,6 +695,14 @@ export class CdnService {
       config: Prisma.JsonValue;
       active: boolean;
       enabled: boolean;
+      priority: number;
+      storageQuotaBytes: bigint | null;
+      manualStorageUsedBytes: bigint | null;
+      trafficQuotaBytes: bigint | null;
+      manualTrafficUsedBytes: bigint | null;
+      failoverThresholdPercent: number;
+      autoFailover: boolean;
+      manualUsageUpdatedAt: Date | null;
       createdAt: Date;
       updatedAt: Date;
     },
@@ -524,6 +716,14 @@ export class CdnService {
       config: this.maskConfig(config.config),
       active: activeConfigId ? config.id === activeConfigId : false,
       enabled: config.enabled,
+      priority: config.priority,
+      storageQuotaBytes: config.storageQuotaBytes?.toString() ?? null,
+      manualStorageUsedBytes: config.manualStorageUsedBytes?.toString() ?? null,
+      trafficQuotaBytes: config.trafficQuotaBytes?.toString() ?? null,
+      manualTrafficUsedBytes: config.manualTrafficUsedBytes?.toString() ?? null,
+      failoverThresholdPercent: config.failoverThresholdPercent,
+      autoFailover: config.autoFailover,
+      manualUsageUpdatedAt: config.manualUsageUpdatedAt,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
     };
@@ -602,8 +802,9 @@ export class CdnService {
         checkedAt: new Date().toISOString(),
         message: '当前平台不支持云用量查询。',
       };
-      this.usageCache.set(config.id, { expiresAt: Date.now() + USAGE_CACHE_TTL_MS, value: unsupported });
-      return unsupported;
+      const result = this.applyUsagePolicy(config, unsupported);
+      this.usageCache.set(config.id, { expiresAt: Date.now() + USAGE_CACHE_TTL_MS, value: result });
+      return result;
     }
 
     const runtimeConfig: RuntimeCdnConfig = {
@@ -629,8 +830,9 @@ export class CdnService {
         checkedAt: new Date().toISOString(),
         message: error instanceof Error ? error.message : String(error),
       };
-      this.usageCache.set(config.id, { expiresAt: Date.now() + 60_000, value: failed });
-      return failed;
+      const result = this.applyUsagePolicy(config, failed);
+      this.usageCache.set(config.id, { expiresAt: Date.now() + 60_000, value: result });
+      return result;
     }
 
     const value: StorageUsageResponse = {
@@ -645,8 +847,33 @@ export class CdnService {
       checkedAt: snapshot.checkedAt || new Date().toISOString(),
       message: snapshot.message,
     };
-    this.usageCache.set(config.id, { expiresAt: Date.now() + USAGE_CACHE_TTL_MS, value });
-    return value;
+    const result = this.applyUsagePolicy(config, value);
+    this.usageCache.set(config.id, { expiresAt: Date.now() + USAGE_CACHE_TTL_MS, value: result });
+    return result;
+  }
+
+  private applyUsagePolicy(config: CdnConfig, reported: StorageUsageResponse): StorageUsageResponse {
+    const storageUsed = resolveUsageValue(reported.storageUsedBytes, config.manualStorageUsedBytes);
+    const storageQuota = resolveUsageValue(reported.storageQuotaBytes, config.storageQuotaBytes);
+    const trafficUsed = resolveUsageValue(reported.trafficUsedBytes, config.manualTrafficUsedBytes);
+    const trafficQuota = resolveUsageValue(reported.trafficQuotaBytes, config.trafficQuotaBytes);
+    return {
+      ...reported,
+      storageUsedBytes: storageUsed.value,
+      storageQuotaBytes: storageQuota.value,
+      trafficUsedBytes: trafficUsed.value,
+      trafficQuotaBytes: trafficQuota.value,
+      storageUsedSource: storageUsed.source,
+      storageQuotaSource: storageQuota.source,
+      trafficUsedSource: trafficUsed.source,
+      trafficQuotaSource: trafficQuota.source,
+      policy: {
+        priority: config.priority,
+        failoverThresholdPercent: config.failoverThresholdPercent,
+        autoFailover: config.autoFailover,
+        manualUsageUpdatedAt: config.manualUsageUpdatedAt?.toISOString() ?? null,
+      },
+    };
   }
 
   private usageAdapter(provider: CdnProvider): StorageAdapter | null {
@@ -725,6 +952,7 @@ export class CdnService {
       config,
     };
 
+    // Upload is the hard requirement: it proves the credentials, bucket and endpoint.
     try {
       await adapter.upload(runtimeConfig, {
         key,
@@ -750,7 +978,13 @@ export class CdnService {
         message: response.ok ? '探测对象可读取。' : `读取失败：${response.status} ${response.statusText}`,
       });
     } catch (error) {
-      checks.push({ name: 'download', status: 'FAIL', message: this.errorMessage(error) });
+      // Network-level failures (DNS / TLS / SSRF guard) are local environment issues,
+      // not a credential problem — upload already succeeded, so warn instead of failing.
+      checks.push({
+        name: 'download',
+        status: 'WARN',
+        message: `当前网络无法读取探测对象（域名解析/证书/代理）：${this.errorMessage(error)}`,
+      });
     }
 
     try {
@@ -762,7 +996,6 @@ export class CdnService {
 
     return checks;
   }
-
   private remoteAdapter(provider: CdnProvider): StorageAdapter {
     if (provider === CdnProvider.QINIU) {
       return this.qiniuAdapter;

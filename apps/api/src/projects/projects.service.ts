@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -25,6 +25,13 @@ import { ListProjectsDto } from './dto/list-projects.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 import { ProjectAccessService } from './project-access.service';
 
+type WebdavProjectFields = {
+  webdavEnabled?: boolean;
+  webdavUsername?: string | null;
+  webdavPasswordHash?: string;
+  webdavPasswordVault?: string;
+};
+
 @Injectable()
 export class ProjectsService {
   constructor(
@@ -41,9 +48,13 @@ export class ProjectsService {
     const appSecretHash = await bcrypt.hash(appSecret, PASSWORD_SALT_ROUNDS);
     const cryptoKey = getAppCryptoKey(this.configService);
     const defaultStorageConfigId = await this.ensureDefaultLocalStorageConfig();
+    // Validated up-front so a bad WebDAV credential can never leave a half-created
+    // project behind (that used to make admins retry and create duplicates).
+    const webdavData = await this.buildWebdavFields(dto, null);
+
 
     const project = await this.prisma.project.create({
-      data: {
+      data: ({
         name: dto.name,
         description: dto.description,
         allowedDomains: normalizeDomainAllowlist(dto.allowedDomains) as Prisma.InputJsonValue,
@@ -56,6 +67,7 @@ export class ProjectsService {
         publicLibrarySlug: dto.publicLibrarySlug?.trim() || null,
         quotaBytes: dto.quotaBytes == null ? null : BigInt(dto.quotaBytes),
         quotaFiles: dto.quotaFiles ?? null,
+        ...webdavData,
         apiSecrets: {
           create: {
             name: '默认密钥',
@@ -63,7 +75,7 @@ export class ProjectsService {
             secretVault: encryptText(appSecret, cryptoKey),
           },
         },
-      },
+      } as Prisma.ProjectUncheckedCreateInput),
       include: { activeCdnConfig: true },
     });
 
@@ -115,8 +127,70 @@ export class ProjectsService {
     return this.toProjectResponse(project, user);
   }
 
+  /**
+   * Build the WebDAV columns for a project create/update so credentials travel in
+   * the same write as the project itself (no half-created project on failure).
+   */
+  private async buildWebdavFields(
+    dto: UpdateProjectDto,
+    existing: {
+      webdavEnabled: boolean;
+      webdavUsername: string | null;
+      webdavPasswordHash: string | null;
+    } | null,
+  ): Promise<Prisma.ProjectUpdateInput> {
+    const touchesWebdav =
+      dto.webdavEnabled !== undefined ||
+      dto.webdavUsername !== undefined ||
+      dto.webdavPassword !== undefined;
+
+    if (!touchesWebdav) {
+      return {};
+    }
+
+    const username =
+      dto.webdavUsername === undefined
+        ? existing?.webdavUsername ?? null
+        : dto.webdavUsername?.trim() || null;
+    const hasPassword =
+      dto.webdavPassword !== undefined && dto.webdavPassword !== null && dto.webdavPassword !== ''
+      ? true
+      : Boolean(existing?.webdavPasswordHash);
+    const enabled = dto.webdavEnabled ?? existing?.webdavEnabled ?? false;
+
+    if (enabled) {
+      if (!username) {
+        throw new BadRequestException('启用 WebDAV 前必须设置用户名。');
+      }
+      if (!hasPassword) {
+        throw new BadRequestException('启用 WebDAV 前必须设置至少 8 位密码。');
+      }
+    }
+
+    const fields: WebdavProjectFields = {
+      webdavEnabled: enabled,
+      webdavUsername: username,
+    };
+
+    if (dto.webdavPassword) {
+      fields.webdavPasswordHash = await bcrypt.hash(dto.webdavPassword, PASSWORD_SALT_ROUNDS);
+      fields.webdavPasswordVault = encryptText(dto.webdavPassword, getAppCryptoKey(this.configService));
+    }
+
+    return fields;
+  }
+
   async update(projectId: string, dto: UpdateProjectDto, user: RequestUser): Promise<Record<string, unknown>> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
+    const existingProject = await this.prisma.project.findFirst({
+      where: { id: projectId, deletedAt: null },
+      select: { webdavUsername: true, webdavPasswordHash: true, webdavEnabled: true },
+    });
+    if (!existingProject) {
+      throw new NotFoundException('项目不存在。');
+    }
+
+    const webdavData = await this.buildWebdavFields(dto, existingProject);
     const data: Prisma.ProjectUpdateInput = {
       name: dto.name,
       description: dto.description,
@@ -139,6 +213,7 @@ export class ProjectsService {
             ? null
             : BigInt(dto.quotaBytes),
       quotaFiles: dto.quotaFiles === undefined ? undefined : dto.quotaFiles,
+      ...webdavData,
     };
     const project = await this.prisma.project.update({
       where: { id: projectId },
@@ -598,6 +673,8 @@ export class ProjectsService {
     publicLibrarySlug?: string | null;
     quotaBytes?: bigint | null;
     quotaFiles?: number | null;
+    webdavEnabled?: boolean;
+    webdavUsername?: string | null;
     createdAt: Date;
     updatedAt: Date;
     activeCdnConfig?: { provider: CdnProvider; name: string } | null;
@@ -617,6 +694,8 @@ export class ProjectsService {
       publicLibrarySlug: project.publicLibrarySlug ?? null,
       quotaBytes: project.quotaBytes == null ? null : Number(project.quotaBytes),
       quotaFiles: project.quotaFiles ?? null,
+      webdavEnabled: Boolean(project.webdavEnabled),
+      webdavUsername: project.webdavUsername ?? null,
       activeCdnProvider: project.activeCdnConfig?.provider ?? null,
       activeCdnName: project.activeCdnConfig?.name ?? null,
       fileCount: project._count?.files ?? 0,

@@ -58,6 +58,11 @@
               </div>
             </div>
           </el-popover>
+          <el-tooltip v-if="versionCheck" :content="versionTooltip" placement="bottom">
+            <el-tag v-if="versionCheck.updateAvailable" type="warning">发现新版本 {{ versionCheck.latestVersion }}</el-tag>
+            <el-tag v-else-if="versionCheck.state === 'available'" type="success">已是最新版本</el-tag>
+            <el-tag v-else-if="versionCheck.state === 'unavailable'" type="info">版本检查暂不可用</el-tag>
+          </el-tooltip>
           <span class="user-name">{{ authStore.currentUser?.displayName }}</span>
           <el-tag :type="authStore.currentUser?.totpEnabled ? 'success' : 'info'">
             2FA {{ authStore.currentUser?.totpEnabled ? '已启用' : '未启用' }}
@@ -218,6 +223,7 @@ import {
   Delete,
   Files,
   Folder,
+  FolderOpened,
   Guide,
   Key,
   Link,
@@ -234,10 +240,15 @@ import { toDataURL } from 'qrcode';
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { authApi, notificationApi, projectApi, sessionApi, type TotpSetupResult } from '@/api/modules';
+import { authApi, notificationApi, projectApi, sessionApi, versionApi, type TotpSetupResult, type VersionCheckResult } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import type { Project } from '@/types';
 import { copyText } from '@/utils/io';
+
+const versionCheck = ref<VersionCheckResult | null>(null);
+const versionTooltip = computed(() => versionCheck.value
+  ? `当前版本 ${versionCheck.value.currentVersion} · 最新版本 ${versionCheck.value.latestVersion ?? '未知'}`
+  : '版本检查');
 
 const route = useRoute();
 const router = useRouter();
@@ -305,6 +316,7 @@ const menuItems = computed(() => {
       { path: '/audit-logs', label: '日志审计', icon: Memo },
       { path: '/share-ip-abuse', label: 'IP 防刷', icon: Warning },
       { path: '/system-health', label: '系统健康', icon: Monitor },
+      { path: '/backups', label: '备份管理', icon: FolderOpened },
       { path: '/settings', label: '系统设置', icon: Setting },
     );
   }
@@ -508,6 +520,9 @@ function logout(): void {
 
 onMounted(async () => {
   await authStore.loadProfile();
+  if (authStore.currentUser?.role === 'SUPER_ADMIN') {
+    try { versionCheck.value = await versionApi.check(); } catch { /* configured source may be offline */ }
+  }
   await loadProjects();
   await loadNotifications();
   if (authStore.currentUser?.mustChangePassword) {

@@ -67,6 +67,100 @@
       </div>
     </section>
 
+    <section class="surface">
+      <div class="surface-body">
+        <div class="section-head">
+          <div>
+            <div class="section-title">下载流量统计（近 {{ downloadDays }} 日）</div>
+            <div class="muted">统计所有下载入口：后台、开放 API、公开访问、分享与 WebDAV。</div>
+          </div>
+          <el-select v-model="downloadDays" size="small" style="width: 130px" @change="loadDownloadStats">
+            <el-option :value="1" label="近 1 日" />
+            <el-option :value="7" label="近 7 日" />
+            <el-option :value="30" label="近 30 日" />
+            <el-option :value="90" label="近 90 日" />
+          </el-select>
+        </div>
+
+        <div class="metric-grid">
+          <div class="metric">
+            <div class="metric-label">下载流量</div>
+            <div class="metric-value">{{ formatSize(downloadSummary?.totalBytes || 0) }}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">下载次数</div>
+            <div class="metric-value">{{ downloadSummary?.totalCount || 0 }}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">成功 / 失败</div>
+            <div class="metric-value small-value">
+              {{ downloadSummary?.successCount || 0 }} / {{ downloadSummary?.failedCount || 0 }}
+            </div>
+          </div>
+        </div>
+
+        <el-row :gutter="16" style="margin-top: 12px">
+          <el-col :xs="24" :md="12">
+            <div class="muted" style="margin-bottom: 8px">按来源统计</div>
+            <el-table :data="downloadSummary?.bySource || []" size="small" empty-text="暂无下载数据">
+              <el-table-column label="来源" min-width="120">
+                <template #default="{ row }">{{ sourceLabel(row.source) }}</template>
+              </el-table-column>
+              <el-table-column prop="count" label="次数" width="90" />
+              <el-table-column label="流量" width="130">
+                <template #default="{ row }">{{ formatSize(row.bytes) }}</template>
+              </el-table-column>
+            </el-table>
+          </el-col>
+          <el-col :xs="24" :md="12">
+            <div class="muted" style="margin-bottom: 8px">下载最多的文件</div>
+            <el-table :data="downloadSummary?.byFile || []" size="small" empty-text="暂无下载数据">
+              <el-table-column label="文件" min-width="180" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.originalName || row.fileId || '-' }}</template>
+              </el-table-column>
+              <el-table-column prop="count" label="次数" width="90" />
+              <el-table-column label="流量" width="130">
+                <template #default="{ row }">{{ formatSize(row.bytes) }}</template>
+              </el-table-column>
+            </el-table>
+          </el-col>
+        </el-row>
+
+        <div class="muted" style="margin: 16px 0 8px">最近下载明细</div>
+        <el-table v-loading="downloadLoading" :data="downloadItems" size="small" empty-text="暂无下载记录">
+          <el-table-column label="时间" width="170">
+            <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
+          </el-table-column>
+          <el-table-column label="文件" min-width="200" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.originalName || row.fileId || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="来源" width="110">
+            <template #default="{ row }">{{ sourceLabel(row.source) }}</template>
+          </el-table-column>
+          <el-table-column label="流量" width="110">
+            <template #default="{ row }">{{ formatSize(row.bytes) }}</template>
+          </el-table-column>
+          <el-table-column prop="ip" label="IP" min-width="130" show-overflow-tooltip />
+          <el-table-column label="结果" width="80">
+            <template #default="{ row }">
+              <el-tag :type="row.success ? 'success' : 'danger'" size="small">
+                {{ row.success ? '成功' : '失败' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-pagination
+          v-if="downloadTotal > downloadPageSize"
+          v-model:current-page="downloadPage"
+          :page-size="downloadPageSize"
+          :total="downloadTotal"
+          layout="prev, pager, next"
+          style="margin-top: 12px"
+          @current-change="loadDownloadStats"
+        />
+      </div>
+    </section>
+
     <section v-if="stats?.uploadTrend?.length" class="surface">
       <div class="surface-body">
         <div class="section-title">近 30 日上传趋势</div>
@@ -380,8 +474,16 @@ import { onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { http } from '@/api/http';
-import { cdnApi, fileApi, projectApi, uploadCredentialApi } from '@/api/modules';
-import type { CdnConfig, ManagedFile, Project, ProjectSecret, ProjectStats, StorageUsageResult } from '@/types';
+import { cdnApi, downloadStatsApi, fileApi, projectApi, uploadCredentialApi } from '@/api/modules';
+import type {
+  CdnConfig,
+  DownloadStatsSummary,
+  ManagedFile,
+  Project,
+  ProjectSecret,
+  ProjectStats,
+  StorageUsageResult,
+} from '@/types';
 import { saveBlob } from '@/utils/io';
 
 const route = useRoute();
@@ -437,6 +539,47 @@ const lifecyclePolicies = ref<
   }>
 >([]);
 
+const downloadDays = ref(30);
+const downloadLoading = ref(false);
+const downloadSummary = ref<DownloadStatsSummary | null>(null);
+const downloadItems = ref<
+  Array<{
+    id: string;
+    fileId: string | null;
+    originalName: string | null;
+    bytes: number;
+    source: string;
+    success: boolean;
+    ip: string | null;
+    createdAt: string;
+  }>
+>([]);
+const downloadTotal = ref(0);
+const downloadPage = ref(1);
+const downloadPageSize = 20;
+
+function sourceLabel(source: string): string {
+  return downloadSummary.value?.labels?.[source] || source;
+}
+
+async function loadDownloadStats(): Promise<void> {
+  downloadLoading.value = true;
+  try {
+    const [summary, list] = await Promise.all([
+      downloadStatsApi.summary(projectId, { days: downloadDays.value }),
+      downloadStatsApi.list(projectId, {
+        days: downloadDays.value,
+        page: downloadPage.value,
+        pageSize: downloadPageSize,
+      }),
+    ]);
+    downloadSummary.value = summary;
+    downloadItems.value = list.items;
+    downloadTotal.value = list.total;
+  } finally {
+    downloadLoading.value = false;
+  }
+}
 function formatTime(value?: string | null): string {
   return value ? new Date(value).toLocaleString() : '-';
 }
@@ -475,6 +618,7 @@ async function loadDetail(): Promise<void> {
   cdnConfigs.value = cdnResult;
   files.value = fileResult.items;
   void loadHotspots();
+  void loadDownloadStats();
   void loadActiveCloudUsage(cdnResult);
   if (projectResult.canManage) {
     const secretResult = await projectApi.listSecrets(projectId);

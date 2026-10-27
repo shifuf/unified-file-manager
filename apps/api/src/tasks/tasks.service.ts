@@ -136,8 +136,8 @@ export class TasksService {
   async cancel(taskId: string, user: RequestUser): Promise<Record<string, unknown>> {
     const task = await this.findTaskForUser(taskId, user, true);
 
-    if (task.status !== 'RUNNING') {
-      throw new BadRequestException('只有运行中的任务可以取消。');
+    if (!['RUNNING', 'PAUSED'].includes(task.status)) {
+      throw new BadRequestException('只有运行中或已暂停的任务可以取消。');
     }
 
     const updated = await this.prisma.task.update({
@@ -147,6 +147,8 @@ export class TasksService {
         progress: task.progress,
         error: '任务已手动取消。',
         finishedAt: new Date(),
+        leaseOwner: null,
+        leaseUntil: null,
       },
       include: { project: { select: { id: true, name: true } } },
     });
@@ -161,6 +163,32 @@ export class TasksService {
     return this.toResponse(updated);
   }
 
+  async pause(taskId: string, user: RequestUser): Promise<Record<string, unknown>> {
+    const task = await this.findTaskForUser(taskId, user, true);
+    if (task.type !== 'STORAGE_MIGRATION' || task.status !== 'RUNNING') {
+      throw new BadRequestException('仅运行中的存储迁移任务可以暂停。');
+    }
+    const paused = await this.prisma.task.update({
+      where: { id: taskId },
+      data: { status: 'PAUSED', leaseOwner: null, leaseUntil: null },
+      include: { project: { select: { id: true, name: true } } },
+    });
+    return this.toResponse(paused);
+  }
+
+  async resume(taskId: string, user: RequestUser): Promise<Record<string, unknown>> {
+    const task = await this.findTaskForUser(taskId, user, true);
+    if (task.type !== 'STORAGE_MIGRATION' || task.status !== 'PAUSED') {
+      throw new BadRequestException('仅已暂停的存储迁移任务可以恢复。');
+    }
+    const resumed = await this.prisma.task.update({
+      where: { id: taskId },
+      data: { status: 'RUNNING', error: null, finishedAt: null, leaseOwner: null, leaseUntil: null },
+      include: { project: { select: { id: true, name: true } } },
+    });
+    return this.toResponse(resumed);
+  }
+
   async retry(taskId: string, user: RequestUser): Promise<Record<string, unknown>> {
     const task = await this.findTaskForUser(taskId, user, true);
 
@@ -168,22 +196,43 @@ export class TasksService {
       throw new BadRequestException('只有失败任务可以重试。');
     }
 
+    const originalDetail = this.asRecord(task.detail);
+    const failedIds = Array.isArray(originalDetail.failures)
+      ? originalDetail.failures.flatMap((failure) => {
+          if (!failure || typeof failure !== 'object' || Array.isArray(failure)) return [];
+          const id = (failure as Record<string, unknown>).fileId;
+          return typeof id === 'string' ? [id] : [];
+        })
+      : [];
+    const migrationRetry = task.type === 'STORAGE_MIGRATION';
+    const retryDetail: Prisma.InputJsonValue = migrationRetry
+      ? {
+          ...originalDetail,
+          retriedFromTaskId: task.id,
+          retryFileIds: failedIds.length > 0 ? failedIds : undefined,
+          retryIndex: 0,
+          cursor: failedIds.length > 0 ? '' : String(originalDetail.cursor ?? ''),
+          total: failedIds.length > 0 ? failedIds.length : originalDetail.total,
+          scanned: 0,
+          migrated: 0,
+          skipped: 0,
+          failed: 0,
+          failures: [],
+        } as Prisma.InputJsonObject
+      : { retriedFromTaskId: task.id, originalDetail: task.detail };
     const retried = await this.prisma.task.create({
       data: {
         projectId: task.projectId,
         type: task.type,
         title: `${task.title}（重试）`,
-        status: 'COMPLETED',
-        progress: 100,
-        detail: {
-          retriedFromTaskId: task.id,
-          originalDetail: task.detail,
-        },
-        result: {
-          retryNotice: '该任务已重新登记为重试完成；涉及外部副作用的任务请在对应功能页重新执行。',
+        status: migrationRetry ? 'RUNNING' : 'COMPLETED',
+        progress: migrationRetry ? 0 : 100,
+        detail: retryDetail,
+        result: migrationRetry ? undefined : {
+          retryNotice: '该任务已重新登记；涉及外部副作用的任务请在对应功能页重新执行。',
           originalError: task.error,
         },
-        finishedAt: new Date(),
+        finishedAt: migrationRetry ? null : new Date(),
       },
       include: { project: { select: { id: true, name: true } } },
     });
@@ -215,6 +264,12 @@ export class TasksService {
     });
 
     return { success: true };
+  }
+
+  private asRecord(value: Prisma.JsonValue | null): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
   }
 
   private async findTaskForUser(

@@ -42,11 +42,16 @@ import {
 import { safeFetch } from '../common/utils/ssrf-guard.util';
 import { SettingsService } from '../settings/settings.service';
 import { StorageService } from '../storage/storage.service';
+import { DownloadSource } from '@prisma/client';
+
 import { AccessStatsService } from './access-stats.service';
+import { DownloadStatsService } from './download-stats.service';
 import { BatchDownloadDto } from './dto/batch-download.dto';
+import { CreateFolderDto } from './dto/create-folder.dto';
 import { BatchFileOperationDto } from './dto/batch-file-operation.dto';
 import { BatchCopyFileDto, BatchMoveFileDto } from './dto/batch-move-file.dto';
 import { CopyFileDto } from './dto/copy-file.dto';
+import { CopyFileToStorageDto } from './dto/copy-file-to-storage.dto';
 import { CreateShareLinkDto } from './dto/create-share-link.dto';
 import { InitChunkedUploadDto } from './dto/init-chunked-upload.dto';
 import { ListFilesDto } from './dto/list-files.dto';
@@ -55,6 +60,7 @@ import { MoveFileDto } from './dto/move-file.dto';
 import { UpdateFileDto } from './dto/update-file.dto';
 import { UpdateShareLinkDto } from './dto/update-share-link.dto';
 import { FilesService } from './files.service';
+import { FolderManagerService } from './folder-manager.service';
 import {
   createImageTransformStream,
   hasImageTransform,
@@ -64,6 +70,8 @@ import {
 } from './image-transform.util';
 import { UploadFilesInterceptor } from './interceptors/upload-files.interceptor';
 import { createWatermarkStream } from './watermark.util';
+
+type ShareFileRef = { originalName: string; mimeType: string };
 
 type ArchiveFailure = {
   name: string;
@@ -77,7 +85,11 @@ type ArchiveFile = Awaited<ReturnType<FilesService['listArchiveFiles']>>[number]
 @UseGuards(JwtAuthGuard)
 @Controller()
 export class FilesController {
-  constructor(private readonly filesService: FilesService) {}
+  constructor(
+    private readonly filesService: FilesService,
+    private readonly folderManagerService: FolderManagerService,
+    private readonly downloadStatsService: DownloadStatsService,
+  ) {}
 
   @Get('files')
   list(@Query() query: ListFilesDto, @CurrentUser() user: RequestUser): ReturnType<FilesService['list']> {
@@ -192,6 +204,15 @@ export class FilesController {
     return this.filesService.listFolderTree(projectId, user);
   }
 
+  @Post('projects/:projectId/files/folders')
+  createFolder(
+    @Param('projectId') projectId: string,
+    @Body() dto: CreateFolderDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<FolderManagerService['createForUser']> {
+    return this.folderManagerService.createForUser(projectId, dto.folderPath, user);
+  }
+
   @Post('projects/:projectId/files/migrate-local')
   migrateLocalFiles(
     @Param('projectId') projectId: string,
@@ -221,6 +242,22 @@ export class FilesController {
         : undefined;
     const { file, target } = await this.filesService.getDownloadTarget(fileId, user, range);
 
+    this.downloadStatsService.record({
+      projectId: file.projectId,
+      fileId: file.id,
+      originalName: file.originalName,
+      bytes:
+        parsed && typeof parsed === 'object'
+          ? parsed.end - parsed.start + 1
+          : size,
+      source: DownloadSource.ADMIN,
+      actorId: user.id,
+      ip: getClientIp(request),
+      userAgent: request.get('user-agent') ?? null,
+      rangeStart: parsed && typeof parsed === 'object' ? parsed.start : null,
+      rangeEnd: parsed && typeof parsed === 'object' ? parsed.end : null,
+    });
+
     await this.writeDownloadResponse(
       response,
       file.originalName,
@@ -237,6 +274,7 @@ export class FilesController {
   async batchDownload(
     @Body() dto: BatchDownloadDto,
     @CurrentUser() user: RequestUser,
+    @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
     const files = await this.filesService.listArchiveFiles(dto.fileIds, user);
@@ -252,6 +290,16 @@ export class FilesController {
       try {
         const target = await this.resolveArchiveTarget(file.id, user);
         archive.append(target, { name: this.buildArchiveEntryName(file, usedNames) });
+        this.downloadStatsService.record({
+          projectId: file.projectId,
+          fileId: file.id,
+          originalName: file.originalName,
+          bytes: Number(file.size),
+          source: DownloadSource.BATCH,
+          actorId: user.id,
+          ip: getClientIp(request),
+          userAgent: request.get('user-agent') ?? null,
+        });
       } catch (error) {
         failures.push({
           name: file.originalName,
@@ -314,6 +362,15 @@ export class FilesController {
     @CurrentUser() user: RequestUser,
   ): ReturnType<FilesService['move']> {
     return this.filesService.move(fileId, dto, user);
+  }
+
+  @Post('files/:fileId/copy-to-storage')
+  copyToStorage(
+    @Param('fileId') fileId: string,
+    @Body() dto: CopyFileToStorageDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<FilesService['copyToStorage']> {
+    return this.filesService.copyToStorage(fileId, dto.targetConfigId, user);
   }
 
   @Post('files/:fileId/copy')
@@ -563,6 +620,7 @@ export class PublicFilesController {
     private readonly settingsService: SettingsService,
     private readonly storageService: StorageService,
     private readonly accessStatsService: AccessStatsService,
+    private readonly downloadStatsService: DownloadStatsService,
   ) {}
 
   /**
@@ -718,6 +776,16 @@ export class PublicFilesController {
       origin: request.get('origin'),
     });
 
+    this.downloadStatsService.record({
+      projectId: file.projectId,
+      fileId: file.id,
+      originalName: file.originalName,
+      bytes: Number(file.size) || 0,
+      source: DownloadSource.PUBLIC,
+      ip: getClientIp(request),
+      userAgent: request.get('user-agent') ?? null,
+      referer: request.get('referer') ?? null,
+    });
     const transformOptions = parseImageTransformOptions(
       rawWidth,
       rawFormat,
@@ -1074,7 +1142,10 @@ export class PublicFilesController {
 @Throttle({ limit: 60, windowMs: 60_000 })
 @Controller('shares')
 export class PublicSharesController {
-  constructor(private readonly filesService: FilesService) {}
+  constructor(
+    private readonly downloadStatsService: DownloadStatsService,
+    private readonly filesService: FilesService,
+  ) {}
 
   /** Resolve share metadata by opaque token or multi-segment customPath (e.g. docs/readme). */
   @Get('resolve')
@@ -1110,7 +1181,16 @@ export class PublicSharesController {
     const { file, target, watermarkText } = await this.filesService.getShareDownloadTarget(token, password, {
       ip: getClientIp(request),
     });
-    await this.writeShareFileResponse(response, file.originalName, file.mimeType, target, 'attachment', {
+    this.downloadStatsService.record({
+      projectId: file.projectId,
+      fileId: file.id,
+      originalName: file.originalName,
+      bytes: Number(file.size),
+      source: DownloadSource.SHARE,
+      ip: getClientIp(request),
+      userAgent: request.get('user-agent') ?? null,
+    });
+    await this.writeShareFileResponse(response, file as ShareFileRef, target, 'attachment', {
       watermarkText,
       category: file.category,
       size: Number(file.size),
@@ -1162,7 +1242,16 @@ export class PublicSharesController {
       skipPassword: sessionValid,
       skipRateLimit: sessionValid,
     });
-    await this.writeShareFileResponse(response, file.originalName, file.mimeType, target, 'attachment', {
+    this.downloadStatsService.record({
+      projectId: file.projectId,
+      fileId: file.id,
+      originalName: file.originalName,
+      bytes: Number(file.size),
+      source: DownloadSource.SHARE,
+      ip: getClientIp(request),
+      userAgent: request.get('user-agent') ?? null,
+    });
+    await this.writeShareFileResponse(response, file as ShareFileRef, target, 'attachment', {
       watermarkText,
       category: file.category,
       size: Number(file.size),
@@ -1186,7 +1275,7 @@ export class PublicSharesController {
       countDownload: false,
       ip: getClientIp(request),
     });
-    await this.writeShareFileResponse(response, file.originalName, file.mimeType, target, 'inline', {
+    await this.writeShareFileResponse(response, file as ShareFileRef, target, 'inline', {
       watermarkText,
       category: file.category,
       size: Number(file.size),
@@ -1195,8 +1284,7 @@ export class PublicSharesController {
 
   private async writeShareFileResponse(
     response: Response,
-    filename: string,
-    mimeType: string,
+    file: { originalName: string; mimeType: string },
     target: Awaited<ReturnType<FilesService['getShareDownloadTarget']>>['target'],
     disposition: 'attachment' | 'inline',
     options: {
@@ -1220,7 +1308,7 @@ export class PublicSharesController {
     // mimeType, so an inline HTML/SVG file would run script in this origin. Force it
     // to a download and lock everything else down with a sandboxed, no-script CSP.
     const effectiveDisposition =
-      disposition === 'inline' && this.isInlineUnsafeType(mimeType) ? 'attachment' : disposition;
+      disposition === 'inline' && this.isInlineUnsafeType(file.mimeType) ? 'attachment' : disposition;
 
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1245,11 +1333,11 @@ export class PublicSharesController {
     const size = options.size ?? 0;
     applyRangeHeaders(
       response,
-      mimeType,
+      file.mimeType,
       size,
       options.range ?? null,
       effectiveDisposition,
-      filename,
+      file.originalName,
     );
 
     const onStreamError = (error?: Error): void => {
@@ -1266,7 +1354,7 @@ export class PublicSharesController {
     const shouldWatermark =
       Boolean(options.watermarkText) &&
       options.category === 'IMAGE' &&
-      !this.isInlineUnsafeType(mimeType) &&
+      !this.isInlineUnsafeType(file.mimeType) &&
       !options.range;
 
     if (shouldWatermark) {

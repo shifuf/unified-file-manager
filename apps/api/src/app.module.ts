@@ -21,6 +21,8 @@ import { TasksModule } from './tasks/tasks.module';
 import { HealthController } from './health.controller';
 import { LifecycleModule } from './lifecycle/lifecycle.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { BackupModule } from './backup/backup.module';
+import { WebdavModule } from './webdav/webdav.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 
 /** Only `.env` is used (cwd or monorepo root). */
@@ -49,6 +51,8 @@ function resolveEnvFilePath(): string[] {
     WebhooksModule,
     NotificationsModule,
     LifecycleModule,
+    WebdavModule,
+    BackupModule,
   ],
   controllers: [HealthController],
   providers: [{ provide: APP_GUARD, useClass: ThrottleGuard }],

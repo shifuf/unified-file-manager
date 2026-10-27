@@ -1,4 +1,4 @@
-﻿/** Console is single super-admin only. */
+/** Console is single super-admin only. */
 export type UserRole = 'SUPER_ADMIN';
 export type CdnProvider = 'LOCAL' | 'QINIU' | 'UPYUN' | 'ALIYUN' | 'S3';
 export type FileCategory = 'IMAGE' | 'DOCUMENT' | 'VIDEO' | 'AUDIO' | 'ARCHIVE' | 'CODE' | 'OTHER';
@@ -118,6 +118,8 @@ export interface Project {
   publicLibrarySlug?: string | null;
   quotaBytes?: number | null;
   quotaFiles?: number | null;
+  webdavEnabled?: boolean;
+  webdavUsername?: string | null;
   canManage: boolean;
   createdAt: string;
   updatedAt: string;
@@ -131,6 +133,14 @@ export interface CdnConfig {
   config: Record<string, unknown>;
   active: boolean;
   enabled: boolean;
+  priority?: number;
+  storageQuotaBytes?: string | null;
+  manualStorageUsedBytes?: string | null;
+  trafficQuotaBytes?: string | null;
+  manualTrafficUsedBytes?: string | null;
+  failoverThresholdPercent?: number;
+  autoFailover?: boolean;
+  manualUsageUpdatedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -165,6 +175,8 @@ export interface ManagedFile {
   progressiveUrl?: string | null;
   hlsUrl?: string | null;
   cdnProvider?: CdnProvider | null;
+  storageConfigId?: string | null;
+  storageConfigName?: string | null;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string | null;
@@ -178,6 +190,9 @@ export interface ShareLink {
   projectName?: string | null;
   fileName: string;
   fileSize: number;
+  storageProvider?: CdnProvider | null;
+  storageConfigName?: string | null;
+  accessRoute?: { mode: 'ACCELERATED' | 'DIRECT'; label: '加速访问' | '源站/直连'; host: string | null };
   fileCategory: FileCategory;
   token: string;
   customPath?: string | null;
@@ -283,6 +298,11 @@ export interface StorageUsageResult {
   storageQuotaBytes: number | null;
   trafficUsedBytes: number | null;
   trafficQuotaBytes: number | null;
+  storageUsedSource?: 'provider' | 'manual' | 'unavailable';
+  storageQuotaSource?: 'provider' | 'manual' | 'unavailable';
+  trafficUsedSource?: 'provider' | 'manual' | 'unavailable';
+  trafficQuotaSource?: 'provider' | 'manual' | 'unavailable';
+  policy?: { priority: number; failoverThresholdPercent: number; autoFailover: boolean; manualUsageUpdatedAt: string | null };
   checkedAt: string;
   message?: string;
 }
@@ -340,4 +360,25 @@ export interface AuditLog {
   userAgent?: string | null;
   detail?: Record<string, unknown> | null;
   createdAt: string;
+}
+export type DownloadSource =
+  | 'ADMIN'
+  | 'OPEN_API'
+  | 'PUBLIC'
+  | 'SHARE'
+  | 'FOLDER_SHARE'
+  | 'WEBDAV'
+  | 'BATCH';
+
+export interface DownloadStatsSummary {
+  totalCount: number;
+  totalBytes: number;
+  successCount: number;
+  failedCount: number;
+  bySource: Array<{ source: DownloadSource; count: number; bytes: number }>;
+  byFile: Array<{ fileId: string | null; originalName: string | null; count: number; bytes: number }>;
+  byDay: Array<{ day: string; count: number; bytes: number }>;
+  topIps: Array<{ ip: string; count: number; bytes: number }>;
+  labels: Record<string, string>;
+  days: number;
 }

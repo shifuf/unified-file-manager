@@ -112,7 +112,7 @@ export class NotificationsService implements OnModuleInit {
     });
   }
 
-  private titleFor(event: string, payload: Record<string, unknown>): string {
+  private titleFor(event: string, _payload: Record<string, unknown>): string {
     switch (event) {
       case DOMAIN_EVENTS.QUOTA_EXCEEDED:
         return '项目配额超限';

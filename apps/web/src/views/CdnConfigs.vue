@@ -55,18 +55,21 @@
           </el-table-column>
           <el-table-column label="云用量" min-width="220">
             <template #default="{ row }">
-              <div v-if="row.provider === 'QINIU' || row.provider === 'UPYUN'" class="usage-cell">
+              <div v-if="['QINIU', 'UPYUN'].includes(row.provider) || row.storageQuotaBytes != null || row.manualStorageUsedBytes != null || row.trafficQuotaBytes != null || row.manualTrafficUsedBytes != null" class="usage-cell">
                 <template v-if="usageLoadingId === row.id">
                   <span class="muted">加载中…</span>
                 </template>
                 <template v-else-if="usageByConfigId[row.id]">
-                  <div v-if="!usageByConfigId[row.id]?.supported" class="muted">不适用</div>
-                  <template v-else>
+                  <div v-if="usageByConfigId[row.id]?.storageUsedBytes == null && row.manualStorageUsedBytes == null" class="muted">
+                    平台未提供空间用量
+                    <span v-if="row.storageQuotaBytes != null">· 上限 {{ formatBytes(Number(row.storageQuotaBytes)) }}</span>
+                  </div>
                     <div>
-                      空间 {{ formatBytes(usageByConfigId[row.id]?.storageUsedBytes) }}
-                      <span v-if="usageByConfigId[row.id]?.storageQuotaBytes != null">
-                        / {{ formatBytes(usageByConfigId[row.id]?.storageQuotaBytes) }}
+                      空间 {{ formatBytes(usageByConfigId[row.id]?.storageUsedBytes ?? (row.manualStorageUsedBytes == null ? null : Number(row.manualStorageUsedBytes))) }}
+                      <span v-if="usageByConfigId[row.id]?.storageQuotaBytes != null || row.storageQuotaBytes != null">
+                        / {{ formatBytes(usageByConfigId[row.id]?.storageQuotaBytes ?? Number(row.storageQuotaBytes)) }}
                       </span>
+                      <el-tag size="small" type="info">{{ usageByConfigId[row.id]?.storageUsedSource === 'provider' ? '平台' : row.manualStorageUsedBytes != null ? '手动' : '未知' }}</el-tag>
                     </div>
                     <el-progress
                       v-if="usagePercent(usageByConfigId[row.id]) != null"
@@ -75,13 +78,16 @@
                       :show-text="false"
                       style="margin: 4px 0"
                     />
-                    <div v-if="usageByConfigId[row.id]?.trafficUsedBytes != null" class="muted usage-sub">
-                      本月流量 {{ formatBytes(usageByConfigId[row.id]?.trafficUsedBytes) }}
+                    <div v-if="usageByConfigId[row.id]?.trafficUsedBytes != null || row.manualTrafficUsedBytes != null" class="muted usage-sub">
+                      流量 {{ formatBytes(usageByConfigId[row.id]?.trafficUsedBytes ?? Number(row.manualTrafficUsedBytes)) }}
+                      <span v-if="usageByConfigId[row.id]?.trafficQuotaBytes != null || row.trafficQuotaBytes != null">
+                        / {{ formatBytes(usageByConfigId[row.id]?.trafficQuotaBytes ?? Number(row.trafficQuotaBytes)) }}
+                      </span>
+                      <el-tag size="small" type="warning">{{ usageByConfigId[row.id]?.trafficUsedSource === 'provider' ? '平台回报' : usageByConfigId[row.id]?.trafficUsedSource === 'manual' ? '手动填报' : '未知' }} · 不等同 CDN 账单</el-tag>
                     </div>
                     <div v-else-if="usageByConfigId[row.id]?.message" class="muted usage-sub" :title="usageByConfigId[row.id]?.message">
                       {{ shortMessage(usageByConfigId[row.id]?.message) }}
                     </div>
-                  </template>
                 </template>
                 <template v-else>
                   <span class="muted">未加载</span>
@@ -97,7 +103,7 @@
                   测试
                 </el-button>
                 <el-button
-                  v-if="row.provider === 'QINIU' || row.provider === 'UPYUN'"
+                  v-if="['QINIU', 'UPYUN'].includes(row.provider) || row.autoFailover"
                   link
                   type="primary"
                   :loading="usageLoadingId === row.id"
@@ -162,13 +168,60 @@
           </div>
           <div class="config-help">{{ currentHelp.description }}</div>
         </div>
+        <div class="config-section">
+          <div class="config-section-title">用量与自动切换</div>
+          <div class="config-field-grid">
+            <el-form-item label="优先级（数字越小越优先）"><el-input-number v-model="form.priority" :min="0" :max="100000" /></el-form-item>
+            <el-form-item label="切换阈值 (%)"><el-input-number v-model="form.failoverThresholdPercent" :min="1" :max="100" /></el-form-item>
+            <el-form-item label="空间上限 (GiB)"><el-input-number v-model="form.storageQuotaGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="手动已用空间 (GiB)"><el-input-number v-model="form.manualStorageUsedGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="流量上限 (GiB)"><el-input-number v-model="form.trafficQuotaGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="手动已用流量 (GiB)"><el-input-number v-model="form.manualTrafficUsedGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
+          </div>
+          <el-checkbox v-model="form.autoFailover">达到阈值后自动切换新上传目标</el-checkbox>
+          <div class="field-help">平台用量优先使用平台回报；查不到时使用这里录入的用量。应用访问统计不等同于 CDN 账单流量。</div>
+        </div>
         <el-checkbox v-if="selectedProjectId && canManageSelectedProject" v-model="form.selectForProject">
           保存后设为当前项目存储
         </el-checkbox>
       </el-form>
+
+      <div v-if="draftTestResult" class="draft-test-panel">
+        <el-alert
+          :type="draftTestResult.success ? 'success' : 'error'"
+          :closable="false"
+          show-icon
+          :title="draftTestResult.success ? '连接测试通过，可以保存' : '连接测试未通过，请修正配置'"
+        />
+        <el-table :data="draftTestResult.checks" row-key="name" size="small" style="margin-top: 8px">
+          <el-table-column prop="name" label="检查项" width="140" />
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }">
+              <el-tag :type="checkTagType(row.status)">{{ row.status }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="message" label="结果" min-width="240" show-overflow-tooltip />
+        </el-table>
+      </div>
+
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitConfig">保存</el-button>
+        <div class="dialog-footer">
+          <el-button :icon="Connection" :loading="draftTesting" @click="testDraftConfig">测试连接</el-button>
+          <div class="dialog-footer-right">
+            <el-button @click="dialogVisible = false">取消</el-button>
+            <el-tooltip
+              :disabled="saveEnabled"
+              content="请先完成“测试连接”并通过后再保存"
+              placement="top"
+            >
+              <span>
+                <el-button type="primary" :loading="submitting" :disabled="!saveEnabled" @click="submitConfig">
+                  保存
+                </el-button>
+              </span>
+            </el-tooltip>
+          </div>
+        </div>
       </template>
     </el-dialog>
 
@@ -223,7 +276,7 @@
 </template>
 
 <script setup lang="ts">
-import { Plus, Refresh } from '@element-plus/icons-vue';
+import { Connection, Plus, Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
@@ -253,6 +306,10 @@ const createButtonLabel = computed(() =>
 );
 const dialogVisible = ref(false);
 const editingConfig = ref<CdnConfig | null>(null);
+const draftTesting = ref(false);
+const draftTestResult = ref<StorageHealthResult | null>(null);
+/** Fingerprint of the tested payload; any field change invalidates the result. */
+const draftTestedKey = ref('');
 const formRef = ref<FormInstance>();
 const providerOptions = [
   { label: '本地', value: 'LOCAL' },
@@ -301,6 +358,14 @@ const providerHelp: Record<CdnProvider, ProviderHelp> = {
       { key: 'password', label: '密码', required: true, secret: true, placeholder: 'operator-password' },
       { key: 'domain', label: '访问域名', required: true, placeholder: 'https://assets.example.com' },
       { key: 'endpoint', label: '接口地址', required: false, placeholder: 'https://v0.api.upyun.com' },
+      {
+        key: 'tokenSecret',
+        label: 'Token 密钥',
+        required: false,
+        secret: true,
+        placeholder: '防盗链/签名密钥，可留空',
+        help: '用于生成 _upt 防盗链签名；留空则直接使用公开域名直链。',
+      },
     ],
   },
   ALIYUN: {
@@ -331,6 +396,13 @@ const form = reactive({
   name: '',
   configValues: {} as Record<string, string>,
   selectForProject: false,
+  priority: 100,
+  failoverThresholdPercent: 90,
+  storageQuotaGiB: null as number | null,
+  manualStorageUsedGiB: null as number | null,
+  trafficQuotaGiB: null as number | null,
+  manualTrafficUsedGiB: null as number | null,
+  autoFailover: false,
 });
 const rules: FormRules = {
   provider: [{ required: true, message: '请选择存储平台。', trigger: 'change' }],
@@ -492,8 +564,10 @@ function openCreateDialog(): void {
   editingConfig.value = null;
   form.provider = 'ALIYUN';
   form.name = '';
+  Object.assign(form, { priority: 100, failoverThresholdPercent: 90, storageQuotaGiB: null, manualStorageUsedGiB: null, trafficQuotaGiB: null, manualTrafficUsedGiB: null, autoFailover: false });
   form.selectForProject = Boolean(selectedProjectId.value && canManageSelectedProject.value);
   form.configValues = buildConfigValues(form.provider);
+  resetDraftTest();
   dialogVisible.value = true;
 }
 
@@ -505,12 +579,86 @@ function openEditDialog(config: CdnConfig): void {
   editingConfig.value = config;
   form.provider = config.provider;
   form.name = config.name;
+  Object.assign(form, {
+    priority: config.priority ?? 100,
+    failoverThresholdPercent: config.failoverThresholdPercent ?? 90,
+    storageQuotaGiB: config.storageQuotaBytes == null ? null : Number(config.storageQuotaBytes) / 1073741824,
+    manualStorageUsedGiB: config.manualStorageUsedBytes == null ? null : Number(config.manualStorageUsedBytes) / 1073741824,
+    trafficQuotaGiB: config.trafficQuotaBytes == null ? null : Number(config.trafficQuotaBytes) / 1073741824,
+    manualTrafficUsedGiB: config.manualTrafficUsedBytes == null ? null : Number(config.manualTrafficUsedBytes) / 1073741824,
+    autoFailover: config.autoFailover ?? false,
+  });
   form.selectForProject = false;
   form.configValues = buildConfigValues(config.provider, config.config);
+  resetDraftTest();
   dialogVisible.value = true;
 }
 
+const draftFingerprint = computed(() =>
+  JSON.stringify({
+    provider: form.provider,
+    name: form.name,
+    config: form.configValues,
+    configId: editingConfig.value?.id ?? '',
+  }),
+);
+
+const saveEnabled = computed(
+  () =>
+    Boolean(draftTestResult.value?.success) &&
+    draftTestedKey.value === draftFingerprint.value &&
+    !draftTesting.value,
+);
+
+/** Any edit invalidates the previous probe result. */
+function resetDraftTest(): void {
+  draftTestResult.value = null;
+  draftTestedKey.value = '';
+}
+
+async function testDraftConfig(): Promise<void> {
+  const valid = await formRef.value?.validate();
+  if (!valid) {
+    return;
+  }
+
+  const parsedConfig = collectConfigValues(
+    form.provider,
+    form.configValues,
+    Boolean(editingConfig.value && editingConfig.value.provider === form.provider),
+  );
+  if (!parsedConfig) {
+    return;
+  }
+
+  const fingerprint = draftFingerprint.value;
+  draftTesting.value = true;
+  try {
+    const payload = { provider: form.provider, name: form.name, config: parsedConfig };
+    const result = editingConfig.value
+      ? await cdnApi.testDraftForConfig(editingConfig.value.id, payload, configProjectScope(editingConfig.value))
+      : await cdnApi.testDraft(
+          payload,
+          selectedProjectId.value && canManageSelectedProject.value ? selectedProjectId.value : undefined,
+        );
+
+    draftTestResult.value = result;
+    draftTestedKey.value = fingerprint;
+    if (result.success) {
+      ElMessage.success('连接测试通过，可以保存。');
+    } else {
+      ElMessage.error('连接测试未通过，请根据检查结果修正配置。');
+    }
+  } finally {
+    draftTesting.value = false;
+  }
+}
+
 async function submitConfig(): Promise<void> {
+  if (!saveEnabled.value) {
+    ElMessage.warning('请先完成“测试连接”并通过。');
+    return;
+  }
   const valid = await formRef.value?.validate();
   if (!valid) {
     return;
@@ -536,6 +684,13 @@ async function submitConfig(): Promise<void> {
         provider: form.provider,
         name: form.name,
         config: parsedConfig,
+        priority: form.priority,
+        failoverThresholdPercent: form.failoverThresholdPercent,
+        autoFailover: form.autoFailover,
+        storageQuotaBytes: form.storageQuotaGiB == null ? null : Math.round(form.storageQuotaGiB * 1073741824),
+        manualStorageUsedBytes: form.manualStorageUsedGiB == null ? null : Math.round(form.manualStorageUsedGiB * 1073741824),
+        trafficQuotaBytes: form.trafficQuotaGiB == null ? null : Math.round(form.trafficQuotaGiB * 1073741824),
+        manualTrafficUsedBytes: form.manualTrafficUsedGiB == null ? null : Math.round(form.manualTrafficUsedGiB * 1073741824),
       }, configProjectScope(editingConfig.value));
       if (form.selectForProject && selectedProjectId.value) {
         await cdnApi.activate(selectedProjectId.value, result.id);
@@ -551,6 +706,13 @@ async function submitConfig(): Promise<void> {
         provider: form.provider,
         name: form.name,
         config: parsedConfig,
+        priority: form.priority,
+        failoverThresholdPercent: form.failoverThresholdPercent,
+        autoFailover: form.autoFailover,
+        storageQuotaBytes: form.storageQuotaGiB == null ? null : Math.round(form.storageQuotaGiB * 1073741824),
+        manualStorageUsedBytes: form.manualStorageUsedGiB == null ? null : Math.round(form.manualStorageUsedGiB * 1073741824),
+        trafficQuotaBytes: form.trafficQuotaGiB == null ? null : Math.round(form.trafficQuotaGiB * 1073741824),
+        manualTrafficUsedBytes: form.manualTrafficUsedGiB == null ? null : Math.round(form.manualTrafficUsedGiB * 1073741824),
       }, projectScope);
       if (form.selectForProject && selectedProjectId.value) {
         await cdnApi.activate(selectedProjectId.value, result.id);
@@ -722,6 +884,22 @@ onMounted(loadProjects);
   line-height: 1.5;
 }
 
+.dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dialog-footer-right {
+  display: flex;
+  gap: 8px;
+}
+
+.draft-test-panel {
+  margin-top: 8px;
+}
+
 .config-help {
   width: 100%;
   margin-top: 12px;
@@ -752,3 +930,4 @@ onMounted(loadProjects);
   }
 }
 </style>
+

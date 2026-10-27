@@ -37,6 +37,7 @@
               <div class="file-cell">
                 <span>{{ row.fileName }}</span>
                 <span class="muted">{{ row.projectName || row.projectId }} · {{ formatSize(row.fileSize) }}</span>
+                <span v-if="row.accessRoute" class="muted">{{ row.storageConfigName || row.storageProvider }} · {{ row.accessRoute.label }} · {{ row.accessRoute.host || '无加速域名' }}</span>
               </div>
             </template>
           </el-table-column>

@@ -25,6 +25,7 @@
             <el-option label="完成" value="COMPLETED" />
             <el-option label="失败" value="FAILED" />
             <el-option label="运行中" value="RUNNING" />
+            <el-option label="已暂停" value="PAUSED" />
           </el-select>
           <el-input v-model="filters.type" clearable placeholder="任务类型" style="width: 180px" @keyup.enter="reload" />
         </div>
@@ -52,9 +53,11 @@
           <el-table-column label="操作" fixed="right" width="170">
             <template #default="{ row }">
               <el-button link type="primary" @click="openDetail(row)">详情</el-button>
-              <el-button v-if="row.status === 'RUNNING'" link type="warning" @click="cancelTask(row)">取消</el-button>
+              <el-button v-if="row.type === 'STORAGE_MIGRATION' && row.status === 'RUNNING'" link type="warning" @click="pauseTask(row)">暂停</el-button>
+              <el-button v-if="row.type === 'STORAGE_MIGRATION' && row.status === 'PAUSED'" link type="success" @click="resumeTask(row)">继续</el-button>
+              <el-button v-if="['RUNNING', 'PAUSED'].includes(row.status)" link type="danger" @click="cancelTask(row)">取消</el-button>
               <el-button v-if="row.status === 'FAILED'" link type="primary" @click="retryTask(row)">重试</el-button>
-              <el-button v-if="row.status !== 'RUNNING'" link type="danger" @click="removeTask(row)">删除</el-button>
+              <el-button v-if="!['RUNNING', 'PAUSED'].includes(row.status)" link type="danger" @click="removeTask(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -170,6 +173,18 @@ async function cancelTask(task: TaskItem): Promise<void> {
   });
   await taskApi.cancel(task.id);
   ElMessage.success('任务已取消。');
+  await reload();
+}
+
+async function pauseTask(task: TaskItem): Promise<void> {
+  await taskApi.pause(task.id);
+  ElMessage.success('迁移任务已暂停。');
+  await reload();
+}
+
+async function resumeTask(task: TaskItem): Promise<void> {
+  await taskApi.resume(task.id);
+  ElMessage.success('迁移任务已恢复。');
   await reload();
 }
 

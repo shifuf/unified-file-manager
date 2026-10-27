@@ -44,6 +44,7 @@ import { UpdateFileDto } from './dto/update-file.dto';
 import { UpdateShareLinkDto } from './dto/update-share-link.dto';
 import { FolderPublicService } from './folder-public.service';
 import { ShareIpAbuseService } from './share-ip-abuse.service';
+import { getAdminAccessRoute } from './share-access-route.util';
 
 type FileWithStorage = ManagedFile & {
   cdnConfig: CdnConfig | null;
@@ -1296,6 +1297,49 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     return this.toResponse(updated);
   }
 
+  async copyToStorage(
+    fileId: string,
+    targetConfigId: string,
+    user: RequestUser,
+  ): Promise<Record<string, unknown>> {
+    const file = await this.findFileForUser(fileId, user);
+    await this.projectAccessService.assertProjectAccess(user, file.projectId, true);
+    if (file.status !== FileStatus.ACTIVE) {
+      throw new BadRequestException('只能复制有效文件。');
+    }
+    if (file.cdnConfigId === targetConfigId) {
+      throw new BadRequestException('文件已经位于所选存储。');
+    }
+
+    const targetConfig = await this.prisma.cdnConfig.findFirst({
+      where: { id: targetConfigId, enabled: true, OR: [{ projectId: null }, { projectId: file.projectId }] },
+    });
+    if (!targetConfig) {
+      throw new NotFoundException('目标存储配置不存在或未启用。');
+    }
+
+    const uploadLimits = await this.settingsService.getUploadLimits();
+    if (file.size > BigInt(uploadLimits.maxFileSizeBytes)) {
+      throw new BadRequestException(`文件超过当前单文件上限 ${uploadLimits.maxFileSizeMb} MB，无法复制。`);
+    }
+
+    const result = await this.storageService.copyToConfig(file, targetConfig.id).catch((error: unknown) => {
+      throw new BadRequestException(error instanceof Error ? error.message : '复制到目标存储失败。');
+    });
+    const updated = await this.prisma.managedFile.update({
+      where: { id: file.id },
+      data: { cdnConfigId: result.cdnConfigId, storageKey: result.storageKey, publicUrl: result.publicUrl },
+      include: { cdnConfig: true, project: { select: { id: true, name: true } } },
+    });
+    await this.auditService.write({
+      action: AuditAction.FILE_UPDATE,
+      actorId: user.id,
+      projectId: file.projectId,
+      detail: { fileId: file.id, action: 'copy-to-storage', fromConfigId: file.cdnConfigId, toConfigId: targetConfig.id },
+    });
+    return this.toResponse(updated);
+  }
+
   async copy(fileId: string, dto: CopyFileDto, user: RequestUser): Promise<Record<string, unknown>> {
     const file = await this.findFileForUser(fileId, user);
     const targetProjectId = dto.projectId || file.projectId;
@@ -1486,8 +1530,26 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       orderBy: { folderPath: 'asc' },
     });
 
-    return folders.map((item) => item.folderPath).filter((value): value is string => Boolean(value));
+    // Explicitly created folders (console / WebDAV MKCOL) are real rows, so an
+    // empty folder stays visible even though no ManagedFile references it yet.
+    const registered = await this.prisma.managedFolder.findMany({
+      where: { projectId },
+      select: { path: true },
+    });
+
+    const paths = new Set<string>();
+    for (const value of [
+      ...folders.map((item) => item.folderPath),
+      ...registered.map((row) => row.path),
+    ]) {
+      if (value) {
+        paths.add(value);
+      }
+    }
+
+    return [...paths].sort((a, b) => a.localeCompare(b));
   }
+
 
   /**
    * Enforce project storage quotas.
@@ -2341,7 +2403,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       detail: { fileId, shareId: share.id, expiresAt: dto.expiresAt, maxDownloads: dto.maxDownloads, customPath },
     });
 
-    return this.toShareResponse(share, publicBaseUrl);
+    return this.toShareResponse(share, publicBaseUrl, true);
   }
 
   async createShareLinkForProject(
@@ -2390,7 +2452,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       orderBy: { createdAt: 'desc' },
     });
 
-    return shares.map((share) => this.toShareResponse(share, publicBaseUrl));
+    return shares.map((share) => this.toShareResponse(share, publicBaseUrl, true));
   }
 
   async listShareLinksForProject(
@@ -2455,7 +2517,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     });
 
     return {
-      items: shares.map((share) => this.toShareResponse(share, publicBaseUrl)),
+      items: shares.map((share) => this.toShareResponse(share, publicBaseUrl, true)),
       total,
       page,
       pageSize,
@@ -2539,7 +2601,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    return this.toShareResponse(updated, publicBaseUrl);
+    return this.toShareResponse(updated, publicBaseUrl, true);
   }
 
   async updateShareLinkForProject(
@@ -2850,6 +2912,8 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       progressiveUrl,
       hlsUrl,
       cdnProvider: file.cdnConfig?.provider ?? null,
+      storageConfigId: file.cdnConfigId ?? null,
+      storageConfigName: file.cdnConfig?.name ?? (file.cdnConfig?.provider === CdnProvider.LOCAL ? '本地存储' : null),
       createdAt: file.createdAt,
       updatedAt: file.updatedAt,
       deletedAt: file.deletedAt,
@@ -3795,10 +3859,10 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
    * Resolve a share by opaque token or by customPath (pretty URL suffix).
    * Prefer exact token match so random hex tokens are never confused with paths.
    */
-  private async findShareByAccessKey(
+  private async findShareByAccessKey<T extends Prisma.ShareLinkFindFirstArgs = Prisma.ShareLinkFindFirstArgs>(
     accessKey: string,
-    args: Record<string, unknown> = {},
-  ): Promise<any> {
+    args: T = {} as T,
+  ): Promise<Prisma.ShareLinkGetPayload<T> | null> {
     const key = decodeURIComponent(String(accessKey || '').trim()).replace(/^\/+|\/+$/g, '');
     if (!key) {
       return null;
@@ -3807,7 +3871,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     const byToken = await this.prisma.shareLink.findUnique({
       ...args,
       where: { token: key },
-    } as any);
+    } as Prisma.ShareLinkFindUniqueArgs) as Prisma.ShareLinkGetPayload<T> | null;
     if (byToken) {
       return byToken;
     }
@@ -3820,10 +3884,10 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     if (!customPath) {
       return null;
     }
-    return this.prisma.shareLink.findFirst({
+    return await this.prisma.shareLink.findFirst({
       ...args,
       where: { customPath },
-    } as any);
+    } as T) as unknown as Prisma.ShareLinkGetPayload<T> | null;
   }
 
   private toShareResponse(
@@ -3844,6 +3908,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       file: FileWithStorage;
     },
     publicBaseUrl?: string,
+    includeAdminAccessInfo = false,
   ): Record<string, unknown> {
     // Prefer request Host (passed as publicBaseUrl) so IP/domain deploys work without PUBLIC_URL.
     // PUBLIC_URL, when set, overrides (fixed CDN/site domain).
@@ -3860,6 +3925,16 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       projectName: share.file.project?.name ?? null,
       fileName: share.file.originalName,
       fileSize: Number(share.file.size),
+      ...(includeAdminAccessInfo ? {
+        storageProvider: share.file.cdnConfig?.provider ?? null,
+        storageConfigName: share.file.cdnConfig?.name ?? null,
+        accessRoute: getAdminAccessRoute(
+          share.file.cdnConfig?.provider,
+          share.file.cdnConfig?.config && typeof share.file.cdnConfig.config === 'object' && !Array.isArray(share.file.cdnConfig.config)
+            ? share.file.cdnConfig.config as Record<string, unknown>
+            : null,
+        ),
+      } : {}),
       fileCategory: share.file.category,
       token: share.token,
       customPath: share.customPath ?? null,

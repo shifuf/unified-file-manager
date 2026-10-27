@@ -38,6 +38,16 @@ export class TasksController {
     return this.tasksService.cancel(taskId, user);
   }
 
+  @Post(':taskId/pause')
+  pause(@Param('taskId') taskId: string, @CurrentUser() user: RequestUser): ReturnType<TasksService['pause']> {
+    return this.tasksService.pause(taskId, user);
+  }
+
+  @Post(':taskId/resume')
+  resume(@Param('taskId') taskId: string, @CurrentUser() user: RequestUser): ReturnType<TasksService['resume']> {
+    return this.tasksService.resume(taskId, user);
+  }
+
   @Post(':taskId/retry')
   retry(
     @Param('taskId') taskId: string,

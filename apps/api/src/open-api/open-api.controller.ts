@@ -1,5 +1,7 @@
 import { Readable } from 'node:stream';
 
+import { DownloadSource } from '@prisma/client';
+
 import {
   Body,
   Controller,
@@ -24,7 +26,11 @@ import {
   pipeStreamToResponse,
   writeUnsatisfiableRange,
 } from '../common/utils/http-range.util';
+import { getClientIp } from '../common/utils/client-ip.util';
+import { CreateFolderDto } from '../files/dto/create-folder.dto';
+import { DownloadStatsService } from '../files/download-stats.service';
 import { FilesService } from '../files/files.service';
+import { FolderManagerService } from '../files/folder-manager.service';
 import { BatchFileOperationDto } from '../files/dto/batch-file-operation.dto';
 import { CreateShareLinkDto } from '../files/dto/create-share-link.dto';
 import { UpdateFileDto } from '../files/dto/update-file.dto';
@@ -40,7 +46,11 @@ import type { OpenApiRequest } from './open-api.types';
 @UseGuards(OpenApiGuard)
 @Controller('open/files')
 export class OpenApiController {
-  constructor(private readonly filesService: FilesService) {}
+  constructor(
+    private readonly downloadStatsService: DownloadStatsService,
+    private readonly filesService: FilesService,
+    private readonly folderManagerService: FolderManagerService,
+  ) {}
 
   @Get()
   list(
@@ -56,6 +66,14 @@ export class OpenApiController {
   @Get('folders')
   listFolders(@Req() request: OpenApiRequest): ReturnType<FilesService['listFoldersForProject']> {
     return this.filesService.listFoldersForProject(request.openProject.id);
+  }
+
+  @Post('folders')
+  createFolder(
+    @Req() request: OpenApiRequest,
+    @Body() dto: CreateFolderDto,
+  ): ReturnType<FolderManagerService['createForProject']> {
+    return this.folderManagerService.createForProject(request.openProject.id, dto.folderPath);
   }
 
   @Get('folder-tree')
@@ -172,6 +190,16 @@ export class OpenApiController {
       request.openProject.id,
       range,
     );
+
+    this.downloadStatsService.record({
+      projectId: file.projectId,
+      fileId: file.id,
+      originalName: file.originalName,
+      bytes: parsed && typeof parsed === 'object' ? parsed.length : size,
+      source: DownloadSource.OPEN_API,
+      ip: getClientIp(request),
+      userAgent: request.get('user-agent') ?? null,
+    });
 
     if (target.type === 'redirect' && target.url && !range) {
       response.redirect(target.url);

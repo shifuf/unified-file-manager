@@ -6,6 +6,9 @@ import { SettingsModule } from '../settings/settings.module';
 import { StorageModule } from '../storage/storage.module';
 import { TasksModule } from '../tasks/tasks.module';
 import { AccessStatsModule } from './access-stats.module';
+import { DownloadStatsController } from './download-stats.controller';
+import { DownloadStatsService } from './download-stats.service';
+import { FolderManagerService } from './folder-manager.service';
 import { FilesController, PublicFilesController, PublicSharesController } from './files.controller';
 import { FilesService } from './files.service';
 import { FolderPublicController } from './folder-public.controller';
@@ -32,6 +35,7 @@ import { UploadCredentialGuard } from './guards/upload-credential.guard';
     FolderShareAdminController,
     PublicFolderSharesController,
     ShareIpAbuseController,
+    DownloadStatsController,
   ],
   providers: [
     FilesService,
@@ -41,6 +45,8 @@ import { UploadCredentialGuard } from './guards/upload-credential.guard';
     FolderPublicService,
     FolderShareService,
     ShareIpAbuseService,
+    DownloadStatsService,
+    FolderManagerService,
   ],
   exports: [
     FilesService,
@@ -50,6 +56,8 @@ import { UploadCredentialGuard } from './guards/upload-credential.guard';
     FolderPublicService,
     FolderShareService,
     ShareIpAbuseService,
+    DownloadStatsService,
+    FolderManagerService,
   ],
 })
 export class FilesModule {}

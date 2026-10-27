@@ -30,6 +30,8 @@ FROM source AS web-build
 RUN npm --workspace apps/web run build
 
 FROM ${NODE_IMAGE} AS api
+ARG UFM_VERSION=dev
+ENV UFM_VERSION=${UFM_VERSION}
 WORKDIR /app
 # ffmpeg enables cover extraction / optional VIDEO_TRANSCODE / VIDEO_HLS pipelines.
 RUN apk add --no-cache openssl su-exec ffmpeg

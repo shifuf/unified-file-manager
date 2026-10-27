@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -28,6 +28,14 @@ export class CdnController {
     return this.cdnService.create(dto, user);
   }
 
+  @Post('storage-configs/test')
+  testDraft(
+    @Body() dto: CreateCdnConfigDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<CdnService['testDraft']> {
+    return this.cdnService.testDraft(dto, user);
+  }
+
   @Put('storage-configs/:configId')
   update(
     @Param('configId') configId: string,
@@ -41,8 +49,18 @@ export class CdnController {
   remove(
     @Param('configId') configId: string,
     @CurrentUser() user: RequestUser,
+    @Query('force') force?: string,
   ): ReturnType<CdnService['remove']> {
-    return this.cdnService.remove(configId, user);
+    return this.cdnService.remove(configId, user, force === 'true' || force === '1');
+  }
+
+  @Post('storage-configs/:configId/test-draft')
+  testDraftForConfig(
+    @Param('configId') configId: string,
+    @Body() dto: UpdateCdnConfigDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<CdnService['testDraftForConfig']> {
+    return this.cdnService.testDraftForConfig(configId, dto, user);
   }
 
   @Post('storage-configs/:configId/test')
@@ -78,6 +96,16 @@ export class CdnController {
     return this.cdnService.selectForProject(projectId, configId, user);
   }
 
+  @Post('projects/:projectId/storage-configs/:configId/test-draft')
+  testDraftForProjectConfig(
+    @Param('projectId') projectId: string,
+    @Param('configId') configId: string,
+    @Body() dto: UpdateCdnConfigDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<CdnService['testDraftForConfig']> {
+    return this.cdnService.testDraftForConfig(configId, dto, user, projectId);
+  }
+
   @Post('projects/:projectId/storage-configs/:configId/test')
   testForProject(
     @Param('projectId') projectId: string,
@@ -94,6 +122,15 @@ export class CdnController {
     @CurrentUser() user: RequestUser,
   ): ReturnType<CdnService['getUsageForProject']> {
     return this.cdnService.getUsageForProject(projectId, configId, user);
+  }
+
+  @Post('projects/:projectId/storage-configs/test')
+  testDraftForProject(
+    @Param('projectId') projectId: string,
+    @Body() dto: CreateCdnConfigDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<CdnService['testDraft']> {
+    return this.cdnService.testDraft(dto, user, projectId);
   }
 
   @Post('projects/:projectId/storage-configs')
@@ -120,8 +157,9 @@ export class CdnController {
     @Param('projectId') projectId: string,
     @Param('configId') configId: string,
     @CurrentUser() user: RequestUser,
+    @Query('force') force?: string,
   ): ReturnType<CdnService['removeForProject']> {
-    return this.cdnService.removeForProject(projectId, configId, user);
+    return this.cdnService.removeForProject(projectId, configId, user, force === 'true' || force === '1');
   }
 
   @Get('projects/:projectId/cdn-configs')

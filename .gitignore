@@ -7,7 +7,9 @@ coverage/
 .env.*
 !.env.example
 *.log
-storage/
+/storage/
+!/apps/api/src/storage/
+!/apps/api/src/storage/**
 uploads/
 tmp/
 data/
@@ -26,3 +28,7 @@ tmp-*.log
 *.pem
 *.key
 
+
+# 会话生成的文档草稿与本地测试，不上传 GitHub
+docs/
+apps/api/test/

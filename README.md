@@ -18,6 +18,9 @@
 | 媒体 | 图片变换/缩略图；视频封面；可选 HLS/转码（Docker API 镜像含 ffmpeg） |
 | Office 预览 | 配置 `OFFICE_PREVIEW_BASE_URL`（如 KKFileView） |
 | 运维 | 配额、通知、Webhook、生命周期、访问热点、审计日志 |
+| 下载统计 | 每次下载记录文件、来源、IP、字节数；按日/来源/文件汇总，控制台可查 |
+| WebDAV | 每个项目独立开关 + 独立账号密码，挂载 `/api/dav/{projectId}`，支持 PROPFIND / GET / PUT / MKCOL / DELETE / MOVE / COPY |
+| 备份 | 控制台一键全量备份（全部数据表 + 可选本地文件实体），可下载 / 恢复（merge、replace）/ 删除 |
 
 ---
 
@@ -166,6 +169,23 @@ npm run dev:web
 - 控制台登录：`http://localhost:5174${ADMIN_LOGIN_PATH}`（默认 `/console-login`）  
 - API：`http://localhost:3000`（以 `APP_PORT` 为准）  
 
+### Windows（无 Docker，便携 MariaDB）
+
+没有 Docker 时可以用 `.runtime/` 放一份便携 MariaDB（免安装、免管理员），一条命令拉起全栈：
+
+```powershell
+# 首次：解压 MariaDB winx64 包到 .runtime/，并初始化数据目录
+#   mariadb-install-db.exe --datadir=.runtime/mysql-data --password=root_password
+powershell -ExecutionPolicy Bypass -File scripts/local-dev.ps1 start    # 启动 MySQL + API + Web
+powershell -ExecutionPolicy Bypass -File scripts/local-dev.ps1 status   # 查看端口状态
+powershell -ExecutionPolicy Bypass -File scripts/local-dev.ps1 stop     # 全部停止
+```
+
+- 端口取自 `.env`（`MYSQL_PORT` / `APP_PORT` / `VITE_WEB_PORT`）。
+- 使用便携数据库时，请把 `.env` 的 `MYSQL_HOST` 设为 `127.0.0.1` 并显式提供 `DATABASE_URL`：
+  API 启动时会先按 `MYSQL_*` 推导连接串，否则会退回默认的 `localhost:3306`。
+- 备份文件目录由 `BACKUP_ROOT` 控制（默认 `./backups`，已在 `.gitignore` 中）。
+
 ---
 
 ## 生产检查清单
@@ -176,6 +196,7 @@ npm run dev:web
 4. 自定义 `ADMIN_LOGIN_PATH`，公网部署时避免过于常见的路径  
 5. 勿将 MySQL / Redis / Meili 端口映射到公网  
 6. 健康检查：`/api/healthz`  
+7. WebDAV：在「项目 → 编辑 → WebDAV」里按项目开启并设置账号密码；生产环境建议仅在 HTTPS 下使用（Basic 认证为明文口令）
 
 ---
 

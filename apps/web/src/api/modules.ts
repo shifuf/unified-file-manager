@@ -1,4 +1,5 @@
 import type {
+  DownloadStatsSummary,
   AuditAction,
   AuditLog,
   CdnConfig,
@@ -84,6 +85,58 @@ export const authApi = {
   },
 };
 
+export const webdavApi = {
+  status(projectId: string) {
+    return http.get<
+      unknown,
+      { projectId: string; enabled: boolean; username: string | null; hasPassword: boolean; baseUrl: string }
+    >(`/projects/${projectId}/webdav`);
+  },
+  update(
+    projectId: string,
+    payload: { enabled?: boolean; username?: string | null; password?: string | null },
+  ) {
+    return http.put<
+      unknown,
+      { projectId: string; enabled: boolean; username: string | null; hasPassword: boolean; baseUrl: string }
+    >(`/projects/${projectId}/webdav`, payload);
+  },
+};
+
+export const downloadStatsApi = {
+  summary(projectId: string, params: { days?: number; source?: string; fileId?: string } = {}) {
+    return http.get<unknown, DownloadStatsSummary>(`/projects/${projectId}/download-stats/summary`, {
+      params: compactParams(params),
+    });
+  },
+  list(
+    projectId: string,
+    params: { page?: number; pageSize?: number; days?: number; source?: string; fileId?: string } = {},
+  ) {
+    return http.get<
+      unknown,
+      {
+        items: Array<{
+          id: string;
+          projectId: string;
+          fileId: string | null;
+          originalName: string | null;
+          bytes: number;
+          source: string;
+          success: boolean;
+          ip: string | null;
+          userAgent: string | null;
+          referer: string | null;
+          createdAt: string;
+        }>;
+        total: number;
+        page: number;
+        pageSize: number;
+        labels: Record<string, string>;
+      }
+    >(`/projects/${projectId}/download-stats`, { params: compactParams(params) });
+  },
+};
 export const projectApi = {
   list(keyword?: string) {
     return http.get<unknown, Project[]>('/projects', { params: { keyword } });
@@ -100,6 +153,9 @@ export const projectApi = {
     publicLibrarySlug?: string | null;
     quotaBytes?: number | null;
     quotaFiles?: number | null;
+    webdavEnabled?: boolean;
+    webdavUsername?: string | null;
+    webdavPassword?: string | null;
   }) {
     return http.post<unknown, Project & { appSecret: string; secretNotice: string }>('/projects', payload);
   },
@@ -114,6 +170,9 @@ export const projectApi = {
       publicLibrarySlug?: string | null;
       quotaBytes?: number | null;
       quotaFiles?: number | null;
+      webdavEnabled?: boolean;
+      webdavUsername?: string | null;
+      webdavPassword?: string | null;
     },
   ) {
     return http.put<unknown, Project>(`/projects/${projectId}`, payload);
@@ -172,13 +231,13 @@ export const cdnApi = {
     const url = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
     return http.get<unknown, CdnConfig[]>(url);
   },
-  create(payload: { provider: CdnProvider; name: string; config: Record<string, unknown> }, projectId?: string) {
+  create(payload: { provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }, projectId?: string) {
     const url = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
     return http.post<unknown, CdnConfig>(url, payload);
   },
   update(
     configId: string,
-    payload: Partial<{ provider: CdnProvider; name: string; config: Record<string, unknown> }>,
+    payload: Partial<{ provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }>,
     projectId?: string,
   ) {
     const url = projectId ? `/projects/${projectId}/storage-configs/${configId}` : `/storage-configs/${configId}`;
@@ -187,9 +246,21 @@ export const cdnApi = {
   activate(projectId: string, configId: string) {
     return http.post<unknown, CdnConfig>(`/projects/${projectId}/storage-configs/${configId}/select`);
   },
-  remove(configId: string, projectId?: string) {
+  remove(configId: string, projectId?: string, force = false) {
     const url = projectId ? `/projects/${projectId}/storage-configs/${configId}` : `/storage-configs/${configId}`;
-    return http.delete<unknown, { success: boolean }>(url);
+    return http.delete<unknown, { success: boolean }>(url, { params: force ? { force: true } : {} });
+  },
+  testDraft(payload: { provider: CdnProvider; name: string; config: Record<string, unknown> }, projectId?: string) {
+    const url = projectId ? `/projects/${projectId}/storage-configs/test` : '/storage-configs/test';
+    return http.post<unknown, StorageHealthResult>(url, payload);
+  },
+  testDraftForConfig(
+    configId: string,
+    payload: Partial<{ provider: CdnProvider; name: string; config: Record<string, unknown> }>,
+    projectId?: string,
+  ) {
+    const base = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
+    return http.post<unknown, StorageHealthResult>(`${base}/${configId}/test-draft`, payload);
   },
   test(configId: string, projectId?: string) {
     const url = projectId
@@ -367,6 +438,9 @@ export const fileApi = {
   move(fileId: string, payload: { folderPath?: string | null }) {
     return http.post<unknown, ManagedFile>(`/files/${fileId}/move`, payload);
   },
+  copyToStorage(fileId: string, targetConfigId: string) {
+    return http.post<unknown, ManagedFile>(`/files/${fileId}/copy-to-storage`, { targetConfigId });
+  },
   copy(fileId: string, payload: { projectId?: string; folderPath?: string | null }) {
     return http.post<unknown, ManagedFile>(`/files/${fileId}/copy`, compactUndefinedParams(payload));
   },
@@ -390,6 +464,9 @@ export const fileApi = {
   },
   listFolders(projectId: string) {
     return http.get<unknown, string[]>(`/projects/${projectId}/files/folders`);
+  },
+  createFolder(projectId: string, folderPath: string) {
+    return http.post<unknown, { folderPath: string }>(`/projects/${projectId}/files/folders`, { folderPath });
   },
   listFolderTree(projectId: string) {
     return http.get<
@@ -950,6 +1027,19 @@ export const sessionApi = {
   },
 };
 
+export interface VersionCheckResult {
+  currentVersion: string;
+  latestVersion: string | null;
+  updateAvailable: boolean | null;
+  state: 'available' | 'not_configured' | 'unavailable' | 'invalid_version';
+}
+
+export const versionApi = {
+  check() {
+    return http.get<unknown, VersionCheckResult>('/version');
+  },
+};
+
 export const taskApi = {
   list(params: { projectId?: string; status?: string; type?: string; page?: number; pageSize?: number }) {
     return http.get<unknown, PageResult<TaskItem>>('/tasks', { params: compactParams(params) });
@@ -963,8 +1053,80 @@ export const taskApi = {
   retry(taskId: string) {
     return http.post<unknown, TaskItem>(`/tasks/${taskId}/retry`);
   },
+  pause(taskId: string) {
+    return http.post<unknown, TaskItem>(`/tasks/${taskId}/pause`);
+  },
+  resume(taskId: string) {
+    return http.post<unknown, TaskItem>(`/tasks/${taskId}/resume`);
+  },
   remove(taskId: string) {
     return http.delete<unknown, { success: boolean }>(`/tasks/${taskId}`);
   },
 };
 
+
+export type BackupStatus = 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+
+export interface BackupScopeInfo {
+  key: string;
+  label: string;
+  description: string;
+  models: string[];
+}
+
+export interface BackupRecord {
+  id: string;
+  name: string;
+  status: BackupStatus;
+  includeObjects: boolean;
+  fileName: string | null;
+  fileSize: number;
+  checksum: string | null;
+  tableCounts: Record<string, number>;
+  tableRows: Record<string, number>;
+  scopes: string[];
+  objectCount: number;
+  objectBytes: number;
+  message: string | null;
+  createdById: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  fileAvailable: boolean;
+}
+
+export interface BackupRestoreResult {
+  backupId: string;
+  mode: 'merge' | 'replace';
+  scopes: string[];
+  restored: Record<string, number>;
+  objectsRestored: number;
+  failures: string[];
+}
+
+export const backupApi = {
+  list() {
+    return http.get<unknown, BackupRecord[]>('/backups');
+  },
+  scopes() {
+    return http.get<unknown, BackupScopeInfo[]>('/backups/scopes');
+  },
+  create(payload: { name?: string; scopes?: string[]; includeObjects?: boolean }) {
+    return http.post<unknown, BackupRecord>('/backups', payload);
+  },
+  importFile(file: File) {
+    const form = new FormData();
+    form.append('file', file);
+    return http.post<unknown, BackupRecord>('/backups/import', form);
+  },
+  restore(backupId: string, mode: 'merge' | 'replace', scopes?: string[]) {
+    return http.post<unknown, BackupRestoreResult>(`/backups/${backupId}/restore`, { mode, scopes });
+  },
+  remove(backupId: string) {
+    return http.delete<unknown, { success: boolean }>(`/backups/${backupId}`);
+  },
+  downloadUrl(backupId: string) {
+    return `/api/backups/${backupId}/download`;
+  },
+};

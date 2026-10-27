@@ -41,6 +41,14 @@
         </el-button>
         <el-button
           v-if="!isRecycleBin && canManageSelectedProject"
+          :icon="FolderAdd"
+          :disabled="!selectedProjectId"
+          @click="createFolder"
+        >
+          新建文件夹
+        </el-button>
+        <el-button
+          v-if="!isRecycleBin && canManageSelectedProject"
           :icon="Refresh"
           :loading="migratingLocalFiles"
           :disabled="!selectedProjectId"
@@ -369,7 +377,11 @@
               <span v-else class="muted">-</span>
             </template>
           </el-table-column>
-          <el-table-column prop="cdnProvider" label="存储" width="100" />
+          <el-table-column label="存储位置" min-width="150">
+            <template #default="{ row }">
+              <el-tag effect="dark" type="info">{{ row.storageConfigName || row.cdnProvider || '未知存储' }}</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column :label="isRecycleBin ? '删除时间' : '上传时间'" min-width="170">
             <template #default="{ row }">
               {{ formatTime(isRecycleBin ? row.deletedAt || row.updatedAt : row.createdAt) }}
@@ -383,6 +395,7 @@
                   <el-button link type="primary" :loading="downloadingIds.has(row.id)" @click="download(row)">
                     下载
                   </el-button>
+                  <el-button v-if="canManageFile(row)" link type="primary" @click="openStorageCopy(row)">复制到存储</el-button>
                   <el-button v-if="canManageFile(row)" link type="primary" @click="openEditDialog(row)">
                     编辑
                   </el-button>
@@ -440,6 +453,22 @@
         </div>
       </div>
     </section>
+
+    <el-dialog v-model="storageCopyVisible" title="复制文件到其他存储" width="520px">
+      <el-alert type="info" :closable="false" show-icon title="复制成功后文件归属切换到目标存储，源对象会保留。" />
+      <el-select v-model="storageCopyTargetId" placeholder="请选择目标存储" style="width: 100%; margin-top: 16px">
+        <el-option
+          v-for="config in storageCopyConfigs.filter((item) => item.id !== storageCopyFile?.storageConfigId)"
+          :key="config.id"
+          :label="`${config.name}（${config.provider}）`"
+          :value="config.id"
+        />
+      </el-select>
+      <template #footer>
+        <el-button @click="storageCopyVisible = false">取消</el-button>
+        <el-button type="primary" :loading="storageCopyLoading" :disabled="!storageCopyTargetId" @click="submitStorageCopy">开始复制</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="editDialogVisible" title="文件信息" width="560px">
       <el-form label-position="top">
@@ -711,14 +740,14 @@
 </template>
 
 <script setup lang="ts">
-import { Back, Delete, Document, Download, Refresh, Search, Upload } from '@element-plus/icons-vue';
+import { Back, Delete, Document, Download, FolderAdd, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { http } from '@/api/http';
-import { fileApi, folderPublicApi, projectApi, settingsApi, uploadCredentialApi } from '@/api/modules';
-import type { CdnProvider, FileCategory, FileStatus, ManagedFile, PageResult, Project, ShareLink, ShareStatus } from '@/types';
+import { cdnApi, fileApi, folderPublicApi, projectApi, settingsApi, uploadCredentialApi } from '@/api/modules';
+import type { CdnConfig, CdnProvider, FileCategory, FileStatus, ManagedFile, PageResult, Project, ShareLink, ShareStatus } from '@/types';
 import { copyText, saveBlob } from '@/utils/io';
 
 type FileListParams = Parameters<typeof fileApi.list>[0];
@@ -815,6 +844,11 @@ const versions = ref<
     remark?: string | null;
   }>
 >([]);
+const storageCopyVisible = ref(false);
+const storageCopyLoading = ref(false);
+const storageCopyTargetId = ref('');
+const storageCopyFile = ref<ManagedFile | null>(null);
+const storageCopyConfigs = ref<CdnConfig[]>([]);
 const editDialogVisible = ref(false);
 const editingFile = ref<ManagedFile | null>(null);
 const moveFile = ref<ManagedFile | null>(null);
@@ -1486,6 +1520,50 @@ async function uploadFiles(
   }
 }
 
+async function openStorageCopy(file: ManagedFile): Promise<void> {
+  if (!canManageFile(file)) return;
+  storageCopyFile.value = file;
+  storageCopyTargetId.value = '';
+  storageCopyConfigs.value = await cdnApi.list(file.projectId);
+  storageCopyVisible.value = true;
+}
+
+async function submitStorageCopy(): Promise<void> {
+  const file = storageCopyFile.value;
+  if (!file || !storageCopyTargetId.value) return;
+  storageCopyLoading.value = true;
+  try {
+    await fileApi.copyToStorage(file.id, storageCopyTargetId.value);
+    ElMessage.success('文件已复制到目标存储，源存储中的对象已保留。');
+    storageCopyVisible.value = false;
+    await reload();
+  } finally {
+    storageCopyLoading.value = false;
+  }
+}
+
+async function createFolder(): Promise<void> {
+  if (!selectedProjectId.value || !canManageSelectedProject.value) {
+    return;
+  }
+
+  const { value } = await ElMessageBox.prompt('请输入目录路径（可包含多级，如 contracts/2026）', '新建文件夹', {
+    confirmButtonText: '创建',
+    cancelButtonText: '取消',
+    inputPattern: /^[^\\:*?"<>|]+$/,
+    inputErrorMessage: '目录名不能包含 \\ : * ? " < > |',
+  });
+
+  const folderPath = String(value ?? '').trim().replace(/^\/+|\/+$/g, '');
+  if (!folderPath) {
+    ElMessage.warning('目录名不能为空。');
+    return;
+  }
+
+  await fileApi.createFolder(selectedProjectId.value, folderPath);
+  ElMessage.success('目录已创建。');
+  await reload();
+}
 async function migrateLocalFiles(): Promise<void> {
   if (!selectedProjectId.value || !canManageSelectedProject.value) {
     return;

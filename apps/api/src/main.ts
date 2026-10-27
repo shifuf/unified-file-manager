@@ -5,6 +5,7 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
 
 import { AppModule } from './app.module';
+import { WebdavMiddleware } from './webdav/webdav.middleware';
 import { ensureDatabaseUrl } from './common/utils/database-url.util';
 import {
   buildFrameAncestors,
@@ -28,6 +29,12 @@ async function bootstrap(): Promise<void> {
   app.getHttpAdapter().getInstance().set('trust proxy', resolveTrustProxy(configService));
   app.setGlobalPrefix('api');
 
+  // WebDAV lives at /api/dav/:projectId and needs raw HTTP verbs (PROPFIND/MKCOL/
+  // MOVE/COPY/LOCK/UNLOCK) that Nest routing cannot express.
+  const webdavMiddleware = app.get(WebdavMiddleware);
+  app.use('/api/dav', webdavMiddleware.handle);
+  app.use('/api/dav/', webdavMiddleware.handle);
+
   // Capture scheme+host per request so public/share links can omit PUBLIC_URL (IP:port).
   app.use(
     (
@@ -43,12 +50,16 @@ async function bootstrap(): Promise<void> {
   app.enableCors({
     origin: webOrigins.length > 0 ? webOrigins : true,
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'PROPFIND', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Depth', 'Destination', 'Overwrite', 'If', 'If-Match', 'If-None-Match', 'Range', 'Timeout'],
+    exposedHeaders: ['DAV', 'ETag', 'Content-Range', 'Content-Length', 'Accept-Ranges', 'WWW-Authenticate', 'Location'],
   });
   const requireHttps = getConfigBoolean(configService, 'REQUIRE_HTTPS', false);
   app.use(
     helmet({
       crossOriginResourcePolicy: { policy: 'cross-origin' },
+      // WebDAV clients (Windows Explorer / macOS Finder) fetch PROPFIND bodies cross-origin.
+      crossOriginEmbedderPolicy: false,
       xFrameOptions: false,
       strictTransportSecurity: requireHttps
         ? {

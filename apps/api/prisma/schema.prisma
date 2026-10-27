@@ -135,6 +135,10 @@ enum AuditAction {
   NOTIFICATION_READ
   AUDIT_EXPORT
   FILE_QUARANTINE_RELEASE
+  BACKUP_CREATE
+  BACKUP_DOWNLOAD
+  BACKUP_RESTORE
+  BACKUP_DELETE
 }
 
 model User {
@@ -171,6 +175,10 @@ model Project {
   notifyEnabled        Boolean            @default(true)
   publicLibraryEnabled Boolean            @default(false)
   publicLibrarySlug    String?            @unique @db.VarChar(64)
+  webdavEnabled        Boolean            @default(false)
+  webdavUsername       String?            @db.VarChar(64)
+  webdavPasswordHash   String?            @db.VarChar(255)
+  webdavPasswordVault  String?            @db.Text
   quotaBytes           BigInt?
   quotaFiles           Int?
   createdAt            DateTime           @default(now())
@@ -187,6 +195,8 @@ model Project {
   folderPublicPolicies FolderPublicPolicy[]
   lifecyclePolicies    LifecyclePolicy[]
   folderShareLinks     FolderShareLink[]
+  folders              ManagedFolder[]
+  downloadRecords      DownloadRecord[]
 
   @@index([name])
   @@index([activeCdnConfigId])
@@ -201,6 +211,14 @@ model CdnConfig {
   config         Json
   active         Boolean       @default(false)
   enabled        Boolean       @default(true)
+  priority       Int           @default(100)
+  storageQuotaBytes BigInt?
+  manualStorageUsedBytes BigInt?
+  trafficQuotaBytes BigInt?
+  manualTrafficUsedBytes BigInt?
+  failoverThresholdPercent Float @default(90)
+  autoFailover   Boolean       @default(false)
+  manualUsageUpdatedAt DateTime?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
   project        Project?      @relation("LegacyProjectCdnConfigs", fields: [projectId], references: [id], onDelete: SetNull)
@@ -247,6 +265,7 @@ model ManagedFile {
   shareLinks     ShareLink[]
   derivatives    FileDerivative[]
   versions       FileVersion[]
+  downloadRecords DownloadRecord[]
 
   @@index([projectId, status, category])
   @@index([projectId, status, folderPath])
@@ -462,6 +481,8 @@ model Task {
   detail     Json?
   result     Json?
   error      String?   @db.VarChar(1024)
+  leaseOwner String?   @db.VarChar(128)
+  leaseUntil DateTime?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   finishedAt DateTime?
@@ -470,6 +491,7 @@ model Task {
   @@index([projectId, createdAt])
   @@index([status, createdAt])
   @@index([type, createdAt])
+  @@index([type, status, leaseUntil])
 }
 
 model AuditLog {
@@ -560,4 +582,101 @@ model FileAccessDailyStat {
   @@index([projectId, day])
   @@index([day, hits])
   @@index([day, bytes])
+}
+
+enum DownloadSource {
+  ADMIN
+  OPEN_API
+  PUBLIC
+  SHARE
+  FOLDER_SHARE
+  WEBDAV
+  BATCH
+}
+
+model DownloadRecord {
+  id           String         @id @default(cuid())
+  projectId    String
+  fileId       String?
+  originalName String?        @db.VarChar(255)
+  size         BigInt         @default(0)
+  source       DownloadSource @default(ADMIN)
+  actorId      String?
+  shareId      String?        @db.VarChar(191)
+  ip           String?        @db.VarChar(64)
+  userAgent    String?        @db.VarChar(512)
+  referer      String?        @db.VarChar(512)
+  rangeStart   BigInt?
+  rangeEnd     BigInt?
+  success      Boolean        @default(true)
+  message      String?        @db.VarChar(512)
+  createdAt    DateTime       @default(now())
+  project      Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  file         ManagedFile?   @relation(fields: [fileId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, createdAt])
+  @@index([fileId, createdAt])
+  @@index([source, createdAt])
+  @@index([createdAt])
+}
+
+model DownloadDailyStat {
+  id            String   @id @default(cuid())
+  day           DateTime @db.Date
+  projectId     String
+  fileId        String?
+  source        DownloadSource
+  count         Int      @default(0)
+  bytes         BigInt   @default(0)
+  successCount  Int      @default(0)
+  failedCount   Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([day, projectId, fileId, source])
+  @@index([projectId, day])
+  @@index([fileId, day])
+  @@index([day, bytes])
+}
+model ManagedFolder {
+  id          String   @id @default(cuid())
+  projectId   String
+  path        String   @db.VarChar(512)
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, path])
+  @@index([projectId, path])
+}
+enum BackupStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model Backup {
+  id             String       @id @default(cuid())
+  name           String       @db.VarChar(128)
+  status         BackupStatus @default(PENDING)
+  includeObjects Boolean      @default(false)
+  fileName       String?      @db.VarChar(255)
+  fileSize       BigInt       @default(0)
+  checksum       String?      @db.VarChar(64)
+  tableCounts    Json?
+  tableRows      Json?
+  scopes         Json?
+  objectCount    Int          @default(0)
+  objectBytes    BigInt       @default(0)
+  message        String?      @db.Text
+  createdById    String?      @db.VarChar(191)
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([createdAt])
+  @@index([status])
 }
