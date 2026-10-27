@@ -23,7 +23,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm install --include=optional --no-audit --fund=false
       - run: npm --workspace apps/api run prisma:generate
       - run: npm run lint
       - run: npm run build
