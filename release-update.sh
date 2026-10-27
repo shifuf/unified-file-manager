@@ -4,11 +4,6 @@
 # 用法:
 #   bash release-update.sh            # 自动获取最新版本并更新
 #   bash release-update.sh v0.1.0     # 更新到指定版本
-# 逻辑:
-#   1. 从 GitHub(经 gh-proxy 加速)拉取最新 compose 配置
-#   2. 依次尝试 ghcr.io / 南京大学镜像 / DaoCloud 镜像拉取预构建镜像
-#   3. 重建容器(不动数据卷)
-#   4. 健康检查 + 输出真实公网 IP 验证命令
 # ============================================================
 set -u
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,6 +13,7 @@ GH_PROXY="${GH_PROXY:-https://gh-proxy.com}"
 REPO="shifuf/unified-file-manager"
 VERSION_ARG="${1:-}"
 DC="docker compose -f docker-compose.yml -f docker-compose.ghcr.yml"
+PULL_TIMEOUT="${PULL_TIMEOUT:-180}"
 
 echo "[1/5] 检查环境..."
 if ! command -v docker >/dev/null 2>&1; then
@@ -46,9 +42,16 @@ sed -i 's/\r$//' docker-compose.yml docker-compose.ghcr.yml
 echo "[3/5] 确定目标版本..."
 VERSION="$VERSION_ARG"
 if [ -z "$VERSION" ]; then
-  VERSION=$(curl -fsSL --connect-timeout 8 --max-time 15 \
+  # 方式1: GitHub API 直连(海外/有代理的机器可用)
+  VERSION=$(curl -fsSL --connect-timeout 6 --max-time 15 \
     "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
     | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+fi
+if [ -z "$VERSION" ]; then
+  # 方式2: 走 gh-proxy 拉 releases atom 源(国内可用)
+  VERSION=$(curl -fsSL --connect-timeout 8 --max-time 20 \
+    "$GH_PROXY/https://github.com/$REPO/releases.atom" 2>/dev/null \
+    | grep -o 'releases/tag/[^<"]*' | head -1 | cut -d/ -f2 || true)
 fi
 if [ -z "$VERSION" ]; then
   if [ -f .ufm-version ]; then
@@ -67,18 +70,23 @@ else
   printf '\nUFM_VERSION=%s\n' "$VERSION" >> .env
 fi
 
-echo "[4/5] 拉取镜像(自动尝试多个镜像源)..."
+echo "[4/5] 拉取镜像(自动尝试多个镜像源, 单源最多 ${PULL_TIMEOUT}s)..."
 PULLED=0
-for MIRROR in "ghcr.io" "ghcr.nju.edu.cn" "docker.m.daocloud.io/ghcr.io" "ghcr.m.daocloud.io"; do
+for MIRROR in "ghcr.io" "docker.m.daocloud.io/ghcr.io" "ghcr.nju.edu.cn" "ghcr.m.daocloud.io"; do
   echo "--- 尝试: $MIRROR ---"
   sed -i "s|image: [^ ]*/shifuf/unified-file-manager|image: $MIRROR/shifuf/unified-file-manager|g" docker-compose.ghcr.yml
-  if timeout 300 $DC pull api web >/tmp/ufm-pull.log 2>&1; then
+  timeout -k 10 "$PULL_TIMEOUT" $DC pull api web
+  RC=$?
+  if [ "$RC" = 0 ]; then
     PULLED=1
     echo "镜像源 $MIRROR 拉取成功"
     break
   fi
-  tail -5 /tmp/ufm-pull.log
-  echo "镜像源 $MIRROR 失败, 换下一个..."
+  if [ "$RC" = 124 ] || [ "$RC" = 137 ]; then
+    echo "镜像源 $MIRROR 超时(${PULL_TIMEOUT}s), 换下一个..."
+  else
+    echo "镜像源 $MIRROR 拉取失败(退出码 $RC), 换下一个..."
+  fi
 done
 if [ "$PULLED" != 1 ]; then
   echo "错误: 所有镜像源都拉取失败。请检查网络后重试, 或手动指定版本: bash release-update.sh vX.Y.Z"
