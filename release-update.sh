@@ -101,8 +101,10 @@ if [ "$PULLED" != 1 ]; then
   exit 1
 fi
 
-echo "重建容器(数据卷不受影响)..."
-$DC up -d --remove-orphans || { echo "容器启动失败:"; $DC ps -a; exit 1; }
+echo "重建容器(显式指定 api/web, 绕过 profiles, 数据卷不受影响)..."
+$DC up -d --remove-orphans api web || { echo "容器启动失败:"; $DC ps -a; exit 1; }
+echo "容器状态:"
+$DC ps api web
 
 echo "[5/5] 健康检查..."
 APP_PORT=$(grep -E '^APP_PORT=' .env | head -1 | cut -d= -f2 | tr -d ' \r')
