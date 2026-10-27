@@ -116,18 +116,6 @@ a {
   color: var(--color-danger);
 }
 
-/* Ensure Element Plus overlays always sit above the admin shell (sidebar/header). */
-.el-overlay,
-.el-message-box__wrapper,
-.el-dialog__wrapper {
-  z-index: 4000 !important;
-}
-
-.el-message,
-.el-notification {
-  z-index: 4100 !important;
-}
-
 .el-popup-parent--hidden {
   overflow: hidden;
 }
