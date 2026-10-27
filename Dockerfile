@@ -12,7 +12,7 @@ COPY apps/web/package.json apps/web/package.json
 # workspace package — required by root package.json workspaces / lockfile
 COPY packages/sdk-js/package.json packages/sdk-js/package.json
 RUN npm config set registry "$NPM_REGISTRY" \
-    && npm install --include=optional --no-audit --fund=false
+    && npm ci --include=optional --no-audit --fund=false
 
 FROM deps AS source
 WORKDIR /app
