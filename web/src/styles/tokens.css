@@ -1,0 +1,253 @@
+/* ============================================================
+   统一文件管理 · 设计令牌 Design Tokens
+   唯一强调色：电光蓝 #0052FF（深色 #4D7CFF）
+   铁律：组件内禁止硬编码色值，一切走变量；紫罗兰仅用于背景光晕且 ≤5%
+   ============================================================ */
+
+:root {
+  color-scheme: light;
+
+  /* ---------- 背景 / 表面 ---------- */
+  --bg: #FAFAFA;
+  --bg-soft: #F7F9FC;
+  --surface: #FFFFFF;
+  --surface-2: #F1F5F9;
+
+  /* ---------- 边框 ---------- */
+  --border: #E2E8F0;
+  --border-strong: #D3DEEB;
+  --divider: #E2E8F0;
+  --sidebar-border: rgba(224, 231, 255, .8);
+
+  /* ---------- 文字 ---------- */
+  --text-strong: #0F172A;
+  --text: #1E293B;
+  --text-muted: #64748B;
+  --placeholder: #94A3B8;
+  --on-accent: #FFFFFF;
+
+  /* ---------- 强调（唯一） ---------- */
+  --accent: #0052FF;
+  --accent-2: #4D7CFF;
+  --accent-hover: #0047DE;
+  --accent-pressed: #0038B0;
+  --accent-soft: #E9F0FF;
+  --accent-ink: #1F57CC;
+  --accent-gradient: linear-gradient(135deg, #0052FF, #4D7CFF);
+
+  /* 强调衍生：透明层（一律由 accent 派生，不新增色相） */
+  --accent-a06: rgba(0, 82, 255, .06);
+  --accent-a08: rgba(0, 82, 255, .08);
+  --accent-a10: rgba(0, 82, 255, .10);
+  --accent-a12: rgba(0, 82, 255, .12);
+  --accent-a16: rgba(0, 82, 255, .16);
+  --accent-a20: rgba(0, 82, 255, .20);
+  --accent-a22: rgba(0, 82, 255, .22);
+  --accent-a25: rgba(0, 82, 255, .25);
+  --accent-a45: rgba(0, 82, 255, .45);
+  --accent-a55: rgba(0, 82, 255, .55);
+  --accent2-a10: rgba(77, 124, 255, .10);
+  --accent2-a12: rgba(77, 124, 255, .12);
+  --accent2-a14: rgba(77, 124, 255, .14);
+  --accent2-a15: rgba(77, 124, 255, .15);
+  --accent2-a18: rgba(77, 124, 255, .18);
+
+  /* ---------- 语义色 ---------- */
+  --success: #16A34A;
+  --warning: #B88336;
+  --danger: #DC2626;
+  --info: #2563EB;
+
+  /* ---------- 状态标签三元组（background / border / text） ---------- */
+  --tag-success-bg: #E8F5F0;
+  --tag-success-border: #BFE3D4;
+  --tag-success-text: #256C56;
+  --tag-warning-bg: #FFF4E8;
+  --tag-warning-border: #F2D9BB;
+  --tag-warning-text: #9A6425;
+  --tag-danger-bg: #FBEEEE;
+  --tag-danger-border: #F0C7C7;
+  --tag-danger-text: #A54646;
+  --tag-info-bg: #EAF2FF;
+  --tag-info-border: #C1D7FB;
+  --tag-info-text: #2F66B3;
+
+  /* ---------- 控件 ---------- */
+  --input-border: #D6E1EE;
+  --input-border-hover: #C1D2E8;
+  --input-bg: #FFFFFF;
+  --btn-secondary-border: #D4DFEF;
+  --btn-secondary-text: #475569;
+  --danger-soft: #FEF2F2;
+  --table-head-bg: #F8FAFC;
+  --nav-hover-bg: #F8FAFC;
+  --nav-active-border: var(--accent-a25);
+
+  /* ---------- 徽章 Badge ---------- */
+  --badge-border: var(--accent-a22);
+  --badge-bg: linear-gradient(135deg, var(--accent-a08), var(--accent2-a10));
+  --badge-dot-glow: var(--accent-a45);
+
+  /* ---------- 圆角 ---------- */
+  --r-xs: 8px;
+  --r-sm: 10px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-card: 16px;
+  --r-sidebar: 24px;
+  --r-pill: 999px;
+
+  /* ---------- 阴影（blur ≤ 60px；深色一律纯黑影） ---------- */
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, .06), 0 18px 40px -24px rgba(0, 82, 255, .18);
+  --shadow-sidebar: 0 10px 40px -20px rgba(0, 82, 255, .20), 0 2px 12px -8px rgba(15, 23, 42, .12);
+  --shadow-primary: 0 6px 20px -10px rgba(0, 82, 255, .55);
+  --shadow-dialog: 0 20px 60px -24px rgba(15, 23, 42, .35);
+  --shadow-focus: 0 0 0 3px rgba(0, 82, 255, .12);
+  --shadow-focus-soft: 0 0 0 2px rgba(0, 82, 255, .10);
+
+  /* ---------- 渐变 ---------- */
+  --sidebar-gradient: linear-gradient(180deg, #FFFFFF 0%, #F7F9FC 60%, #F4F7FF 100%);
+  --hero-gradient: linear-gradient(135deg, #FFFFFF 0%, #F5F9FF 50%, #F0F6FF 100%);
+  --nav-active-bg: linear-gradient(90deg, rgba(0, 82, 255, .10), rgba(77, 124, 255, .15));
+
+  /* ---------- 背景氛围（fixed 多层径向光晕） ---------- */
+  --ambient-glow:
+    radial-gradient(circle at 0% 0%, rgba(0, 82, 255, .06), transparent 55%),
+    radial-gradient(circle at 100% 0%, rgba(77, 124, 255, .08), transparent 50%),
+    radial-gradient(circle at 50% 100%, rgba(139, 92, 246, .05), transparent 45%);
+  --hero-blob-a: radial-gradient(circle, var(--accent-a16), transparent 70%);
+  --hero-blob-b: radial-gradient(circle, var(--accent2-a14), transparent 70%);
+  --sidebar-blob-a: radial-gradient(circle, var(--accent-a16), transparent 68%);
+  --sidebar-blob-b: radial-gradient(circle, var(--accent2-a12), transparent 70%);
+
+  /* ---------- 动效 ---------- */
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 200ms;
+  --dur: 240ms;
+  --dur-slow: 260ms;
+
+  /* ---------- 滚动条 ---------- */
+  --scrollbar-track: #EAF0F8;
+  --scrollbar-thumb: #B9CBE5;
+  --scrollbar-thumb-hover: #A4BAD9;
+
+  /* ---------- 选中 ---------- */
+  --selection-bg: rgba(0, 82, 255, .20);
+  --scrim: rgba(15, 23, 42, .28);
+
+  /* ---------- 排版 ---------- */
+  --font-ui: Inter, "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", Consolas, "Courier New", monospace;
+  --font-display: Calistoga, Georgia, "Times New Roman", serif;
+}
+
+html.dark {
+  color-scheme: dark;
+
+  /* ---------- 背景 / 表面 ---------- */
+  --bg: #0C0E14;
+  --bg-soft: #12141E;
+  --surface: #141620;
+  --surface-2: #1A1D2B;
+
+  /* ---------- 边框 ---------- */
+  --border: #2A2E3E;
+  --border-strong: #3A3F52;
+  --divider: #252838;
+  --sidebar-border: var(--border);
+
+  /* ---------- 文字 ---------- */
+  --text-strong: #E2E8F0;
+  --text: #CBD5E1;
+  --text-muted: #94A3B8;
+  --placeholder: #64748B;
+  --on-accent: #FFFFFF;
+
+  /* ---------- 强调 ---------- */
+  --accent: #4D7CFF;
+  --accent-2: #6B93FF;
+  --accent-hover: #3366FF;
+  --accent-pressed: #3366FF;
+  --accent-soft: #1A2544;
+  --accent-ink: #6B93FF;
+  --accent-gradient: linear-gradient(135deg, #4D7CFF, #6B93FF);
+
+  --accent-a06: rgba(77, 124, 255, .06);
+  --accent-a08: rgba(77, 124, 255, .08);
+  --accent-a10: rgba(77, 124, 255, .10);
+  --accent-a12: rgba(77, 124, 255, .12);
+  --accent-a16: rgba(77, 124, 255, .16);
+  --accent-a20: rgba(77, 124, 255, .20);
+  --accent-a22: rgba(77, 124, 255, .22);
+  --accent-a25: rgba(77, 124, 255, .25);
+  --accent-a45: rgba(77, 124, 255, .45);
+  --accent2-a10: rgba(107, 147, 255, .10);
+  --accent2-a12: rgba(107, 147, 255, .12);
+  --accent2-a14: rgba(107, 147, 255, .14);
+  --accent2-a15: rgba(107, 147, 255, .15);
+  --accent2-a18: rgba(107, 147, 255, .18);
+
+  /* ---------- 语义色 ---------- */
+  --success: #4ADE80;
+  --warning: #FBBF24;
+  --danger: #F87171;
+  --info: #60A5FA;
+
+  /* ---------- 状态标签三元组（深色：同色相低透明底 + 亮字） ---------- */
+  --tag-success-bg: rgba(74, 222, 128, .12);
+  --tag-success-border: rgba(74, 222, 128, .28);
+  --tag-success-text: #4ADE80;
+  --tag-warning-bg: rgba(251, 191, 36, .12);
+  --tag-warning-border: rgba(251, 191, 36, .28);
+  --tag-warning-text: #FBBF24;
+  --tag-danger-bg: rgba(248, 113, 113, .12);
+  --tag-danger-border: rgba(248, 113, 113, .28);
+  --tag-danger-text: #F87171;
+  --tag-info-bg: rgba(96, 165, 250, .12);
+  --tag-info-border: rgba(96, 165, 250, .28);
+  --tag-info-text: #60A5FA;
+
+  /* ---------- 控件 ---------- */
+  --input-border: #2A2E3E;
+  --input-border-hover: #3A3F52;
+  --input-bg: #12141E;
+  --btn-secondary-border: #3A3F52;
+  --btn-secondary-text: #CBD5E1;
+  --danger-soft: rgba(248, 113, 113, .10);
+  --table-head-bg: #1A1D2B;
+  --nav-hover-bg: #1A1D2B;
+  --nav-active-border: var(--accent-a25);
+
+  /* ---------- 阴影：纯黑 ---------- */
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, .5), 0 18px 40px -24px rgba(0, 0, 0, .6);
+  --shadow-sidebar: 0 10px 40px -20px rgba(0, 0, 0, .6), 0 2px 12px -8px rgba(0, 0, 0, .5);
+  --shadow-primary: 0 6px 20px -10px rgba(0, 0, 0, .6);
+  --shadow-dialog: 0 20px 60px -24px rgba(0, 0, 0, .6);
+  --shadow-focus: 0 0 0 3px rgba(77, 124, 255, .18);
+  --shadow-focus-soft: 0 0 0 2px rgba(77, 124, 255, .16);
+
+  /* ---------- 渐变 ---------- */
+  --sidebar-gradient: linear-gradient(180deg, var(--surface) 0%, var(--bg-soft) 60%, var(--surface-2) 100%);
+  --hero-gradient: linear-gradient(135deg, var(--surface) 0%, var(--bg-soft) 50%, var(--surface-2) 100%);
+  --nav-active-bg: linear-gradient(90deg, rgba(77, 124, 255, .14), rgba(107, 147, 255, .18));
+
+  /* ---------- 背景氛围 ---------- */
+  --ambient-glow:
+    radial-gradient(circle at 0% 0%, rgba(77, 124, 255, .08), transparent 55%),
+    radial-gradient(circle at 100% 0%, rgba(99, 102, 241, .06), transparent 50%),
+    radial-gradient(circle at 50% 100%, rgba(139, 92, 246, .04), transparent 45%);
+  --hero-blob-a: radial-gradient(circle, var(--accent-a16), transparent 70%);
+  --hero-blob-b: radial-gradient(circle, var(--accent2-a14), transparent 70%);
+  --sidebar-blob-a: radial-gradient(circle, var(--accent-a16), transparent 68%);
+  --sidebar-blob-b: radial-gradient(circle, var(--accent2-a14), transparent 70%);
+
+  /* ---------- 滚动条 ---------- */
+  --scrollbar-track: #2A2E3E;
+  --scrollbar-thumb: #3A3F52;
+  --scrollbar-thumb-hover: #3A3F52;
+
+  /* ---------- 选中 ---------- */
+  --selection-bg: rgba(77, 124, 255, .20);
+  --scrim: rgba(0, 0, 0, .5);
+}

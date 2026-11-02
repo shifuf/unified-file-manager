@@ -1,0 +1,92 @@
+name: Publish release images
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish downloadable images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify release version
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          numeric="${VERSION#v}"
+          grep -Fx "ufm.version=${numeric}" gradle.properties
+          node -e "const p=require('./web/package.json');if(p.version!==process.env.VERSION.slice(1))process.exit(1)"
+
+      - name: Build server image
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          app_version="${VERSION#v}"
+          docker build \
+            --file deploy/Dockerfile.server \
+            --build-arg "UFM_VERSION=${app_version}" \
+            --tag "ufm-server:${VERSION}" \
+            --tag ufm-server:local \
+            .
+
+      - name: Build web image
+        env:
+          VERSION: ${{ github.ref_name }}
+          NPM_REGISTRY: ${{ vars.NPM_REGISTRY }}
+        run: |
+          app_version="${VERSION#v}"
+          registry="${NPM_REGISTRY:-https://registry.npmmirror.com}"
+          docker build \
+            --file deploy/Dockerfile.web \
+            --build-arg "UFM_VERSION=${app_version}" \
+            --build-arg "NPM_REGISTRY=${registry}" \
+            --tag "ufm-web:${VERSION}" \
+            --tag ufm-web:local \
+            .
+
+      - name: Package release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker save \
+            "ufm-server:${VERSION}" \
+            "ufm-server:local" \
+            "ufm-web:${VERSION}" \
+            "ufm-web:local" \
+            | gzip -6 > "dist/ufm-images-${VERSION}-amd64.tar.gz"
+          cp deploy/compose.yml "dist/ufm-compose-${VERSION}.yml"
+          (
+            cd dist
+            sha256sum \
+              "ufm-images-${VERSION}-amd64.tar.gz" \
+              "ufm-compose-${VERSION}.yml" \
+              > SHA256SUMS
+          )
+          ls -lh dist
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --notes "Linux amd64 预构建镜像。服务器通过 gh-proxy 下载后执行 docker load，不依赖 GHCR 或国内镜像同步。"
+          fi
+          gh release upload "$VERSION" dist/* --clobber

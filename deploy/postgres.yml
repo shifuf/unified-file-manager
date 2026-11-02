@@ -1,0 +1,22 @@
+name: ufm-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ufm
+      POSTGRES_USER: ufm
+      POSTGRES_PASSWORD: ${UFM_DB_PASSWORD:?Provide a local development password}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ufm_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ufm -d ufm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  ufm_pg_data:

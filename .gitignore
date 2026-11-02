@@ -1,0 +1,28 @@
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Node / Vite
+web/node_modules/
+web/dist/
+web/*.log
+web/shot.cjs
+web/shot-*.png
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Test / coverage
+coverage/
+web/build/
+*.hprof

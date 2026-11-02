@@ -1,0 +1,12 @@
+.git
+.gradle
+**/build
+**/node_modules
+web/dist
+.env
+.env.*
+!.env.example
+**/*.log
+**/*.hprof
+.idea
+.vscode

@@ -1,0 +1,31 @@
+spring:
+  datasource:
+    url: ${UFM_DB_URL:jdbc:postgresql://localhost:5432/ufm}
+    username: ${UFM_DB_USER:ufm}
+    password: ${UFM_DB_PASSWORD}
+    hikari:
+      maximum-pool-size: ${UFM_DB_POOL_SIZE:8}
+      minimum-idle: 1
+      connection-timeout: 5000
+      validation-timeout: 3000
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+mybatis-plus:
+  type-handlers-package: com.ufm.common.persistence.uuid
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+
+ufm:
+  uploads:
+    path: ${UFM_UPLOADS_PATH:${java.io.tmpdir}/ufm-uploads}
+  security:
+    jwt-secret: ${UFM_JWT_SECRET}
+    cookie-secure: ${UFM_COOKIE_SECURE:true}
+  crypto:
+    key: ${UFM_CRYPTO_KEY}

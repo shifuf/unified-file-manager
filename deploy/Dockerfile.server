@@ -1,0 +1,26 @@
+ARG UFM_VERSION=0.2.0
+
+FROM eclipse-temurin:21-jdk-alpine AS build
+ARG UFM_VERSION
+WORKDIR /src
+COPY gradle gradle
+COPY gradlew settings.gradle.kts build.gradle.kts gradle.properties ./
+COPY server server
+COPY tools tools
+RUN chmod +x gradlew \
+    && ./gradlew :server:app:bootJar :server:worker:bootJar --no-daemon -Pufm.version="$UFM_VERSION"
+
+FROM eclipse-temurin:21-jre-alpine
+ARG UFM_VERSION
+RUN apk add --no-cache postgresql16-client ffmpeg curl tini \
+    && addgroup -S -g 10001 ufm && adduser -S -D -H -u 10001 -G ufm ufm \
+    && mkdir -p /data/files /data/backups /data/tmp /data/uploads && chown -R ufm:ufm /data
+ENV UFM_VERSION="$UFM_VERSION"
+WORKDIR /app
+COPY --from=build /src/server/app/build/libs/ufm-api.jar /app/ufm-api.jar
+COPY --from=build /src/server/worker/build/libs/ufm-worker.jar /app/ufm-worker.jar
+COPY deploy/server-entrypoint.sh /app/entrypoint.sh
+RUN chmod 755 /app/entrypoint.sh
+USER 10001:10001
+EXPOSE 8080
+ENTRYPOINT ["/sbin/tini", "--", "/app/entrypoint.sh"]

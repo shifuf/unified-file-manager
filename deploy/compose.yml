@@ -1,0 +1,123 @@
+name: ufm
+
+x-server: &server
+  image: ${UFM_SERVER_IMAGE:-ufm-server:local}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.server
+    args:
+      UFM_VERSION: ${UFM_VERSION:-0.2.0}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 120s
+  volumes:
+    - storage_data:/data
+  networks: [backend]
+  mem_limit: 640m
+  cpus: 1.0
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: '3' }
+
+x-environment: &environment
+  UFM_VERSION: ${UFM_VERSION:-0.2.0}
+  UFM_DB_URL: jdbc:postgresql://postgres:5432/ufm
+  UFM_DB_USER: ufm
+  UFM_DB_PASSWORD: ${UFM_DB_PASSWORD:?Provide UFM_DB_PASSWORD}
+  UFM_JWT_SECRET: ${UFM_JWT_SECRET:?Provide independent base64 JWT key}
+  UFM_CRYPTO_KEY: ${UFM_CRYPTO_KEY:?Provide independent base64 encryption key}
+  UFM_COOKIE_SECURE: ${UFM_COOKIE_SECURE:-true}
+  UFM_PUBLIC_BASE_URL: ${UFM_PUBLIC_BASE_URL:-}
+  UFM_DB_POOL_SIZE: '4'
+  UFM_PORT: '8080'
+  UFM_BACKUP_PATH: /data/backups
+  UFM_UPLOADS_PATH: /data/uploads
+  JAVA_IO_TMPDIR: /data/tmp
+  JAVA_TOOL_OPTIONS: -Xms64m -Xmx384m -XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError
+  LOGGING_LEVEL_COM_UFM: INFO
+  SERVER_FORWARD_HEADERS_STRATEGY: framework
+  SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE: 1GB
+  SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE: 1GB
+  SPRING_SERVLET_MULTIPART_FILE_SIZE_THRESHOLD: 0B
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ufm
+      POSTGRES_USER: ufm
+      POSTGRES_PASSWORD: ${UFM_DB_PASSWORD:?Provide UFM_DB_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U ufm -d ufm']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+    command: [postgres, -c, shared_buffers=64MB, -c, max_connections=30]
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: '3' }
+  api:
+    <<: *server
+    environment:
+      <<: *environment
+      UFM_ROLE: api
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/api/healthz]
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 5
+  worker:
+    <<: *server
+    environment:
+      <<: *environment
+      UFM_ROLE: worker
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/api/healthz]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 5
+  web:
+    image: ${UFM_WEB_IMAGE:-ufm-web:local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        UFM_VERSION: ${UFM_VERSION:-0.2.0}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    restart: unless-stopped
+    environment:
+      UFM_PUBLIC_SCHEME: ${UFM_PUBLIC_SCHEME:-https}
+      NGINX_ENVSUBST_FILTER: ^UFM_PUBLIC_SCHEME$
+      NGINX_ENVSUBST_OUTPUT_DIR: /tmp/nginx-conf
+    ports: ['${UFM_BIND_ADDRESS:-127.0.0.1}:${UFM_HTTP_PORT:-8088}:80']
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [backend]
+    read_only: true
+    tmpfs: [/var/cache/nginx, /var/run, /tmp]
+    mem_limit: 96m
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: '3' }
+
+networks:
+  backend:
+volumes:
+  pg_data:
+  storage_data:

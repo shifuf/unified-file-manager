@@ -1,0 +1,44 @@
+{
+  "name": "ufm-web",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:only": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "check:tokens": "node scripts/check-tokens.mjs",
+    "check:error-codes": "node scripts/check-error-codes.mjs",
+    "check:design": "npm run check:tokens && npm run check:error-codes",
+    "api:types": "openapi-typescript src/api/openapi.json -o src/api/schema.d.ts",
+    "verify": "npm run check:design && npm run typecheck && npm run build:only"
+  },
+  "dependencies": {
+    "@fontsource/calistoga": "^5.3.0",
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@noble/hashes": "^2.4.0",
+    "@vueuse/core": "^13.9.0",
+    "hls.js": "^1.7.4",
+    "naive-ui": "^2.45.3",
+    "ofetch": "^1.4.1",
+    "pdfjs-dist": "^5.4.624",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.44",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^22.18.0",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "openapi-typescript": "^7.10.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "vue-tsc": "^3.3.14"
+  }
+}

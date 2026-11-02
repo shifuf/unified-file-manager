@@ -1,0 +1,226 @@
+/* ============================================================
+   Naive UI 适配层
+   themeOverrides 已覆盖绝大多数颜色；这里处理它管不到的细节：
+   主按钮渐变、卡片阴影、表格表头、输入聚焦外发光、弹窗阴影与圆角。
+   ============================================================ */
+
+/* ---------- 主按钮：渐变 + 阴影 + 悬停位移 ---------- */
+.n-button.n-button--primary-type {
+  background-image: var(--accent-gradient);
+  border: none;
+  box-shadow: var(--shadow-primary);
+  transition:
+    transform var(--dur-fast) var(--ease),
+    filter var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+
+.n-button.n-button--primary-type:hover:not(.n-button--disabled) {
+  transform: translateY(-2px) scale(1.02);
+  filter: brightness(1.04);
+}
+
+.n-button.n-button--primary-type:active:not(.n-button--disabled) {
+  transform: scale(0.97);
+  filter: brightness(0.96);
+}
+
+/* 主按钮伪元素覆盖，避免 Naive 内置 state 层盖住渐变 */
+.n-button.n-button--primary-type .n-button__state-border {
+  display: none;
+}
+
+/* 次按钮 / 默认按钮 */
+.n-button:not(.n-button--primary-type):not(.n-button--error-type) {
+  transition:
+    transform var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease);
+}
+
+.n-button:not(.n-button--primary-type):not(.n-button--error-type):hover {
+  transform: translateY(-1px);
+}
+
+/* 危险按钮：默认透明红字（Naive 的 error 类型默认是红底白字，这里压回克制的样子） */
+/* 危险按钮：默认透明红字（Naive 的 error 类型默认是红底白字，这里压回克制的样子） */
+.n-button.n-button--error-type.n-button--quaternary-type {
+  border: none;
+}
+
+/* 功能色按钮：按动作语义给边框与文字着色，悬停填充浅色底 */
+.n-button.n-button--info-type:not(.n-button--primary-type):not(.n-button--quaternary-type) {
+  border-color: var(--tag-info-border);
+  color: var(--tag-info-text);
+  background: var(--tag-info-bg);
+}
+
+.n-button.n-button--info-type:not(.n-button--primary-type):not(.n-button--quaternary-type):hover {
+  border-color: var(--info);
+  color: var(--info);
+  filter: brightness(1.02);
+}
+
+.n-button.n-button--success-type:not(.n-button--primary-type):not(.n-button--quaternary-type) {
+  border-color: var(--tag-success-border);
+  color: var(--tag-success-text);
+  background: var(--tag-success-bg);
+}
+
+.n-button.n-button--success-type:not(.n-button--primary-type):not(.n-button--quaternary-type):hover {
+  border-color: var(--success);
+  color: var(--success);
+  filter: brightness(1.02);
+}
+
+.n-button.n-button--warning-type:not(.n-button--primary-type):not(.n-button--quaternary-type) {
+  border-color: var(--tag-warning-border);
+  color: var(--tag-warning-text);
+  background: var(--tag-warning-bg);
+}
+
+.n-button.n-button--warning-type:not(.n-button--primary-type):not(.n-button--quaternary-type):hover {
+  border-color: var(--warning);
+  color: var(--warning);
+  filter: brightness(1.02);
+}
+
+.n-button.n-button--error-type:not(.n-button--quaternary-type) {
+  border-color: var(--tag-danger-border);
+  color: var(--tag-danger-text);
+  background: var(--tag-danger-bg);
+}
+
+.n-button.n-button--error-type:not(.n-button--quaternary-type):hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.n-button.n-button--tertiary-type,
+.n-button.n-button--quaternary-type:not(.n-button--error-type) {
+  color: var(--btn-secondary-text);
+}
+
+.n-button.n-button--tertiary-type:hover,
+.n-button.n-button--quaternary-type:not(.n-button--error-type):hover {
+  color: var(--accent-ink);
+  border-color: var(--accent-a25);
+  background: var(--accent-a06);
+}
+
+/* ---------- 卡片 ---------- */
+.n-card {
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card);
+  transition:
+    transform var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
+}
+
+.n-card--hoverable:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-card);
+}
+
+/* ---------- 输入框聚焦外发光 ---------- */
+.n-input .n-input__border,
+.n-input .n-input__state-border {
+  transition: box-shadow var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+
+.n-input.n-input--focus .n-input__state-border {
+  box-shadow: var(--shadow-focus);
+}
+
+.n-base-selection .n-base-selection__border,
+.n-base-selection .n-base-selection__state-border {
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+.n-base-selection.n-base-selection--focus .n-base-selection__state-border {
+  box-shadow: var(--shadow-focus);
+}
+
+/* ---------- 表格：表头 11px 大写加粗，圆角内裁 ---------- */
+.n-data-table .n-data-table-th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-family: var(--font-mono);
+}
+
+.n-data-table .n-data-table-td {
+  font-size: 14px;
+}
+
+.n-data-table .n-data-table-tr:hover .n-data-table-td {
+  transition: background-color var(--dur-fast) var(--ease);
+}
+
+/* ---------- 弹窗 / 抽屉：柔和阴影 + 大圆角 ---------- */
+.n-modal.n-modal {
+  box-shadow: var(--shadow-dialog);
+  border-radius: var(--r-xl);
+}
+
+.n-drawer.n-drawer {
+  box-shadow: var(--shadow-dialog);
+}
+
+.n-popover.n-popover {
+  box-shadow: var(--shadow-dialog);
+  border-radius: var(--r-md);
+}
+
+.n-dropdown-menu.n-dropdown-menu {
+  box-shadow: var(--shadow-dialog);
+  border-radius: var(--r-md);
+  padding: 6px;
+}
+
+/* ---------- Tag / Badge 走规则 ---------- */
+.n-tag.n-tag {
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+
+/* ---------- 分页 / 加载 ---------- */
+.n-pagination.n-pagination {
+  font-family: var(--font-mono);
+}
+
+/* ---------- 设置页 Tabs：更清晰的分组与选中态 ---------- */
+.settings-tabs {
+  min-width: 0;
+}
+
+.settings-tabs .n-tabs-tab {
+  font-size: 15px;
+  font-weight: 700;
+  padding: 12px 4px;
+}
+
+.settings-tabs .n-tabs-nav-scroll-wrapper {
+  max-width: 100%;
+}
+
+.settings-tabs .n-tabs-tab--active {
+  color: var(--accent-ink);
+}
+
+.settings-tabs .n-tabs-bar {
+  background: var(--accent-gradient);
+}
+
+/* ---------- 滚动条容器 ---------- */
+.n-scrollbar-rail__scrollbar {
+  border-radius: var(--r-pill);
+}
+
+/* ---------- 消息条 ---------- */
+.n-message.n-message {
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-dialog);
+  border: 1px solid var(--border);
+}

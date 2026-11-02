@@ -1,0 +1,31 @@
+server:
+  port: ${UFM_PORT:8081}
+  shutdown: graceful
+
+spring:
+  application:
+    name: ufm-worker
+  config:
+    import: classpath:application-database.yml
+  threads:
+    virtual:
+      enabled: true
+  profiles:
+    active: ${UFM_PROFILE:worker}
+  jackson:
+    default-property-inclusion: non_null
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoints.web.base-path: /internal
+
+ufm:
+  version: ${UFM_VERSION:0.2.0}
+
+logging:
+  level:
+    root: INFO
+    com.ufm: INFO

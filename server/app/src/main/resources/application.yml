@@ -1,0 +1,51 @@
+server:
+  port: ${UFM_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: ufm-api
+  config:
+    import: classpath:application-database.yml
+  threads:
+    virtual:
+      enabled: true
+  profiles:
+    active: ${UFM_PROFILE:api}
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+  web:
+    resources:
+      add-mappings: false
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: alpha
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+ufm:
+  # Docker 镜像构建和 Compose 会通过环境变量注入正式版本号。
+  version: ${UFM_VERSION:0.2.0}
+  # 对外访问基址（如 https://ufm.example.com），用于签发第三方预览取件地址；留空则按请求推导。
+  public-base-url: ${UFM_PUBLIC_BASE_URL:}
+
+logging:
+  level:
+    root: INFO
+    com.ufm: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{requestId:-}] %logger{36} - %msg%n"
