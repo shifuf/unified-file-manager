@@ -12,6 +12,8 @@ import { StorageService } from '../storage/storage.service';
 
 export type WebdavAccount = {
   projectId: string;
+  /** Actual URL mount used by this request (alias or legacy project ID). */
+  mountId?: string;
   projectName: string;
   username: string;
   passwordHash: string;
@@ -46,9 +48,9 @@ export class WebdavAccountService {
   }
 
   /** Public WebDAV mount URL for a project (no credentials). */
-  mountUrl(projectId: string): string {
+  mountUrl(projectId: string, slug?: string | null): string {
     const publicUrl = (this.configService.get<string>('PUBLIC_URL') ?? '').trim().replace(/\/+$/, '');
-    const path = `/api/dav/${projectId}`;
+    const path = `/api/dav/${slug || projectId}`;
     return publicUrl ? `${publicUrl}${path}` : path;
   }
 
@@ -88,9 +90,9 @@ export class WebdavAccountService {
   }
 
   /** Load the WebDAV account, or null when disabled / not fully configured. */
-  async loadAccount(projectId: string): Promise<WebdavAccount | null> {
+  async loadAccount(mountId: string): Promise<WebdavAccount | null> {
     const project = await this.prisma.project.findFirst({
-      where: { id: projectId, deletedAt: null, enabled: true, webdavEnabled: true },
+      where: { OR: [{ id: mountId }, { webdavSlug: mountId.toLowerCase() }], deletedAt: null, enabled: true, webdavEnabled: true },
       select: {
         id: true,
         name: true,
@@ -106,16 +108,17 @@ export class WebdavAccountService {
 
     let storage: Awaited<ReturnType<StorageService['getActiveStorage']>>;
     try {
-      storage = await this.storageService.getActiveStorage(projectId);
+      storage = await this.storageService.getActiveStorage(project.id);
     } catch (error) {
       this.logger.warn(
-        `WebDAV 项目 ${projectId} 无法解析存储：${error instanceof Error ? error.message : String(error)}`,
+        `WebDAV 项目 ${project.id} 无法解析存储：${error instanceof Error ? error.message : String(error)}`,
       );
       return null;
     }
 
     return {
       projectId: project.id,
+      mountId,
       projectName: project.name,
       username: project.webdavUsername,
       passwordHash: project.webdavPasswordHash,

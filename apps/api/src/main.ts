@@ -29,7 +29,7 @@ async function bootstrap(): Promise<void> {
   app.getHttpAdapter().getInstance().set('trust proxy', resolveTrustProxy(configService));
   app.setGlobalPrefix('api');
 
-  // WebDAV lives at /api/dav/:projectId and needs raw HTTP verbs (PROPFIND/MKCOL/
+  // WebDAV accepts custom mounts and legacy project IDs with raw HTTP verbs (PROPFIND/MKCOL/
   // MOVE/COPY/LOCK/UNLOCK) that Nest routing cannot express.
   const webdavMiddleware = app.get(WebdavMiddleware);
   app.use('/api/dav', webdavMiddleware.handle);

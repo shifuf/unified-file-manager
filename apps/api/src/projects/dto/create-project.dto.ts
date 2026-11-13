@@ -12,6 +12,13 @@ import {
 } from 'class-validator';
 
 export class CreateProjectDto {
+  @ApiPropertyOptional({ description: 'DAV 地址后缀，英文或数字；空白随机生成' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  @Matches(/^\s*[A-Za-z0-9]*\s*$/, { message: 'DAV 地址后缀仅支持英文字母或数字。' })
+  webdavSlug?: string | null;
+
   @ApiProperty({ example: '支付中心' })
   @IsString()
   @MinLength(2)

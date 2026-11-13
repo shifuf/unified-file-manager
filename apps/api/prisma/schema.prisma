@@ -176,6 +176,7 @@ model Project {
   publicLibraryEnabled Boolean            @default(false)
   publicLibrarySlug    String?            @unique @db.VarChar(64)
   webdavEnabled        Boolean            @default(false)
+  webdavSlug           String?            @unique @db.VarChar(64)
   webdavUsername       String?            @db.VarChar(64)
   webdavPasswordHash   String?            @db.VarChar(255)
   webdavPasswordVault  String?            @db.Text

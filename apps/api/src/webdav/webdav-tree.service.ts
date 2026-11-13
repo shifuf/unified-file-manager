@@ -156,7 +156,7 @@ export class WebdavTreeService {
 
   /** XML body describing a single node (PROPFIND depth 0). */
   propfindBody(account: WebdavAccount, node: DavNode): string {
-    const href = `/api/dav/${account.projectId}${node.path ? `/${encodeHrefPath(node.path)}` : ''}`;
+    const href = `/api/dav/${account.mountId || account.projectId}${node.path ? `/${encodeHrefPath(node.path)}` : ''}`;
     const lastModified = (node.updatedAt ?? new Date()).toUTCString();
 
     return [

@@ -115,19 +115,19 @@ export const authApi = {
 };
 
 export const webdavApi = {
-  status(projectId: string) {
+  status(projectId: string, options: ReadOptions = {}) {
     return http.get<
       unknown,
-      { projectId: string; enabled: boolean; username: string | null; hasPassword: boolean; baseUrl: string }
-    >(`/projects/${projectId}/webdav`);
+      { projectId: string; enabled: boolean; username: string | null; hasPassword: boolean; baseUrl: string; slug: string | null }
+    >(`/projects/${projectId}/webdav`, { signal: options.signal });
   },
   update(
     projectId: string,
-    payload: { enabled?: boolean; username?: string | null; password?: string | null },
+    payload: { enabled?: boolean; username?: string | null; password?: string | null; slug?: string | null },
   ) {
     return http.put<
       unknown,
-      { projectId: string; enabled: boolean; username: string | null; hasPassword: boolean; baseUrl: string }
+      { projectId: string; enabled: boolean; username: string | null; hasPassword: boolean; baseUrl: string; slug: string | null }
     >(`/projects/${projectId}/webdav`, payload);
   },
 };
@@ -187,6 +187,7 @@ export const projectApi = {
     webdavEnabled?: boolean;
     webdavUsername?: string | null;
     webdavPassword?: string | null;
+    webdavSlug?: string | null;
   }) {
     return http.post<unknown, Project & { appSecret: string; secretNotice: string }>('/projects', payload);
   },
@@ -204,6 +205,7 @@ export const projectApi = {
       webdavEnabled?: boolean;
       webdavUsername?: string | null;
       webdavPassword?: string | null;
+      webdavSlug?: string | null;
     },
   ) {
     return http.put<unknown, Project>(`/projects/${projectId}`, payload);

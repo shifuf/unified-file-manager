@@ -65,8 +65,8 @@ export class WebdavMiddleware {
   };
 
   private async dispatchRequest(request: Request, response: Response, url: string): Promise<void> {
-    const projectId = url.split('/')[3] ?? '';
-    const davPath = normalizeDavPath(url.replace(`/api/dav/${projectId}`, '').replace(/^\/+/, ''));
+    const mountId = url.split('/')[3] ?? '';
+    const davPath = normalizeDavPath(url.slice(`/api/dav/${mountId}`.length).replace(/^\/+/, ''));
     const method = (request.method || '').toUpperCase() as DavMethod;
 
     if (!DAV_METHODS.includes(method)) {
@@ -74,7 +74,7 @@ export class WebdavMiddleware {
       return;
     }
 
-    const account = await this.accountService.loadAccount(projectId);
+    const account = await this.accountService.loadAccount(mountId);
     if (!account) {
       response.status(404).end();
       return;
@@ -107,7 +107,8 @@ export class WebdavMiddleware {
       const message = error instanceof Error ? error.message : 'WebDAV 请求失败。';
       this.logger.warn(`WebDAV ${method} /${davPath} 失败：${message}`);
       if (!response.headersSent) {
-        response.status(Number.isFinite(status) && status >= 400 ? status : 500).send(message);
+        const responseStatus = Number.isFinite(status) && status >= 400 && status <= 599 ? status : 500;
+        response.status(responseStatus).send(responseStatus >= 500 ? 'WebDAV 请求处理失败，请联系管理员。' : message);
       } else {
         response.end();
       }

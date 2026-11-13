@@ -19,6 +19,7 @@ import { encryptText, randomToken } from '../common/utils/crypto.util';
 import { getAppCryptoKey } from '../common/utils/security-config.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
+import { resolveWebdavSlug, throwWebdavSlugConflict } from '../webdav/webdav-address.util';
 import { CreateProjectSecretDto } from './dto/create-project-secret.dto';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { ListProjectsDto } from './dto/list-projects.dto';
@@ -26,6 +27,7 @@ import { UpdateProjectDto } from './dto/update-project.dto';
 import { ProjectAccessService } from './project-access.service';
 
 type WebdavProjectFields = {
+  webdavSlug?: string;
   webdavEnabled?: boolean;
   webdavUsername?: string | null;
   webdavPasswordHash?: string;
@@ -79,7 +81,7 @@ export class ProjectsService {
       } as Prisma.ProjectUncheckedCreateInput),
       include: { activeCdnConfig: true,
         storageBindings: { include: { config: { select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true } } } } },
-    });
+    }).catch(throwWebdavSlugConflict);
 
     await this.auditService.write({
       action: AuditAction.PROJECT_CREATE,
@@ -146,12 +148,15 @@ export class ProjectsService {
       webdavEnabled: boolean;
       webdavUsername: string | null;
       webdavPasswordHash: string | null;
+      webdavSlug?: string | null;
     } | null,
+    projectId?: string,
   ): Promise<Prisma.ProjectUpdateInput> {
     const touchesWebdav =
       dto.webdavEnabled !== undefined ||
       dto.webdavUsername !== undefined ||
-      dto.webdavPassword !== undefined;
+      dto.webdavPassword !== undefined ||
+      dto.webdavSlug !== undefined;
 
     if (!touchesWebdav) {
       return {};
@@ -179,6 +184,7 @@ export class ProjectsService {
     const fields: WebdavProjectFields = {
       webdavEnabled: enabled,
       webdavUsername: username,
+      webdavSlug: await resolveWebdavSlug(this.prisma, dto.webdavSlug, existing?.webdavSlug, projectId),
     };
 
     if (dto.webdavPassword) {
@@ -193,13 +199,13 @@ export class ProjectsService {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
     const existingProject = await this.prisma.project.findFirst({
       where: { id: projectId, deletedAt: null },
-      select: { webdavUsername: true, webdavPasswordHash: true, webdavEnabled: true },
+      select: { webdavUsername: true, webdavPasswordHash: true, webdavEnabled: true, webdavSlug: true },
     });
     if (!existingProject) {
       throw new NotFoundException('项目不存在。');
     }
 
-    const webdavData = await this.buildWebdavFields(dto, existingProject);
+    const webdavData = await this.buildWebdavFields(dto, existingProject, projectId);
     const data: Prisma.ProjectUpdateInput = {
       name: dto.name,
       description: dto.description,
@@ -232,7 +238,7 @@ export class ProjectsService {
         storageBindings: { include: { config: { select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true } } } },
         _count: { select: { files: { where: { status: FileStatus.ACTIVE, deletedAt: null } } } },
       },
-    });
+    }).catch(throwWebdavSlugConflict);
 
     await this.auditService.write({
       action: AuditAction.PROJECT_UPDATE,
@@ -687,6 +693,7 @@ export class ProjectsService {
     quotaFiles?: number | null;
     webdavEnabled?: boolean;
     webdavUsername?: string | null;
+    webdavSlug?: string | null;
     createdAt: Date;
     updatedAt: Date;
     activeCdnConfig?: { provider: CdnProvider; name: string } | null;
@@ -714,6 +721,7 @@ export class ProjectsService {
       quotaFiles: project.quotaFiles ?? null,
       webdavEnabled: Boolean(project.webdavEnabled),
       webdavUsername: project.webdavUsername ?? null,
+      webdavSlug: project.webdavSlug ?? null,
       activeCdnProvider: project.activeCdnConfig?.provider ?? null,
       activeCdnName: project.activeCdnConfig?.name ?? null,
       storages: storages.map(config => ({ id: config.id, name: config.name, provider: config.provider, enabled: config.enabled, priority: config.priority })),

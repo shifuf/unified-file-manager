@@ -2,7 +2,7 @@
 
 多项目统一文件管理平台：NestJS + Prisma + MySQL 后端，Vue 3 + Element Plus 管理控制台，可插拔存储（本地 / 七牛 / 又拍云 / 阿里云 OSS / S3），开放 API（AppID + HMAC v2）。
 
-当前发布：**v0.2.1**。变更见 [更新记录](CHANGELOG.md)，自动化回归及真实云验收见 [测试说明](tests/acceptance/README.md)。
+当前发布：**v0.2.2**。变更见 [更新记录](CHANGELOG.md)，自动化回归及真实云验收见 [测试说明](tests/acceptance/README.md)。
 
 **账号模型：单一超级管理员**（`.env` 中 `ADMIN_USERNAME` / `ADMIN_PASSWORD`）。业务系统通过各项目的 AppID 与签名密钥对接，不提供多租户成员控制台。
 
@@ -21,7 +21,7 @@
 | Office 预览 | 配置 `OFFICE_PREVIEW_BASE_URL`（如 KKFileView） |
 | 运维 | 配额、通知、Webhook、生命周期、访问热点、审计日志 |
 | 下载统计 | 每次下载记录文件、来源、IP、字节数；按日/来源/文件汇总，控制台可查 |
-| WebDAV | 每个项目独立开关 + 独立账号密码，挂载 `/api/dav/{projectId}`，支持 PROPFIND / GET / PUT / MKCOL / DELETE / MOVE / COPY |
+| WebDAV | 每个项目独立账号密码；英文／数字自定义地址或随机地址，兼容 `/api/dav/{projectId}`，支持 PROPFIND / GET / PUT / MKCOL / DELETE / MOVE / COPY |
 | 备份 | 控制台一键全量备份（全部数据表 + 可选本地文件实体），可下载 / 恢复（merge、replace）/ 删除 |
 
 ---

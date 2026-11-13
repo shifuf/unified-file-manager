@@ -5,6 +5,7 @@ import { AuditService } from '../audit/audit.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { WebdavAccountService } from './webdav-account.service';
 import { UpdateWebdavSettingsDto } from './dto/webdav-settings.dto';
+import { resolveWebdavSlug, throwWebdavSlugConflict } from './webdav-address.util';
 
 /** Persists per-project WebDAV settings (enable flag + credentials). */
 @Injectable()
@@ -18,7 +19,7 @@ export class WebdavSettingsService {
   async get(projectId: string): Promise<Record<string, unknown>> {
     const project = await this.prisma.project.findFirst({
       where: { id: projectId, deletedAt: null },
-      select: { webdavEnabled: true, webdavUsername: true, webdavPasswordHash: true },
+      select: { webdavEnabled: true, webdavUsername: true, webdavPasswordHash: true, webdavSlug: true },
     });
 
     if (!project) {
@@ -30,7 +31,8 @@ export class WebdavSettingsService {
       enabled: Boolean(project.webdavEnabled),
       username: project.webdavUsername ?? null,
       hasPassword: Boolean(project.webdavPasswordHash),
-      baseUrl: this.accountService.mountUrl(projectId),
+      slug: project.webdavSlug ?? null,
+      baseUrl: this.accountService.mountUrl(projectId, project.webdavSlug),
     };
   }
 
@@ -41,7 +43,7 @@ export class WebdavSettingsService {
   ): Promise<Record<string, unknown>> {
     const existing = await this.prisma.project.findFirst({
       where: { id: projectId, deletedAt: null },
-      select: { webdavUsername: true, webdavPasswordHash: true },
+      select: { webdavUsername: true, webdavPasswordHash: true, webdavSlug: true },
     });
 
     if (!existing) {
@@ -63,16 +65,18 @@ export class WebdavSettingsService {
       }
     }
 
+    const slug = await resolveWebdavSlug(this.prisma, dto.slug, existing.webdavSlug, projectId);
     const updated = await this.prisma.project.update({
       where: { id: projectId },
       data: {
         webdavEnabled: dto.enabled ?? undefined,
+        webdavSlug: slug,
         webdavUsername: username,
         webdavPasswordHash: passwordHash,
         ...(passwordChanged ? { webdavPasswordVault: this.accountService.vaultPassword(dto.password as string) } : {}),
       },
-      select: { webdavEnabled: true, webdavUsername: true, webdavPasswordHash: true },
-    });
+      select: { webdavEnabled: true, webdavUsername: true, webdavPasswordHash: true, webdavSlug: true },
+    }).catch(throwWebdavSlugConflict);
 
     await this.auditService.write({
       action: AuditAction.PROJECT_UPDATE,
@@ -81,6 +85,7 @@ export class WebdavSettingsService {
       detail: {
         webdavEnabled: updated.webdavEnabled,
         webdavUsername: updated.webdavUsername,
+        webdavSlug: updated.webdavSlug,
         webdavPasswordChanged: passwordChanged,
       },
     });
@@ -90,7 +95,8 @@ export class WebdavSettingsService {
       enabled: Boolean(updated.webdavEnabled),
       username: updated.webdavUsername,
       hasPassword: Boolean(updated.webdavPasswordHash),
-      baseUrl: this.accountService.mountUrl(projectId),
+      slug: updated.webdavSlug ?? null,
+      baseUrl: this.accountService.mountUrl(projectId, updated.webdavSlug),
     };
   }
 }

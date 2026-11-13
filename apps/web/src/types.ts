@@ -166,6 +166,7 @@ export interface Project {
   quotaFiles?: number | null;
   webdavEnabled?: boolean;
   webdavUsername?: string | null;
+  webdavSlug?: string | null;
   canManage: boolean;
   createdAt: string;
   updatedAt: string;

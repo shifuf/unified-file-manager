@@ -325,7 +325,7 @@ async function handleMove(
   response: Response,
   copy: boolean,
 ): Promise<void> {
-  const destination = readDestination(request, account.projectId);
+  const destination = readDestination(request, account.mountId || account.projectId);
   if (!destination) {
     response.status(400).end();
     return;
@@ -368,7 +368,7 @@ function readDestination(request: Request, projectId: string): string | null {
   }
 
   const marker = `/api/dav/${projectId}`;
-  if (!pathname.startsWith(marker)) {
+  if (pathname !== marker && !pathname.startsWith(`${marker}/`)) {
     return null;
   }
 

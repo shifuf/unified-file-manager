@@ -124,17 +124,23 @@
           <el-input-number v-model="form.quotaFiles" :min="0" :step="10" controls-position="right" />
         </el-form-item>
         <el-divider content-position="left">WebDAV</el-divider>
+        <el-alert v-if="webdavLoadError" :title="webdavLoadError" type="error" :closable="false" />
         <el-form-item label="启用 WebDAV">
-          <el-switch v-model="form.webdavEnabled" active-text="开启" inactive-text="关闭" />
+          <el-switch v-model="form.webdavEnabled" active-text="开启" inactive-text="关闭" :disabled="webdavLoading" />
           <div class="form-help">挂载地址：{{ webdavPreviewUrl }}</div>
         </el-form-item>
         <template v-if="form.webdavEnabled">
+          <el-form-item label="DAV 地址后缀" prop="webdavSlug">
+            <el-input v-model="form.webdavSlug" maxlength="64" placeholder="英文或数字，例如 backup123；留空随机生成" :disabled="webdavLoading" />
+            <div class="form-help">地址全局唯一，保存为小写；清空后保存会生成新地址。原项目 ID 地址仍可使用。</div>
+          </el-form-item>
           <el-form-item label="WebDAV 用户名">
-            <el-input v-model="form.webdavUsername" maxlength="64" placeholder="例如 alice" />
+            <el-input v-model="form.webdavUsername" maxlength="64" placeholder="例如 alice" :disabled="webdavLoading" />
           </el-form-item>
           <el-form-item label="WebDAV 密码">
             <el-input
               v-model="form.webdavPassword"
+              :disabled="webdavLoading"
               type="password"
               show-password
               maxlength="128"
@@ -146,7 +152,7 @@
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitProject">保存</el-button>
+        <el-button type="primary" :loading="submitting || webdavLoading" :disabled="Boolean(webdavLoadError)" @click="submitProject">保存</el-button>
       </template>
     </el-dialog>
 
@@ -181,7 +187,7 @@
 <script setup lang="ts">
 import { Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 
 import { projectApi, webdavApi } from '@/api/modules';
@@ -211,34 +217,56 @@ const form = reactive({
   webdavEnabled: false,
   webdavUsername: '',
   webdavPassword: '',
+  webdavSlug: '',
 });
 const webdavPreviewUrl = computed(() => {
-
-  const id = editingProject.value?.id ?? '{projectId}';
-  return `${window.location.origin}/api/dav/${id}`;
+  const slug = form.webdavSlug.trim().toLowerCase();
+  return slug ? `${window.location.origin}/api/dav/${slug}` : '保存后随机生成';
 });
 
 const webdavStatus = reactive({ enabled: false, username: '', hasPassword: false });
+const webdavLoading = ref(false);
+const webdavLoadError = ref('');
+let webdavGeneration = 0;
+let webdavController: InstanceType<typeof globalThis.AbortController> | null = null;
+function cancelWebdavRead(): void {
+  webdavGeneration += 1;
+  webdavController?.abort();
+  webdavController = null;
+  webdavLoading.value = false;
+}
+watch(dialogVisible, visible => { if (!visible) cancelWebdavRead(); });
+onBeforeUnmount(cancelWebdavRead);
 
 async function loadWebdav(projectId: string): Promise<void> {
+  cancelWebdavRead();
+  const generation = webdavGeneration;
+  const controller = new globalThis.AbortController();
+  webdavController = controller;
+  webdavLoading.value = true;
+  webdavLoadError.value = '';
+  const current = () => generation === webdavGeneration && !controller.signal.aborted && dialogVisible.value && editingProject.value?.id === projectId;
   try {
-    const status = await webdavApi.status(projectId);
+    const status = await webdavApi.status(projectId, { signal: controller.signal });
+    if (!current()) return;
     webdavStatus.enabled = status.enabled;
     webdavStatus.username = status.username ?? '';
     webdavStatus.hasPassword = status.hasPassword;
     form.webdavEnabled = status.enabled;
     form.webdavUsername = status.username ?? '';
     form.webdavPassword = '';
+    form.webdavSlug = status.slug ?? '';
   } catch {
-    webdavStatus.enabled = false;
-    webdavStatus.username = '';
-    webdavStatus.hasPassword = false;
+    if (current()) webdavLoadError.value = '读取 WebDAV 设置失败，请关闭后重新打开项目编辑。';
+  } finally {
+    if (current()) webdavLoading.value = false;
   }
 }
 const latestSecret = reactive({ appId: '', appSecret: '' });
 
 
 const rules: FormRules = {
+  webdavSlug: [{ pattern: /^\s*[A-Za-z0-9]*\s*$/, message: 'DAV 地址后缀只能填写英文或数字。', trigger: 'blur' }],
   name: [
     { required: true, message: '请输入项目名称。', trigger: 'blur' },
     { min: 2, message: '项目名称至少 2 个字符。', trigger: 'blur' },
@@ -268,6 +296,8 @@ async function loadProjects(): Promise<void> {
 }
 
 function openCreateDialog(): void {
+  cancelWebdavRead();
+  webdavLoadError.value = '';
   editingProject.value = null;
   form.name = '';
   form.description = '';
@@ -280,10 +310,13 @@ function openCreateDialog(): void {
   form.webdavEnabled = false;
   form.webdavUsername = '';
   form.webdavPassword = '';
+  form.webdavSlug = '';
   dialogVisible.value = true;
 }
 
 function openEditDialog(project: Project): void {
+  cancelWebdavRead();
+  webdavLoadError.value = '';
   editingProject.value = project;
   form.name = project.name;
   form.description = project.description || '';
@@ -296,11 +329,13 @@ function openEditDialog(project: Project): void {
   form.webdavEnabled = false;
   form.webdavUsername = '';
   form.webdavPassword = '';
+  form.webdavSlug = project.webdavSlug ?? '';
   dialogVisible.value = true;
   void loadWebdav(project.id);
 }
 
 async function submitProject(): Promise<void> {
+  if (webdavLoading.value || webdavLoadError.value) return;
   const valid = await formRef.value?.validate();
   if (!valid) {
     return;
@@ -321,6 +356,7 @@ async function submitProject(): Promise<void> {
       // 避免"创建报错后重试"变成两个项目。
       webdavEnabled: form.webdavEnabled,
       webdavUsername: form.webdavUsername.trim() || null,
+      webdavSlug: form.webdavSlug.trim(),
       ...(form.webdavPassword ? { webdavPassword: form.webdavPassword } : {}),
     };
 

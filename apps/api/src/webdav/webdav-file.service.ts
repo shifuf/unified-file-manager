@@ -132,7 +132,9 @@ export class WebdavFileService {
         publicUrl: stored.publicUrl,
         thumbnailUrl: category === 'IMAGE' ? stored.publicUrl : null,
         folderPath: folderPath || null,
-        uploadedById: actorId,
+        // DAV credentials belong to the project, not to a User row.
+        // The synthetic principal is retained in the event/quota audit only.
+        uploadedById: null,
       },
       select: { id: true },
     });
