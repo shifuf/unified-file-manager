@@ -1,4 +1,4 @@
-import type { Readable } from 'node:stream';
+import { Readable } from 'node:stream';
 import type { Request, Response } from 'express';
 
 export type ByteRange = {
@@ -9,13 +9,15 @@ export type ByteRange = {
 };
 
 export function parseByteRange(header: string | undefined, size: number): ByteRange | 'unsatisfiable' | null {
-  if (!header || size <= 0) {
+  if (!header) {
     return null;
   }
+  if (!/^bytes=/i.test(header.trim())) return null;
+  if (!Number.isSafeInteger(size) || size <= 0) return 'unsatisfiable';
 
   const match = /^bytes=(\d*)-(\d*)$/i.exec(header.trim());
   if (!match) {
-    return null;
+    return 'unsatisfiable';
   }
 
   const startRaw = match[1];
@@ -25,13 +27,13 @@ export function parseByteRange(header: string | undefined, size: number): ByteRa
   let end: number;
 
   if (startRaw === '' && endRaw === '') {
-    return null;
+    return 'unsatisfiable';
   }
 
   if (startRaw === '') {
     // suffix: bytes=-N
     const suffix = Number.parseInt(endRaw, 10);
-    if (!Number.isFinite(suffix) || suffix <= 0) {
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) {
       return 'unsatisfiable';
     }
     start = Math.max(0, size - suffix);
@@ -39,7 +41,7 @@ export function parseByteRange(header: string | undefined, size: number): ByteRa
   } else {
     start = Number.parseInt(startRaw, 10);
     end = endRaw === '' ? size - 1 : Number.parseInt(endRaw, 10);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
       return 'unsatisfiable';
     }
     if (start >= size) {
@@ -88,11 +90,47 @@ export function writeUnsatisfiableRange(response: Response, size: number): void 
   response.end();
 }
 
+/** Slice an already verified full-object stream without reopening its cloud source. */
+export function sliceByteRange(stream: Readable, range: ByteRange): Readable {
+  const sliced = Readable.from((async function* () {
+    let offset = 0;
+    try {
+      for await (const value of stream) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        const start = Math.max(0, range.start - offset);
+        const end = Math.min(chunk.length, range.end + 1 - offset);
+        if (end > start) yield chunk.subarray(start, end);
+        offset += chunk.length;
+        if (offset > range.end) break;
+      }
+    } finally {
+      stream.destroy();
+    }
+  })());
+  const destroy = sliced._destroy.bind(sliced);
+  sliced._destroy = (error, callback): void => {
+    stream.destroy();
+    destroy(error, callback);
+  };
+  return sliced;
+}
+
 export function pipeStreamToResponse(
   stream: Readable,
   response: Response,
   onError: (error: Error) => void,
 ): void {
+  if (response.destroyed || response.writableEnded) {
+    stream.destroy();
+    return;
+  }
+  const closeSource = (): void => {
+    response.removeListener('close', closeSource);
+    response.removeListener('finish', closeSource);
+    stream.destroy();
+  };
+  response.once('close', closeSource);
+  response.once('finish', closeSource);
   stream.once('error', onError);
   stream.pipe(response);
 }

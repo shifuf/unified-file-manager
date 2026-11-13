@@ -7,6 +7,7 @@ import type { RequestUser } from '../common/types/request-user.type';
 import { CdnService } from './cdn.service';
 import { CreateCdnConfigDto } from './dto/create-cdn-config.dto';
 import { UpdateCdnConfigDto } from './dto/update-cdn-config.dto';
+import { AssignStorageProjectsDto } from './dto/assign-storage-projects.dto';
 
 @ApiTags('存储配置')
 @ApiBearerAuth()
@@ -34,6 +35,20 @@ export class CdnController {
     @CurrentUser() user: RequestUser,
   ): ReturnType<CdnService['testDraft']> {
     return this.cdnService.testDraft(dto, user);
+  }
+
+  @Get('storage-configs/:configId/projects')
+  listAssignments(@Param('configId') configId: string, @CurrentUser() user: RequestUser) {
+    return this.cdnService.listAssignments(configId, user);
+  }
+
+  @Put('storage-configs/:configId/projects')
+  assignProjects(
+    @Param('configId') configId: string,
+    @Body() dto: AssignStorageProjectsDto,
+    @CurrentUser() user: RequestUser,
+  ) {
+    return this.cdnService.assignProjects(configId, dto.projectIds, user);
   }
 
   @Put('storage-configs/:configId')

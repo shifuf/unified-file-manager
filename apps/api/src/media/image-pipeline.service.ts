@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -7,6 +9,7 @@ import {
   FileStatus,
   type CdnConfig,
   type ManagedFile,
+  type Prisma,
 } from '@prisma/client';
 import sharp from 'sharp';
 
@@ -38,38 +41,27 @@ export class ImagePipelineService implements OnModuleInit {
 
   onModuleInit(): void {
     this.eventBus.on(DOMAIN_EVENTS.FILE_UPLOADED, (payload) => {
-      void this.handleUploaded(payload.fileId, payload.category);
+      return this.handleUploaded(payload.fileId, payload.category);
     });
+    this.eventBus.on(DOMAIN_EVENTS.FILE_UPDATED, (payload) =>
+      this.handleUploaded(payload.fileId, FileCategory.IMAGE, true),
+    );
   }
 
-  private async handleUploaded(fileId: string, category: string): Promise<void> {
+  private async handleUploaded(
+    fileId: string,
+    category: string,
+    onlyIfNeeded = false,
+  ): Promise<void> {
     if (category !== FileCategory.IMAGE && category !== 'IMAGE') {
       return;
     }
 
     try {
-      await this.withThumbSlot(() => this.generateThumbnail(fileId));
+      await this.withThumbSlot(() => this.generateThumbnail(fileId, onlyIfNeeded));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(`Thumbnail pipeline failed for fileId=${fileId}: ${message}`);
-      await this.prisma.fileDerivative
-        .upsert({
-          where: { fileId_kind: { fileId, kind: DerivativeKind.THUMB } },
-          create: {
-            fileId,
-            kind: DerivativeKind.THUMB,
-            storageKey: '',
-            mimeType: 'image/webp',
-            size: BigInt(0),
-            status: DerivativeStatus.FAILED,
-            error: message.slice(0, 512),
-          },
-          update: {
-            status: DerivativeStatus.FAILED,
-            error: message.slice(0, 512),
-          },
-        })
-        .catch(() => undefined);
     }
   }
 
@@ -89,51 +81,67 @@ export class ImagePipelineService implements OnModuleInit {
     }
   }
 
-  async generateThumbnail(fileId: string): Promise<void> {
+  async generateThumbnail(fileId: string, onlyIfNeeded = false): Promise<void> {
     const file = await this.prisma.managedFile.findUnique({
       where: { id: fileId },
-      include: { cdnConfig: true },
+      include: { cdnConfig: true, derivatives: true },
     });
 
     if (!file || file.status === FileStatus.DELETED || file.category !== FileCategory.IMAGE) {
       return;
     }
+    if (
+      onlyIfNeeded &&
+      file.derivatives.some(
+        (derivative) =>
+          derivative.kind === DerivativeKind.THUMB &&
+          derivative.status === DerivativeStatus.READY &&
+          this.matchesSource(file, derivative.meta),
+      )
+    )
+      return;
+
+    try {
+      await this.generateSourceThumbnail(file);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.markFailed(file, message).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async generateSourceThumbnail(
+    file: ManagedFile & { cdnConfig: CdnConfig | null },
+  ): Promise<void> {
+    const fileId = file.id;
 
     if (Number(file.size) > MAX_THUMB_SOURCE_BYTES) {
-      await this.prisma.fileDerivative.upsert({
-        where: { fileId_kind: { fileId, kind: DerivativeKind.THUMB } },
-        create: {
-          fileId,
-          kind: DerivativeKind.THUMB,
-          storageKey: '',
-          mimeType: 'image/webp',
-          size: BigInt(0),
-          status: DerivativeStatus.FAILED,
-          error: `source exceeds max size ${MAX_THUMB_SOURCE_BYTES}`,
-        },
-        update: {
-          status: DerivativeStatus.FAILED,
-          error: `source exceeds max size ${MAX_THUMB_SOURCE_BYTES}`,
-        },
-      });
+      await this.markFailed(file, `source exceeds max size ${MAX_THUMB_SOURCE_BYTES}`);
       return;
     }
 
-    await this.prisma.fileDerivative.upsert({
-      where: { fileId_kind: { fileId, kind: DerivativeKind.THUMB } },
-      create: {
-        fileId,
-        kind: DerivativeKind.THUMB,
-        storageKey: '',
-        mimeType: 'image/webp',
-        size: BigInt(0),
-        status: DerivativeStatus.PENDING,
-      },
-      update: {
-        status: DerivativeStatus.PENDING,
-        error: null,
-      },
-    });
+    if (
+      !(await this.withCurrentSource(file, (tx) =>
+        tx.fileDerivative.upsert({
+          where: { fileId_kind: { fileId, kind: DerivativeKind.THUMB } },
+          create: {
+            fileId,
+            kind: DerivativeKind.THUMB,
+            storageKey: '',
+            mimeType: 'image/webp',
+            size: BigInt(0),
+            status: DerivativeStatus.PENDING,
+            meta: this.sourceMeta(file),
+          },
+          update: {
+            status: DerivativeStatus.PENDING,
+            error: null,
+            meta: this.sourceMeta(file),
+          },
+        }),
+      ))
+    )
+      return;
 
     const sourceBuffer = await this.readFileBuffer(file);
     const thumbBuffer = await sharp(sourceBuffer, {
@@ -145,7 +153,7 @@ export class ImagePipelineService implements OnModuleInit {
       .webp({ quality: THUMB_WEBP_QUALITY })
       .toBuffer();
 
-    const storageKey = this.buildThumbKey(file.storageKey);
+    const storageKey = this.buildThumbKey(file);
     const uploadResult = await this.storageService.upload(file.projectId, {
       key: storageKey,
       buffer: thumbBuffer,
@@ -153,45 +161,46 @@ export class ImagePipelineService implements OnModuleInit {
       originalName: `${file.originalName}.thumb.webp`,
     });
 
-    // Prefer CDN public URL; otherwise point at the public transform path that can
-    // short-circuit to the stored THUMB object (cacheable + immutable).
-    const thumbnailUrl =
-      uploadResult.publicUrl ??
-      `${this.storageService.buildPublicAccessUrl(file.id)}?w=${THUMB_WIDTH}&format=webp`;
+    const thumbnailUrl = this.storageService.buildPublicDerivativeUrl(file.id, 'THUMB');
 
-    await this.prisma.$transaction([
-      this.prisma.fileDerivative.upsert({
-        where: { fileId_kind: { fileId, kind: DerivativeKind.THUMB } },
-        create: {
-          fileId,
-          kind: DerivativeKind.THUMB,
-          storageKey: uploadResult.storageKey,
-          mimeType: 'image/webp',
-          size: BigInt(thumbBuffer.length),
-          status: DerivativeStatus.READY,
-          publicUrl: uploadResult.publicUrl ?? null,
-          meta: { width: THUMB_WIDTH, format: 'webp' },
-        },
-        update: {
-          storageKey: uploadResult.storageKey,
-          mimeType: 'image/webp',
-          size: BigInt(thumbBuffer.length),
-          status: DerivativeStatus.READY,
-          publicUrl: uploadResult.publicUrl ?? null,
-          meta: { width: THUMB_WIDTH, format: 'webp' },
-          error: null,
-        },
-      }),
-      this.prisma.managedFile.update({
-        where: { id: fileId },
-        data: { thumbnailUrl },
-      }),
-    ]);
+    if (
+      !(await this.withCurrentSource(file, async (tx) => {
+        await tx.fileDerivative.upsert({
+          where: { fileId_kind: { fileId, kind: DerivativeKind.THUMB } },
+          create: {
+            fileId,
+            kind: DerivativeKind.THUMB,
+            storageKey: uploadResult.storageKey,
+            mimeType: 'image/webp',
+            size: BigInt(thumbBuffer.length),
+            status: DerivativeStatus.READY,
+            publicUrl: thumbnailUrl,
+            meta: { ...this.sourceMeta(file), width: THUMB_WIDTH, format: 'webp' },
+          },
+          update: {
+            storageKey: uploadResult.storageKey,
+            mimeType: 'image/webp',
+            size: BigInt(thumbBuffer.length),
+            status: DerivativeStatus.READY,
+            publicUrl: thumbnailUrl,
+            meta: { ...this.sourceMeta(file), width: THUMB_WIDTH, format: 'webp' },
+            error: null,
+          },
+        });
+        await tx.managedFile.update({
+          where: { id: fileId },
+          data: { thumbnailUrl },
+        });
+      }))
+    )
+      return;
 
     this.logger.debug(`Thumbnail ready for fileId=${fileId} key=${uploadResult.storageKey}`);
   }
 
-  private async readFileBuffer(file: ManagedFile & { cdnConfig: CdnConfig | null }): Promise<Buffer> {
+  private async readFileBuffer(
+    file: ManagedFile & { cdnConfig: CdnConfig | null },
+  ): Promise<Buffer> {
     if (Number(file.size) > MAX_THUMB_SOURCE_BYTES) {
       throw new Error(`Source exceeds max size ${MAX_THUMB_SOURCE_BYTES}`);
     }
@@ -212,7 +221,11 @@ export class ImagePipelineService implements OnModuleInit {
     }
 
     if (target.type === 'redirect' && target.url) {
-      const allowPrivate = getConfigBoolean(this.configService, 'STORAGE_ALLOW_PRIVATE_ENDPOINTS', false);
+      const allowPrivate = getConfigBoolean(
+        this.configService,
+        'STORAGE_ALLOW_PRIVATE_ENDPOINTS',
+        false,
+      );
       const response = await safeFetch(
         target.url,
         {},
@@ -238,11 +251,78 @@ export class ImagePipelineService implements OnModuleInit {
     throw new Error('No readable source for thumbnail generation.');
   }
 
-  private buildThumbKey(storageKey: string): string {
+  private sourceMeta(file: ManagedFile) {
+    return {
+      sourceStorageKey: file.storageKey,
+      sourceChecksum: file.checksum,
+      sourceVersion: file.currentVersion,
+      sourceRevision: createHash('sha256')
+        .update(JSON.stringify([file.storageKey, file.checksum, file.currentVersion]))
+        .digest('hex')
+        .slice(0, 32),
+    };
+  }
+
+  private matchesSource(file: ManagedFile, meta: Prisma.JsonValue): boolean {
+    return (
+      meta !== null &&
+      typeof meta === 'object' &&
+      !Array.isArray(meta) &&
+      meta.sourceStorageKey === file.storageKey &&
+      meta.sourceChecksum === file.checksum &&
+      meta.sourceVersion === file.currentVersion
+    );
+  }
+
+  private async withCurrentSource(
+    file: ManagedFile,
+    write: (tx: Prisma.TransactionClient) => Promise<unknown>,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.managedFile.updateMany({
+        where: {
+          id: file.id,
+          storageKey: file.storageKey,
+          checksum: file.checksum,
+          currentVersion: file.currentVersion,
+          status: file.status,
+          category: FileCategory.IMAGE,
+        },
+        data: { currentVersion: file.currentVersion },
+      });
+      if (!locked.count) return false;
+      await write(tx);
+      return true;
+    });
+  }
+
+  private async markFailed(file: ManagedFile, error: string): Promise<boolean> {
+    return this.withCurrentSource(file, (tx) =>
+      tx.fileDerivative.upsert({
+        where: { fileId_kind: { fileId: file.id, kind: DerivativeKind.THUMB } },
+        create: {
+          fileId: file.id,
+          kind: DerivativeKind.THUMB,
+          storageKey: '',
+          mimeType: 'image/webp',
+          size: BigInt(0),
+          status: DerivativeStatus.FAILED,
+          error: error.slice(0, 512),
+          meta: this.sourceMeta(file),
+        },
+        update: {
+          status: DerivativeStatus.FAILED,
+          error: error.slice(0, 512),
+          meta: this.sourceMeta(file),
+        },
+      }),
+    );
+  }
+
+  private buildThumbKey(file: ManagedFile): string {
+    const storageKey = file.storageKey;
     const lastSlash = storageKey.lastIndexOf('/');
     const dir = lastSlash >= 0 ? storageKey.slice(0, lastSlash + 1) : '';
-    const base = lastSlash >= 0 ? storageKey.slice(lastSlash + 1) : storageKey;
-    const withoutExt = base.replace(/\.[^.]+$/, '');
-    return `${dir}thumbs/${withoutExt}-320.webp`;
+    return `${dir}thumbs/${file.id}-${this.sourceMeta(file).sourceRevision}-320.webp`;
   }
 }

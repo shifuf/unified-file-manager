@@ -16,13 +16,42 @@ import type {
   ShareStatus,
   ShareLink,
   StorageHealthResult,
+  StorageProjectBinding,
   StorageUsageResult,
+  StorageReplicaSummary,
   SystemHealth,
   TaskItem,
   UserProfile,
 } from '@/types';
 
 import { http } from './http';
+import type { AxiosRequestConfig } from 'axios';
+import { reactive } from 'vue';
+
+type ReadOptions = Pick<AxiosRequestConfig, 'signal' | '_silent'>;
+
+// Keep the active queue alive across SPA navigation, including login redirects.
+// The upload's closure retains its File objects until completion or cancellation.
+export const uploadQueueState = reactive({ active: false, paused: false, progress: 0, projectId: '', projectName: '', error: '', canceled: false });
+const uploadResumeWaiters = new Set<() => void>();
+export function pauseUploadQueue(message = ''): void {
+  uploadQueueState.paused = true;
+  uploadQueueState.error = message;
+}
+export function resumeUploadQueue(): void {
+  uploadQueueState.paused = false;
+  uploadQueueState.error = '';
+  uploadResumeWaiters.forEach(resolve => resolve());
+  uploadResumeWaiters.clear();
+}
+export function cancelUploadQueue(): void {
+  uploadQueueState.canceled = true;
+  resumeUploadQueue();
+}
+export async function waitForUploadQueue(): Promise<void> {
+  while (uploadQueueState.paused) await new Promise<void>(resolve => uploadResumeWaiters.add(resolve));
+  if (uploadQueueState.canceled) throw Object.assign(new Error('上传已取消。'), { code: 'ERR_CANCELED' });
+}
 
 
 export interface LoginSuccessResult {
@@ -104,14 +133,16 @@ export const webdavApi = {
 };
 
 export const downloadStatsApi = {
-  summary(projectId: string, params: { days?: number; source?: string; fileId?: string } = {}) {
+  summary(projectId: string, params: { days?: number; source?: string; fileId?: string } = {}, options: ReadOptions = {}) {
     return http.get<unknown, DownloadStatsSummary>(`/projects/${projectId}/download-stats/summary`, {
       params: compactParams(params),
+      ...options,
     });
   },
   list(
     projectId: string,
     params: { page?: number; pageSize?: number; days?: number; source?: string; fileId?: string } = {},
+    options: ReadOptions = {},
   ) {
     return http.get<
       unknown,
@@ -134,15 +165,15 @@ export const downloadStatsApi = {
         pageSize: number;
         labels: Record<string, string>;
       }
-    >(`/projects/${projectId}/download-stats`, { params: compactParams(params) });
+    >(`/projects/${projectId}/download-stats`, { params: compactParams(params), ...options });
   },
 };
 export const projectApi = {
-  list(keyword?: string) {
-    return http.get<unknown, Project[]>('/projects', { params: { keyword } });
+  list(keyword?: string, options: ReadOptions = {}) {
+    return http.get<unknown, Project[]>('/projects', { params: { keyword }, ...options });
   },
-  get(projectId: string) {
-    return http.get<unknown, Project>(`/projects/${projectId}`);
+  get(projectId: string, options: ReadOptions = {}) {
+    return http.get<unknown, Project>(`/projects/${projectId}`, options);
   },
   create(payload: {
     name: string;
@@ -185,10 +216,10 @@ export const projectApi = {
       `/projects/${projectId}/secret/reset`,
     );
   },
-  stats(projectId: string) {
-    return http.get<unknown, ProjectStats>(`/projects/${projectId}/stats`);
+  stats(projectId: string, options: ReadOptions = {}) {
+    return http.get<unknown, ProjectStats>(`/projects/${projectId}/stats`, options);
   },
-  hotspots(projectId: string, params?: { days?: number; limit?: number }) {
+  hotspots(projectId: string, params?: { days?: number; limit?: number }, options: ReadOptions = {}) {
     return http.get<
       unknown,
       {
@@ -201,7 +232,7 @@ export const projectApi = {
           bytes: number;
         }>;
       }
-    >(`/projects/${projectId}/hotspots`, { params });
+    >(`/projects/${projectId}/hotspots`, { params, ...options });
   },
   export(projectId: string) {
     return http.get<unknown, Record<string, unknown>>(`/projects/${projectId}/export`);
@@ -212,8 +243,8 @@ export const projectApi = {
       payload,
     );
   },
-  listSecrets(projectId: string) {
-    return http.get<unknown, ProjectSecret[]>(`/projects/${projectId}/secrets`);
+  listSecrets(projectId: string, options: ReadOptions = {}) {
+    return http.get<unknown, ProjectSecret[]>(`/projects/${projectId}/secrets`, options);
   },
   createSecret(projectId: string, payload: { name?: string }) {
     return http.post<unknown, ProjectSecret & { appSecret: string; secretNotice: string }>(
@@ -227,9 +258,15 @@ export const projectApi = {
 };
 
 export const cdnApi = {
-  list(projectId?: string) {
+  projects(configId: string) {
+    return http.get<unknown, StorageProjectBinding[]>(`/storage-configs/${configId}/projects`);
+  },
+  assignProjects(configId: string, projectIds: string[]) {
+    return http.put<unknown, StorageProjectBinding[]>(`/storage-configs/${configId}/projects`, { projectIds });
+  },
+  list(projectId?: string, options: ReadOptions = {}) {
     const url = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
-    return http.get<unknown, CdnConfig[]>(url);
+    return http.get<unknown, CdnConfig[]>(url, options);
   },
   create(payload: { provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }, projectId?: string) {
     const url = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
@@ -268,11 +305,20 @@ export const cdnApi = {
       : `/storage-configs/${configId}/test`;
     return http.post<unknown, StorageHealthResult>(url);
   },
-  usage(configId: string, projectId?: string) {
+  usage(configId: string, projectId?: string, options: ReadOptions = {}) {
     const url = projectId
       ? `/projects/${projectId}/storage-configs/${configId}/usage`
       : `/storage-configs/${configId}/usage`;
-    return http.get<unknown, StorageUsageResult>(url);
+    return http.get<unknown, StorageUsageResult>(url, options);
+  },
+};
+
+export const replicaApi = {
+  list(projectId: string, options: ReadOptions = {}, params: { cursor?: string; limit?: number; page?: number; pageSize?: number } = {}) {
+    return http.get<unknown, StorageReplicaSummary>(`/projects/${projectId}/storage/replicas`, { ...options, params: compactParams(params) });
+  },
+  run(projectId: string, action: 'sync' | 'inspect' | 'retry', payload: { cursor?: string; limit?: number } = {}) {
+    return http.post<unknown, { scanned?: number; queued?: number; ready?: number; failed?: number; nextCursor?: string | null }>(`/projects/${projectId}/storage/replicas/${action}`, compactParams(payload));
   },
 };
 
@@ -293,8 +339,8 @@ export const fileApi = {
     duplicateOnly?: boolean;
     page?: number;
     pageSize?: number;
-  }) {
-    return http.get<unknown, PageResult<ManagedFile>>('/files', { params: compactParams(params) });
+  }, options: ReadOptions = {}) {
+    return http.get<unknown, PageResult<ManagedFile>>('/files', { params: compactParams(params), ...options });
   },
   upload(
     projectId: string,
@@ -331,10 +377,12 @@ export const fileApi = {
       duplicateStrategy?: 'reject' | 'reuse' | 'replace';
       targetFileId?: string;
     },
+    options: ReadOptions = {},
   ) {
     return http.post<unknown, { uploadId: string; received: number[]; totalChunks: number }>(
       `/projects/${projectId}/uploads/init`,
       compactParams(payload),
+      options,
     );
   },
   getChunkStatus(projectId: string, uploadId: string) {
@@ -342,17 +390,17 @@ export const fileApi = {
       `/projects/${projectId}/uploads/${uploadId}`,
     );
   },
-  uploadChunk(projectId: string, uploadId: string, chunkIndex: number, chunk: Blob) {
+  uploadChunk(projectId: string, uploadId: string, chunkIndex: number, chunk: Blob, options: ReadOptions = {}) {
     const formData = new FormData();
     formData.append('files', chunk, `chunk-${chunkIndex}`);
     return http.put<unknown, { received: number; totalChunks: number }>(
       `/projects/${projectId}/uploads/${uploadId}/chunks/${chunkIndex}`,
       formData,
-      { timeout: 0 },
+      { timeout: 0, ...options },
     );
   },
-  completeChunkedUpload(projectId: string, uploadId: string) {
-    return http.post<unknown, ManagedFile>(`/projects/${projectId}/uploads/${uploadId}/complete`, {});
+  completeChunkedUpload(projectId: string, uploadId: string, options: ReadOptions = {}) {
+    return http.post<unknown, ManagedFile>(`/projects/${projectId}/uploads/${uploadId}/complete`, {}, options);
   },
   abortChunkedUpload(projectId: string, uploadId: string) {
     return http.delete<unknown, { success: boolean }>(`/projects/${projectId}/uploads/${uploadId}`);
@@ -370,11 +418,13 @@ export const fileApi = {
       duplicateStrategy?: 'reject' | 'reuse' | 'replace';
       targetFileId?: string;
       onProgress?: (progress: number) => void;
+      beforeTransfer?: () => Promise<void>;
+      onAuthExpired?: () => Promise<void>;
     } = {},
   ): Promise<ManagedFile> {
     const chunkSize = options.chunkSize ?? 5 * 1024 * 1024;
     const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
-    const init = await fileApi.initChunkedUpload(projectId, {
+    const payload = {
       fileName: file.name,
       size: file.size,
       totalChunks,
@@ -382,19 +432,42 @@ export const fileApi = {
       folderPath: options.folderPath,
       duplicateStrategy: options.duplicateStrategy,
       targetFileId: options.targetFileId,
-    });
-    const received = new Set(init.received);
-
-    for (let index = 0; index < totalChunks; index += 1) {
-      if (!received.has(index)) {
-        const start = index * chunkSize;
-        const chunk = file.slice(start, Math.min(start + chunkSize, file.size));
-        await uploadChunkWithRetry(projectId, init.uploadId, index, chunk);
+    };
+    let plan: { uploadId: string; received: number[]; totalChunks: number } | undefined;
+    let received = new Set<number>();
+    let renewals = 0;
+    for (;;) {
+      try {
+        await options.beforeTransfer?.();
+        if (!plan) {
+          plan = await fileApi.initChunkedUpload(projectId, payload, { _silent: true });
+          received = new Set(plan.received);
+        }
+        for (let index = 0; index < totalChunks; index += 1) {
+          if (!received.has(index)) {
+            const start = index * chunkSize;
+            const chunk = file.slice(start, Math.min(start + chunkSize, file.size));
+            await uploadChunkWithRetry(projectId, plan.uploadId, index, chunk, 3, options.beforeTransfer);
+            received.add(index);
+          }
+          options.onProgress?.(Math.round(((index + 1) / totalChunks) * 100));
+        }
+        await options.beforeTransfer?.();
+        return await fileApi.completeChunkedUpload(projectId, plan.uploadId, { _silent: true });
+      } catch (error) {
+        const status = (error as { response?: { status?: number } }).response?.status;
+        if (status === 401 && options.onAuthExpired) {
+          await options.onAuthExpired();
+          continue;
+        }
+        if (plan && (status === 404 || status === 410) && renewals < 3) {
+          renewals++;
+          plan = undefined;
+          continue;
+        }
+        throw error;
       }
-      options.onProgress?.(Math.round(((index + 1) / totalChunks) * 100));
     }
-
-    return fileApi.completeChunkedUpload(projectId, init.uploadId);
   },
   update(fileId: string, payload: {
     originalName?: string;
@@ -462,17 +535,17 @@ export const fileApi = {
   migrateLocalFiles(projectId: string) {
     return http.post<unknown, LocalFileMigrationSummary>(`/projects/${projectId}/files/migrate-local`);
   },
-  listFolders(projectId: string) {
-    return http.get<unknown, string[]>(`/projects/${projectId}/files/folders`);
+  listFolders(projectId: string, options: ReadOptions = {}) {
+    return http.get<unknown, string[]>(`/projects/${projectId}/files/folders`, options);
   },
   createFolder(projectId: string, folderPath: string) {
     return http.post<unknown, { folderPath: string }>(`/projects/${projectId}/files/folders`, { folderPath });
   },
-  listFolderTree(projectId: string) {
+  listFolderTree(projectId: string, options: ReadOptions = {}) {
     return http.get<
       unknown,
       Array<{ name: string; path: string; fileCount: number; children: unknown[] }>
-    >(`/projects/${projectId}/files/folder-tree`);
+    >(`/projects/${projectId}/files/folder-tree`, options);
   },
   createShare(
     fileId: string,
@@ -488,8 +561,8 @@ export const fileApi = {
   ) {
     return http.post<unknown, ShareLink>(`/files/${fileId}/shares`, compactParams(payload));
   },
-  listShares(fileId: string) {
-    return http.get<unknown, ShareLink[]>(`/files/${fileId}/shares`);
+  listShares(fileId: string, options: ReadOptions = {}) {
+    return http.get<unknown, ShareLink[]>(`/files/${fileId}/shares`, options);
   },
   updateShare(
     shareId: string,
@@ -521,7 +594,7 @@ export const fileApi = {
   }) {
     return http.get<unknown, PageResult<ShareLink>>('/file-shares', { params: compactParams(params) });
   },
-  listVersions(fileId: string) {
+  listVersions(fileId: string, options: ReadOptions = {}) {
     return http.get<
       unknown,
       Array<{
@@ -534,7 +607,7 @@ export const fileApi = {
         createdAt: string;
         remark?: string | null;
       }>
-    >(`/files/${fileId}/versions`);
+    >(`/files/${fileId}/versions`, options);
   },
   restoreVersion(fileId: string, version: number) {
     return http.post<unknown, ManagedFile>(`/files/${fileId}/versions/${version}/restore`);
@@ -542,11 +615,11 @@ export const fileApi = {
 };
 
 export const folderPublicApi = {
-  list(projectId: string) {
+  list(projectId: string, options: ReadOptions = {}) {
     return http.get<
       unknown,
       Array<{ id: string; projectId: string; folderPath: string; isPublic: boolean; createdAt: string; updatedAt: string }>
-    >(`/projects/${projectId}/folder-public`);
+    >(`/projects/${projectId}/folder-public`, options);
   },
   upsert(projectId: string, payload: { folderPath?: string | null; isPublic: boolean }) {
     return http.put<
@@ -571,7 +644,7 @@ export const folderPublicApi = {
 };
 
 export const uploadCredentialApi = {
-  list(projectId: string) {
+  list(projectId: string, options: ReadOptions = {}) {
     return http.get<
       unknown,
       Array<{
@@ -588,7 +661,7 @@ export const uploadCredentialApi = {
         scope?: Record<string, unknown>;
         createdAt: string;
       }>
-    >(`/projects/${projectId}/upload-credentials`);
+    >(`/projects/${projectId}/upload-credentials`, options);
   },
   create(
     projectId: string,
@@ -670,6 +743,8 @@ export const uploadCredentialApi = {
       duplicateStrategy?: 'reject' | 'reuse' | 'replace';
       targetFileId?: string;
       onProgress?: (progress: number) => void;
+      beforeTransfer?: () => Promise<void>;
+      onAuthExpired?: () => Promise<void>;
     } = {},
   ): Promise<ManagedFile> {
     const DIRECT_THRESHOLD = 8 * 1024 * 1024;
@@ -841,14 +916,18 @@ async function uploadChunkWithRetry(
   index: number,
   chunk: Blob,
   attempts = 3,
+  beforeTransfer?: () => Promise<void>,
 ): Promise<void> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      await fileApi.uploadChunk(projectId, uploadId, index, chunk);
+      await beforeTransfer?.();
+      await fileApi.uploadChunk(projectId, uploadId, index, chunk, { _silent: true });
       return;
     } catch (error) {
       lastError = error;
+      const status = (error as { response?: { status?: number } }).response?.status;
+      if (status === 401 || status === 404 || status === 410 || (error as { code?: string }).code === 'ERR_CANCELED') throw error;
     }
   }
 

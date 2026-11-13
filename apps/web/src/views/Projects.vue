@@ -46,7 +46,16 @@
               <span class="mono">{{ row.appId }}</span>
             </template>
           </el-table-column>
-          <el-table-column prop="activeCdnName" label="当前存储" min-width="150" />
+          <el-table-column label="使用的存储" min-width="250">
+            <template #default="{ row }">
+              <div class="storage-tags">
+                <el-tag v-for="storage in orderedStorages(row)" :key="storage.id" :type="storage.enabled ? 'success' : 'info'" size="small">
+                  {{ storage.name }} · {{ storage.enabled ? '启用' : '停用' }} · {{ storage.provider === 'LOCAL' ? '本地兜底' : `优先级 ${storage.priority}` }}
+                </el-tag>
+                <span v-if="!row.storages?.length" class="muted">暂无配置关系</span>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="WebDAV" width="120">
             <template #default="{ row }">
               <el-tag :type="row.webdavEnabled ? 'success' : 'info'" size="small">
@@ -245,6 +254,10 @@ function formatDomains(value: string[] | undefined): string {
   return value && value.length > 0 ? value.join('、') : '使用全局白名单';
 }
 
+function orderedStorages(project: Project) {
+  return [...(project.storages || [])].sort((a, b) => Number(a.provider === 'LOCAL') - Number(b.provider === 'LOCAL') || a.priority - b.priority || a.id.localeCompare(b.id));
+}
+
 async function loadProjects(): Promise<void> {
   loading.value = true;
   try {
@@ -399,6 +412,9 @@ onMounted(loadProjects);
 .data-table {
   margin-top: 14px;
 }
+
+.storage-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.storage-tags :deep(.el-tag) { height: auto; white-space: normal; line-height: 1.6; }
 
 .hidden-input {
   display: none;

@@ -24,7 +24,6 @@ import { getClientIp } from '../common/utils/client-ip.util';
 import {
   applyRangeHeaders,
   getRequestRangeHeader,
-  parseByteRange,
   pipeStreamToResponse,
   writeUnsatisfiableRange,
 } from '../common/utils/http-range.util';
@@ -135,30 +134,50 @@ export class PublicFolderSharesController {
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
+    await this.downloadFile(token, fileId, password, undefined, undefined, request, response);
+  }
+
+  @Get(':token/files/:fileId/download')
+  async getDownload(
+    @Param('token') token: string,
+    @Param('fileId') fileId: string,
+    @Query('password') password: string | undefined,
+    @Query('ticket') ticket: string | undefined,
+    @Query('expires') expires: string | undefined,
+    @Req() request: Request,
+    @Res() response: Response,
+  ): Promise<void> {
+    await this.downloadFile(token, fileId, password, ticket, expires, request, response);
+  }
+
+  @Post(':token/files/:fileId/download-session')
+  @HttpCode(200)
+  createDownloadSession(
+    @Param('token') token: string,
+    @Param('fileId') fileId: string,
+    @Body('password') password: string | undefined,
+    @Req() request: Request,
+  ): ReturnType<FolderShareService['createDownloadSession']> {
+    return this.folderShareService.createDownloadSession(token, fileId, password, { ip: getClientIp(request) });
+  }
+
+  private async downloadFile(token: string, fileId: string, password: string | undefined, ticket: string | undefined, expires: string | undefined, request: Request, response: Response): Promise<void> {
     const clientIp = getClientIp(request);
-    const meta = await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
-      ip: clientIp,
+    const head = request.method === 'HEAD';
+    const { file, target, range, unsatisfiable } = await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
+      ip: clientIp, head, rangeHeader: getRequestRangeHeader(request),
+      ticket, expires: expires === undefined ? undefined : Number(expires),
     });
-    const size = Number(meta.file.size ?? 0);
-    const parsed = parseByteRange(getRequestRangeHeader(request), size);
-    if (parsed === 'unsatisfiable') {
+    const size = Number(file.size ?? 0);
+    if (unsatisfiable) {
       writeUnsatisfiableRange(response, size);
       return;
     }
 
-    // Re-fetch with range when seeking — do not double-count download / rate limit.
-    const { file, target } =
-      parsed && typeof parsed === 'object'
-        ? await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
-            ip: clientIp,
-            range: { start: parsed.start, end: parsed.end },
-            skipCount: true,
-          })
-        : meta;
-    // Share downloads always stream via API (preferRedirect:false) so rate limits apply.
-    if (target.type === 'redirect' && target.url && !(parsed && typeof parsed === 'object')) {
-      response.redirect(target.url);
-      return;
+    response.setHeader('Cache-Control', 'no-store');
+    if (head) {
+      applyRangeHeaders(response, file.mimeType, size, range, 'attachment', file.originalName);
+      response.end(); return;
     }
     if (!target.stream) {
       response.status(404).send('File stream not found.');
@@ -168,16 +187,18 @@ export class PublicFolderSharesController {
       projectId: file.projectId,
       fileId: file.id,
       originalName: file.originalName,
-      bytes: parsed && typeof parsed === 'object' ? parsed.length : size,
+      bytes: range?.length ?? size,
       source: DownloadSource.FOLDER_SHARE,
       ip: clientIp,
       userAgent: request.get('user-agent') ?? null,
+      rangeStart: range?.start ?? null,
+      rangeEnd: range?.end ?? null,
     });
     applyRangeHeaders(
       response,
       file.mimeType,
       size,
-      parsed && typeof parsed === 'object' ? parsed : null,
+      range,
       'attachment',
       file.originalName,
     );

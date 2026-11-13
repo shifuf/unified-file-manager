@@ -54,8 +54,12 @@ http.interceptors.request.use((config) => {
 http.interceptors.response.use(
   (response) => response.data,
   async (error: AxiosError<{ message?: string | string[] } | Blob>) => {
-    const authStore = await getAuthStore();
     const original = error.config;
+    if (axios.isCancel(error) || original?.signal?.aborted) {
+      return Promise.reject(error);
+    }
+    const authStore = await getAuthStore();
+    if (original?.signal?.aborted) return Promise.reject(error);
     const status = error.response?.status;
     const isAuthCall = isAuthEndpoint(original?.url);
 
@@ -63,6 +67,9 @@ http.interceptors.response.use(
     if (status === 401 && original && !original._retried && !isAuthCall && authStore.loggedIn) {
       original._retried = true;
       const newToken = await runSingleFlightRefresh(authStore);
+      // Route changes can cancel a read while the shared refresh is pending.
+      // Such a read must never replay, toast, or expire the current session.
+      if (original.signal?.aborted) return Promise.reject(error);
       if (newToken) {
         return http(original);
       }
@@ -77,7 +84,8 @@ http.interceptors.response.use(
     }
 
     if (!original?._silent) {
-      notifyError((await readErrorMessage(error)) || '请求失败，请稍后重试。');
+      const message = (await readErrorMessage(error)) || '请求失败，请稍后重试。';
+      if (!original?.signal?.aborted) notifyError(message);
     }
 
     return Promise.reject(error);

@@ -26,7 +26,7 @@
           v-if="!isRecycleBin && canManageSelectedProject"
           type="primary"
           :icon="Upload"
-          :disabled="!selectedProjectId"
+          :disabled="!selectedProjectId || uploading"
           @click="fileInputRef?.click()"
         >
           上传文件
@@ -34,7 +34,7 @@
         <el-button
           v-if="!isRecycleBin && canManageSelectedProject"
           :icon="Upload"
-          :disabled="!selectedProjectId"
+          :disabled="!selectedProjectId || uploading"
           @click="folderInputRef?.click()"
         >
           上传文件夹
@@ -50,11 +50,10 @@
         <el-button
           v-if="!isRecycleBin && canManageSelectedProject"
           :icon="Refresh"
-          :loading="migratingLocalFiles"
           :disabled="!selectedProjectId"
-          @click="migrateLocalFiles"
+          @click="router.push(`/projects/${selectedProjectId}`)"
         >
-          迁移本地文件
+          项目副本补同步
         </el-button>
         <el-button v-if="!isRecycleBin" :icon="Download" :disabled="selectedRows.length === 0" @click="batchDownload">
           批量下载
@@ -111,6 +110,7 @@
             <el-button link type="primary" @click="selectFolder('')">根目录</el-button>
           </div>
           <el-tree
+            v-loading="foldersLoading"
             :data="folderTree"
             node-key="path"
             :props="{ label: 'name', children: 'children' }"
@@ -312,7 +312,30 @@
           </el-collapse-item>
         </el-collapse>
 
-        <el-progress v-if="!isRecycleBin && uploading" :percentage="uploadProgress" class="upload-progress" />
+        <div v-if="uploading" class="upload-controls">
+          <div class="toolbar">
+            <span>上传项目：{{ uploadQueueState.projectName || uploadQueueState.projectId }}</span>
+            <el-tag v-if="uploadQueueState.paused" type="warning">上传已暂停</el-tag>
+            <el-button v-if="!uploadQueueState.paused" @click="pauseUploadQueue()">暂停上传</el-button>
+            <el-button v-else type="primary" @click="resumeUploadQueue">继续上传</el-button>
+            <el-button @click="cancelUploadQueue">取消上传</el-button>
+            <span class="muted">暂停或取消在当前请求完成后生效；页面内切换可继续上传。</span>
+          </div>
+          <el-alert v-if="uploadQueueState.error" :title="uploadQueueState.error" type="warning" :closable="false" style="margin-top: 8px" />
+          <el-progress :percentage="uploadProgress" class="upload-progress" />
+        </div>
+
+        <section v-if="uploadResults.files.length" class="upload-results">
+          <div class="toolbar"><strong>本次上传结果</strong><span class="muted">{{ uploadResults.projectName || uploadResults.projectId }} · 已提交或复用 {{ uploadResults.files.length }} 个文件</span><el-button size="small" :loading="uploadResultsLoading" @click="loadUploadResultStorage">刷新副本</el-button></div>
+          <p class="muted">上传提交或已有文件复用已完成；本地保存结果以实际副本校验状态为准，选中的云存储在后台同步。点击详情可查看每个存储的状态。</p>
+          <el-table :data="visibleUploadResults" row-key="id" size="small">
+            <el-table-column prop="originalName" label="文件名" min-width="180" show-overflow-tooltip />
+            <el-table-column label="本地保存" min-width="145"><template #default="{ row }">{{ localReplicaResult(storageLocations(row)) }}</template></el-table-column>
+            <el-table-column label="存储状态" min-width="300"><template #default="{ row }"><StorageLocationTags :locations="storageLocations(row)" :error="uploadResultsError" @open="openStorageDetails(row)" /></template></el-table-column>
+            <el-table-column label="操作" width="95"><template #default="{ row }"><el-button link type="primary" @click="openStorageDetails(row)">详情</el-button></template></el-table-column>
+          </el-table>
+          <el-pagination v-model:current-page="uploadResultPage" :page-size="20" :total="uploadResults.files.length" layout="total, prev, pager, next" @current-change="loadUploadResultStorage" />
+        </section>
 
         <el-table
           v-loading="loading"
@@ -377,9 +400,9 @@
               <span v-else class="muted">-</span>
             </template>
           </el-table-column>
-          <el-table-column label="存储位置" min-width="150">
+          <el-table-column label="存储位置" min-width="280">
             <template #default="{ row }">
-              <el-tag effect="dark" type="info">{{ row.storageConfigName || row.cdnProvider || '未知存储' }}</el-tag>
+              <StorageLocationTags :locations="storageLocations(row)" :error="storageSummaryError" @open="openStorageDetails(row)" />
             </template>
           </el-table-column>
           <el-table-column :label="isRecycleBin ? '删除时间' : '上传时间'" min-width="170">
@@ -395,7 +418,7 @@
                   <el-button link type="primary" :loading="downloadingIds.has(row.id)" @click="download(row)">
                     下载
                   </el-button>
-                  <el-button v-if="canManageFile(row)" link type="primary" @click="openStorageCopy(row)">复制到存储</el-button>
+                  <el-button link type="primary" @click="openStorageDetails(row)">详情</el-button>
                   <el-button v-if="canManageFile(row)" link type="primary" @click="openEditDialog(row)">
                     编辑
                   </el-button>
@@ -454,28 +477,7 @@
       </div>
     </section>
 
-    <el-dialog
-      v-model="storageCopyVisible"
-      title="复制文件到其他存储"
-      width="520px"
-      align-center
-      append-to-body
-      destroy-on-close
-    >
-      <el-alert type="info" :closable="false" show-icon title="复制成功后文件归属切换到目标存储，源对象会保留。" />
-      <el-select v-model="storageCopyTargetId" placeholder="请选择目标存储" style="width: 100%; margin-top: 16px">
-        <el-option
-          v-for="config in storageCopyConfigs.filter((item) => item.id !== storageCopyFile?.storageConfigId)"
-          :key="config.id"
-          :label="`${config.name}（${config.provider}）`"
-          :value="config.id"
-        />
-      </el-select>
-      <template #footer>
-        <el-button @click="storageCopyVisible = false">取消</el-button>
-        <el-button type="primary" :loading="storageCopyLoading" :disabled="!storageCopyTargetId" @click="submitStorageCopy">开始复制</el-button>
-      </template>
-    </el-dialog>
+    <FileStorageDetails v-model="storageDetailsVisible" :file="storageDetailsFile" @changed="acceptStorageDetails" />
 
     <el-dialog v-model="editDialogVisible" title="文件信息" width="560px">
       <el-form label-position="top">
@@ -749,12 +751,17 @@
 <script setup lang="ts">
 import { Back, Delete, Document, Download, FolderAdd, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, toRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { http } from '@/api/http';
-import { cdnApi, fileApi, folderPublicApi, projectApi, settingsApi, uploadCredentialApi } from '@/api/modules';
-import type { CdnConfig, CdnProvider, FileCategory, FileStatus, ManagedFile, PageResult, Project, ShareLink, ShareStatus } from '@/types';
+import { fileStorageApi } from '@/api/file-storage';
+import FileStorageDetails from '@/components/FileStorageDetails.vue';
+import StorageLocationTags from '@/components/StorageLocationTags.vue';
+import { uploadResults, retainUploadedFiles } from '@/stores/upload-results';
+import { hasPendingReplicas, localReplicaResult, replicaSnapshotMatches, shouldAcceptReplicaSnapshot } from '@/utils/storage-replica-view';
+import { cancelUploadQueue, fileApi, folderPublicApi, pauseUploadQueue, projectApi, resumeUploadQueue, settingsApi, uploadCredentialApi, uploadQueueState, waitForUploadQueue } from '@/api/modules';
+import type { CdnProvider, FileCategory, FileReplicaDetail, FileStatus, ManagedFile, PageResult, Project, ShareLink, ShareStatus } from '@/types';
 import { copyText, saveBlob } from '@/utils/io';
 
 type FileListParams = Parameters<typeof fileApi.list>[0];
@@ -762,12 +769,38 @@ type FileListParams = Parameters<typeof fileApi.list>[0];
 const route = useRoute();
 const router = useRouter();
 const loading = ref(false);
-const uploading = ref(false);
+const foldersLoading = ref(false);
+let readGeneration = 0;
+let readController: globalThis.AbortController | undefined;
+let targetController: globalThis.AbortController | undefined;
+let targetGeneration = 0;
+const mountController = new globalThis.AbortController();
+let projectContextGeneration = 0;
+const dialogReads = new Map<string, globalThis.AbortController>();
+
+function captureProjectContext(): () => boolean {
+  const generation = projectContextGeneration;
+  return () => generation === projectContextGeneration && !mountController.signal.aborted;
+}
+
+async function readDialog<T>(key: string, fetch: (signal: globalThis.AbortSignal) => Promise<T>, commit: (result: T) => void, busy?: { value: boolean }): Promise<void> {
+  const generation = projectContextGeneration;
+  dialogReads.get(key)?.abort();
+  const controller = new globalThis.AbortController();
+  dialogReads.set(key, controller);
+  const current = () => generation === projectContextGeneration && dialogReads.get(key) === controller && !controller.signal.aborted;
+  if (busy) busy.value = true;
+  try {
+    const result = await fetch(controller.signal);
+    if (current()) commit(result);
+  } catch { /* HTTP handles current errors; navigation cancellation is silent. */ }
+  finally { if (current() && busy) busy.value = false; }
+}
+const uploading = toRef(uploadQueueState, 'active');
 const editing = ref(false);
 const sharing = ref(false);
 const moving = ref(false);
-const migratingLocalFiles = ref(false);
-const uploadProgress = ref(0);
+const uploadProgress = toRef(uploadQueueState, 'progress');
 const isDragging = ref(false);
 const dragDepth = ref(0);
 const uploadStrategy = ref<'reject' | 'reuse' | 'replace'>('reject');
@@ -851,11 +884,56 @@ const versions = ref<
     remark?: string | null;
   }>
 >([]);
-const storageCopyVisible = ref(false);
-const storageCopyLoading = ref(false);
-const storageCopyTargetId = ref('');
-const storageCopyFile = ref<ManagedFile | null>(null);
-const storageCopyConfigs = ref<CdnConfig[]>([]);
+const storageDetailsVisible = ref(false);
+const storageDetailsFile = ref<ManagedFile | null>(null);
+const storageSummaries = ref<Record<string, FileReplicaDetail>>({});
+const storageSummaryError = ref(false);
+const uploadResultPage = ref(1), uploadResultsLoading = ref(false), uploadResultsError = ref(false);
+const visibleUploadResults = computed(() => uploadResults.files.slice((uploadResultPage.value - 1) * 20, uploadResultPage.value * 20));
+let uploadResultController: globalThis.AbortController | undefined, uploadResultGeneration = 0;
+let uploadResultTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+
+function storageLocations(file: ManagedFile) {
+  const snapshot = storageSummaries.value[file.id];
+  return snapshot && replicaSnapshotMatches(file, snapshot) ? snapshot.items : null;
+}
+function openStorageDetails(file: ManagedFile): void { storageDetailsFile.value = file; storageDetailsVisible.value = true; }
+function acceptStorageDetails(snapshot: FileReplicaDetail, file: ManagedFile): void {
+  const existing = storageSummaries.value[file.id];
+  if (!shouldAcceptReplicaSnapshot(file, snapshot, existing)) return;
+  storageSummaries.value[file.id] = snapshot;
+  const index = pageResult.items.findIndex(item => item.id === file.id && item.projectId === file.projectId);
+  if (index >= 0 && (pageResult.items[index].currentVersion || 1) <= (file.currentVersion || 1)) pageResult.items[index] = file;
+  const uploadedIndex = uploadResults.files.findIndex(item => item.id === file.id);
+  if (uploadedIndex >= 0 && (uploadResults.files[uploadedIndex].currentVersion || 1) <= (file.currentVersion || 1)) uploadResults.files[uploadedIndex] = file;
+}
+async function fetchStorageSummaries(files: ManagedFile[], signal: globalThis.AbortSignal, current: () => boolean): Promise<void> {
+  if (!files.length) return;
+  const requested = new Map(files.map(file => [file.id, file]));
+  const result = await fileStorageApi.batch([...requested.keys()], { signal, _silent: true });
+  if (!current()) return;
+  for (const item of result.items) {
+    const file = requested.get(item.fileId), existing = storageSummaries.value[item.fileId];
+    if (file && shouldAcceptReplicaSnapshot(file, item, existing)) storageSummaries.value[item.fileId] = item;
+  }
+}
+async function loadUploadResultStorage(): Promise<void> {
+  globalThis.clearTimeout(uploadResultTimer); uploadResultController?.abort();
+  const controller = new globalThis.AbortController(), generation = ++uploadResultGeneration;
+  uploadResultController = controller;
+  const files = visibleUploadResults.value;
+  if (!files.length || mountController.signal.aborted) return;
+  const current = () => generation === uploadResultGeneration && !controller.signal.aborted && !mountController.signal.aborted;
+  uploadResultsLoading.value = true;
+  try { await fetchStorageSummaries(files, controller.signal, current); if (current()) uploadResultsError.value = false; }
+  catch { if (current()) uploadResultsError.value = true; }
+  finally {
+    if (current()) {
+      uploadResultsLoading.value = false;
+      if (uploadResultsError.value || files.some(file => hasPendingReplicas(storageLocations(file) || []))) uploadResultTimer = globalThis.setTimeout(() => { void loadUploadResultStorage(); }, 3000);
+    }
+  }
+}
 const editDialogVisible = ref(false);
 const editingFile = ref<ManagedFile | null>(null);
 const moveFile = ref<ManagedFile | null>(null);
@@ -1011,9 +1089,12 @@ function canManageFile(file: ManagedFile): boolean {
 }
 
 async function loadProjects(): Promise<void> {
-  projects.value = await projectApi.list();
-  syncSelectedProjectFromRoute();
-  await reload();
+  try {
+    const result = await projectApi.list(undefined, { signal: mountController.signal });
+    if (mountController.signal.aborted) return;
+    projects.value = result;
+    syncSelectedProjectFromRoute();
+  } catch { /* HTTP errors are already surfaced; canceled navigation is silent. */ }
 }
 
 function syncSelectedProjectFromRoute(): void {
@@ -1041,43 +1122,55 @@ async function reloadFirstPage(): Promise<void> {
 
 async function handleProjectFilterChange(): Promise<void> {
   filters.folderPath = '';
-  await reloadFirstPage();
+  pageResult.page = 1;
+  const query = { ...route.query, projectId: selectedProjectId.value || undefined };
+  if (readRouteProjectId() !== selectedProjectId.value) await router.push({ path: route.path, query });
+  else await reload();
 }
 
 async function reload(): Promise<void> {
   selectedRows.value = [];
   filters.status = isRecycleBin.value ? 'RECYCLED' : 'ACTIVE';
-  void router.replace({
-    path: route.path,
-    query: selectedProjectId.value ? { projectId: selectedProjectId.value } : {},
-  });
+  readController?.abort();
+  const controller = new globalThis.AbortController();
+  readController = controller;
+  const generation = ++readGeneration;
+  const projectId = selectedProjectId.value;
+  const params = buildListParams(projectId || undefined, pageResult.page, pageResult.pageSize);
+  const options = { signal: controller.signal };
+  const current = () => generation === readGeneration && projectId === selectedProjectId.value && !controller.signal.aborted;
   loading.value = true;
+  // Each panel commits independently. Slow directory services never hold up files.
+  if (projectId && !isRecycleBin.value) {
+    foldersLoading.value = true;
+    void fileApi.listFolders(projectId, options).then(result => {
+      if (current()) folders.value = result;
+    }).catch(() => {});
+    void fileApi.listFolderTree(projectId, options).then(result => {
+      if (current()) folderTree.value = result;
+    }).catch(() => {}).finally(() => { if (current()) foldersLoading.value = false; });
+    void folderPublicApi.list(projectId, options).then(result => {
+      if (current()) folderPublicPaths.value = new Set(result.filter(item => item.isPublic).map(item => item.folderPath || ''));
+    }).catch(() => {});
+  } else {
+    folders.value = [];
+    folderTree.value = [];
+    folderPublicPaths.value = new Set();
+    foldersLoading.value = false;
+  }
   try {
-    const [result, folderResult, treeResult, publicPolicies] = await Promise.all([
-      loadVisibleFiles(),
-      selectedProjectId.value && !isRecycleBin.value
-        ? fileApi.listFolders(selectedProjectId.value)
-        : Promise.resolve([]),
-      selectedProjectId.value && !isRecycleBin.value
-        ? fileApi.listFolderTree(selectedProjectId.value)
-        : Promise.resolve([]),
-      selectedProjectId.value && !isRecycleBin.value
-        ? folderPublicApi.list(selectedProjectId.value).catch(() => [])
-        : Promise.resolve([]),
-    ]);
+    const result = await fileApi.list(params, options);
+    if (!current()) return;
     pageResult.items = result.items;
     pageResult.total = result.total;
     pageResult.page = result.page;
     pageResult.pageSize = result.pageSize;
-    folders.value = folderResult;
-    folderTree.value = treeResult as Array<{ name: string; path: string; fileCount: number; children: unknown[] }>;
-    folderPublicPaths.value = new Set(
-      (publicPolicies as Array<{ folderPath: string; isPublic: boolean }>)
-        .filter((item) => item.isPublic)
-        .map((item) => item.folderPath || ''),
-    );
+    storageSummaryError.value = false;
+    void fetchStorageSummaries(result.items, controller.signal, current).catch(() => { if (current()) storageSummaryError.value = true; });
+  } catch {
+    // Consume rejected reads so Vue event handlers do not produce page errors.
   } finally {
-    loading.value = false;
+    if (current()) loading.value = false;
   }
 }
 
@@ -1183,12 +1276,8 @@ function copyPublicUrl(file: ManagedFile): void {
   // Stable fileId-based path. Domain policy is enforced by the public endpoint:
   // public files are open; non-public files only from authorized domains / signed links.
   const url = file.accessUrl || file.publicUrl || `${base}/api/public/files/${file.id}`;
-  void copyText(String(url));
+  void copyText(new URL(String(url), base).toString());
   ElMessage.success(file.isPublic ? '公开直链已复制（任意域名可访问）。' : '直链已复制（授权域名可访问；未公开）。');
-}
-
-async function loadVisibleFiles(): Promise<PageResult<ManagedFile>> {
-  return fileApi.list(buildListParams(selectedProjectId.value || undefined, pageResult.page, pageResult.pageSize));
 }
 
 function buildListParams(projectId: string | undefined, page: number, pageSize: number): FileListParams {
@@ -1201,7 +1290,7 @@ function buildListParams(projectId: string | undefined, page: number, pageSize: 
   // always send folderPath — empty string means root-only (folderPath IS NULL on the API).
   // When no project is selected, omit folderPath so the list is unfiltered across projects.
   const folderPath =
-    selectedProjectId.value && !isRecycleBin.value
+    projectId && !isRecycleBin.value
       ? filters.folderPath
       : filters.folderPath || undefined;
 
@@ -1335,6 +1424,12 @@ function triggerReplaceUpload(): void {
 }
 
 async function searchReplaceTargets(keyword: string): Promise<void> {
+  targetController?.abort();
+  const controller = new globalThis.AbortController();
+  targetController = controller;
+  const generation = ++targetGeneration;
+  const projectId = selectedProjectId.value;
+  const current = () => generation === targetGeneration && projectId === selectedProjectId.value && !controller.signal.aborted;
   if (!selectedProjectId.value || !canManageSelectedProject.value) {
     replaceTargetOptions.value = [];
     return;
@@ -1342,15 +1437,17 @@ async function searchReplaceTargets(keyword: string): Promise<void> {
   replaceTargetLoading.value = true;
   try {
     const result = await fileApi.list({
-      projectId: selectedProjectId.value,
+      projectId,
       keyword: keyword?.trim() || undefined,
       status: 'ACTIVE',
       page: 1,
       pageSize: 30,
-    });
-    replaceTargetOptions.value = result.items;
+    }, { signal: controller.signal });
+    if (current()) replaceTargetOptions.value = result.items;
+  } catch {
+    // Navigation cancels remote target searches.
   } finally {
-    replaceTargetLoading.value = false;
+    if (current()) replaceTargetLoading.value = false;
   }
 }
 
@@ -1385,16 +1482,8 @@ async function handleFileCommand(command: string, file: ManagedFile): Promise<vo
 async function openVersionsDialog(file: ManagedFile): Promise<void> {
   versionsFile.value = file;
   versionsDialogVisible.value = true;
-  versionsLoading.value = true;
   versions.value = [];
-  try {
-    versions.value = await fileApi.listVersions(file.id);
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '加载版本历史失败。');
-    versionsDialogVisible.value = false;
-  } finally {
-    versionsLoading.value = false;
-  }
+  await readDialog('versions', signal => fileApi.listVersions(file.id, { signal }), result => { versions.value = result; }, versionsLoading);
 }
 
 async function restoreFileVersion(version: number): Promise<void> {
@@ -1402,6 +1491,7 @@ async function restoreFileVersion(version: number): Promise<void> {
     return;
   }
   const file = versionsFile.value;
+  const current = captureProjectContext();
   try {
     await ElMessageBox.confirm(
       `确认将「${file.originalName}」恢复到版本 v${version}？当前内容会先归档为新历史版本。`,
@@ -1411,17 +1501,19 @@ async function restoreFileVersion(version: number): Promise<void> {
   } catch {
     return;
   }
+  if (!current()) return;
 
   restoringVersion.value = version;
   try {
     await fileApi.restoreVersion(file.id, version);
+    if (!current()) return;
     ElMessage.success(`已恢复到版本 v${version}。`);
     versionsDialogVisible.value = false;
     await reload();
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '恢复版本失败。');
+    if (current()) ElMessage.error(error instanceof Error ? error.message : '恢复版本失败。');
   } finally {
-    restoringVersion.value = null;
+    if (current()) restoringVersion.value = null;
   }
 }
 
@@ -1432,11 +1524,12 @@ async function uploadFiles(
     targetFileId?: string;
   },
 ): Promise<void> {
-  if (!selectedProjectId.value || !canManageSelectedProject.value || files.length === 0) {
+  if (uploading.value || !selectedProjectId.value || !canManageSelectedProject.value || files.length === 0) {
     return;
   }
 
   const projectId = selectedProjectId.value;
+  const folderPath = filters.folderPath;
   const duplicateStrategy = override?.duplicateStrategy || uploadStrategy.value;
   const targetFileId = override?.targetFileId || replaceTargetFileId.value || undefined;
 
@@ -1453,6 +1546,17 @@ async function uploadFiles(
   let doneCount = 0;
 
   uploading.value = true;
+  uploadQueueState.projectId = projectId;
+  uploadQueueState.projectName = selectedProject.value?.name || projectId;
+  uploadQueueState.paused = false;
+  uploadQueueState.canceled = false;
+  uploadQueueState.error = '';
+  uploadResults.projectId = projectId;
+  uploadResults.projectName = uploadQueueState.projectName;
+  uploadResults.files = [];
+  uploadResults.startedAt = new Date().toISOString();
+  uploadResults.finishedAt = '';
+  uploadResultPage.value = 1;
   uploadProgress.value = 0;
   let reusedCount = 0;
   // Overwrite always renames to the uploaded file's name (single-file only).
@@ -1464,15 +1568,16 @@ async function uploadFiles(
         const relativePath = (file as globalThis.File & { webkitRelativePath?: string }).webkitRelativePath;
         formData.append('files', file, relativePath || file.name);
       });
-      const uploaded = await fileApi.upload(projectId, formData, {
-        folderPath: filters.folderPath,
+      const uploaded = await runQueuedUpload(() => fileApi.upload(projectId, formData, {
+        folderPath,
         duplicateStrategy,
         targetFileId,
         onUploadProgress: (progress) => {
           uploadProgress.value = Math.round(((doneCount + (progress / 100) * smallFiles.length) / totalCount) * 100);
         },
-      });
+      }));
       if (Array.isArray(uploaded)) {
+        retainUploadedFiles(uploaded);
         reusedCount += uploaded.filter((item) => item.duplicateReused).length;
         if (targetFileId && uploaded[0]?.originalName) {
           overwriteNewName = String(uploaded[0].originalName);
@@ -1483,17 +1588,23 @@ async function uploadFiles(
     }
 
     for (const file of largeFiles) {
-      const uploaded = await uploadCredentialApi.uploadDirectOrResumable(projectId, file, {
-        folderPath: filters.folderPath,
+      const uploaded = await runQueuedUpload(() => uploadCredentialApi.uploadDirectOrResumable(projectId, file, {
+        folderPath,
         duplicateStrategy,
         targetFileId,
+        beforeTransfer: waitForUploadQueue,
+        onAuthExpired: async () => {
+          pauseUploadQueue('登录已过期，请登录后返回文件管理并继续上传。文件仍保留在当前浏览器会话中。');
+          await waitForUploadQueue();
+        },
         onProgress: (progress) => {
           uploadProgress.value = Math.round(((doneCount + progress / 100) / totalCount) * 100);
         },
-      });
+      }));
       if (uploaded?.duplicateReused) {
         reusedCount += 1;
       }
+      if (uploaded?.id) retainUploadedFiles([uploaded]);
       if (targetFileId && uploaded && typeof uploaded === 'object' && 'originalName' in uploaded && uploaded.originalName) {
         overwriteNewName = String(uploaded.originalName);
       }
@@ -1501,6 +1612,7 @@ async function uploadFiles(
       uploadProgress.value = Math.round((doneCount / totalCount) * 100);
     }
 
+    await waitForUploadQueue();
     if (reusedCount > 0 && duplicateStrategy === 'reuse') {
       ElMessage.success(
         reusedCount === totalCount
@@ -1520,32 +1632,28 @@ async function uploadFiles(
         ElMessage.success('文件上传完成。');
       }
     }
-    resetUploadVisibilityFilters();
-    await reloadFirstPage();
+  } catch (error) {
+    if ((error as { code?: string }).code !== 'ERR_CANCELED') throw error;
   } finally {
     uploading.value = false;
+    uploadQueueState.paused = false;
+    uploadResults.finishedAt = new Date().toISOString();
   }
 }
 
-async function openStorageCopy(file: ManagedFile): Promise<void> {
-  if (!canManageFile(file)) return;
-  storageCopyFile.value = file;
-  storageCopyTargetId.value = '';
-  storageCopyConfigs.value = await cdnApi.list(file.projectId);
-  storageCopyVisible.value = true;
-}
-
-async function submitStorageCopy(): Promise<void> {
-  const file = storageCopyFile.value;
-  if (!file || !storageCopyTargetId.value) return;
-  storageCopyLoading.value = true;
-  try {
-    await fileApi.copyToStorage(file.id, storageCopyTargetId.value);
-    ElMessage.success('文件已复制到目标存储，源存储中的对象已保留。');
-    storageCopyVisible.value = false;
-    await reload();
-  } finally {
-    storageCopyLoading.value = false;
+async function runQueuedUpload<T>(transfer: () => Promise<T>): Promise<T> {
+  for (;;) {
+    await waitForUploadQueue();
+    try {
+      return await transfer();
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ERR_CANCELED') throw error;
+      const status = (error as { response?: { status?: number } }).response?.status;
+      pauseUploadQueue(status === 401
+        ? '登录已过期，请登录后返回文件管理并继续上传。文件仍保留在当前浏览器会话中。'
+        : '上传未完成，文件已保留。请检查连接后继续上传，或取消本次上传。');
+      await waitForUploadQueue();
+    }
   }
 }
 
@@ -1553,6 +1661,8 @@ async function createFolder(): Promise<void> {
   if (!selectedProjectId.value || !canManageSelectedProject.value) {
     return;
   }
+  const current = captureProjectContext();
+  const projectId = selectedProjectId.value;
 
   const { value } = await ElMessageBox.prompt('请输入目录路径（可包含多级，如 contracts/2026）', '新建文件夹', {
     confirmButtonText: '创建',
@@ -1560,6 +1670,7 @@ async function createFolder(): Promise<void> {
     inputPattern: /^[^\\:*?"<>|]+$/,
     inputErrorMessage: '目录名不能包含 \\ : * ? " < > |',
   });
+  if (!current()) return;
 
   const folderPath = String(value ?? '').trim().replace(/^\/+|\/+$/g, '');
   if (!folderPath) {
@@ -1567,43 +1678,11 @@ async function createFolder(): Promise<void> {
     return;
   }
 
-  await fileApi.createFolder(selectedProjectId.value, folderPath);
+  await fileApi.createFolder(projectId, folderPath);
+  if (!current()) return;
   ElMessage.success('目录已创建。');
   await reload();
 }
-async function migrateLocalFiles(): Promise<void> {
-  if (!selectedProjectId.value || !canManageSelectedProject.value) {
-    return;
-  }
-
-  await ElMessageBox.confirm(
-    '会把当前项目仍在本地存储的文件上传到当前启用的云存储，并把文件记录切换到新存储。本地原文件会保留。',
-    '迁移本地文件',
-    {
-      type: 'warning',
-      confirmButtonText: '开始迁移',
-      cancelButtonText: '取消',
-    },
-  );
-
-  migratingLocalFiles.value = true;
-  try {
-    const result = await fileApi.migrateLocalFiles(selectedProjectId.value);
-    const message = `扫描 ${result.scanned} 个本地文件，成功 ${result.migrated} 个，失败 ${result.failed} 个。`;
-    if (result.failed > 0) {
-      ElMessage.warning(message);
-    } else if (result.migrated > 0) {
-      ElMessage.success(message);
-    } else {
-      ElMessage.info('当前项目没有需要迁移的本地文件。');
-    }
-    filters.cdnProvider = '';
-    await reloadFirstPage();
-  } finally {
-    migratingLocalFiles.value = false;
-  }
-}
-
 function openPreview(file: ManagedFile): void {
   destroyHlsPlayer();
   previewFile.value = file;
@@ -1760,6 +1839,7 @@ function openBatchCopyDialog(): void {
 }
 
 async function submitMoveOrCopy(): Promise<void> {
+  const current = captureProjectContext();
   if (moveBatch.value && !canManageSelectedRows.value) {
     return;
   }
@@ -1773,6 +1853,7 @@ async function submitMoveOrCopy(): Promise<void> {
     if (moveBatch.value) {
       if (moveMode.value === 'move') {
         await fileApi.batchMove(selectedRows.value.map((file) => file.id), moveForm.folderPath || null);
+        if (!current()) return;
         ElMessage.success('文件已移动。');
       } else {
         const result = await fileApi.batchCopy(
@@ -1780,6 +1861,7 @@ async function submitMoveOrCopy(): Promise<void> {
           moveForm.folderPath || null,
           moveForm.projectId || undefined,
         );
+        if (!current()) return;
         if (result.failed > 0) {
           ElMessage.warning(`复制成功 ${result.copied} 个，失败 ${result.failed} 个。`);
         } else {
@@ -1789,12 +1871,14 @@ async function submitMoveOrCopy(): Promise<void> {
     } else if (moveFile.value) {
       if (moveMode.value === 'move') {
         await fileApi.move(moveFile.value.id, { folderPath: moveForm.folderPath || null });
+        if (!current()) return;
         ElMessage.success('文件已移动。');
       } else {
         await fileApi.copy(moveFile.value.id, {
           projectId: moveForm.projectId || moveFile.value.projectId,
           folderPath: moveForm.folderPath || null,
         });
+        if (!current()) return;
         ElMessage.success('文件已复制。');
       }
     }
@@ -1802,7 +1886,7 @@ async function submitMoveOrCopy(): Promise<void> {
     moveDialogVisible.value = false;
     await reload();
   } finally {
-    moving.value = false;
+    if (current()) moving.value = false;
   }
 }
 
@@ -1810,6 +1894,7 @@ async function submitEdit(): Promise<void> {
   if (!editingFile.value) {
     return;
   }
+  const current = captureProjectContext();
 
   editing.value = true;
   try {
@@ -1820,11 +1905,12 @@ async function submitEdit(): Promise<void> {
       remark: editForm.remark,
       isPublic: editForm.isPublic,
     });
+    if (!current()) return;
     editDialogVisible.value = false;
     ElMessage.success('文件信息已更新。');
     await reload();
   } finally {
-    editing.value = false;
+    if (current()) editing.value = false;
   }
 }
 
@@ -1843,7 +1929,8 @@ async function openShareDialog(file: ManagedFile): Promise<void> {
 }
 
 async function loadShares(fileId: string): Promise<void> {
-  shareLinks.value = await fileApi.listShares(fileId);
+  shareLinks.value = [];
+  await readDialog('shares', signal => fileApi.listShares(fileId, { signal }), result => { shareLinks.value = result; });
 }
 
 function resetShareForm(): void {
@@ -1908,11 +1995,13 @@ async function createShare(): Promise<void> {
   if (!validateShareForm(false)) {
     return;
   }
+  const current = captureProjectContext();
+  const fileId = shareFile.value.id;
 
   sharing.value = true;
   try {
     const copyTarget = shareForm.copyTarget;
-    const share = await fileApi.createShare(shareFile.value.id, {
+    const share = await fileApi.createShare(fileId, {
       password: shareForm.requiresPassword ? shareForm.password : undefined,
       expiresAt: shareForm.expiresAt,
       maxDownloads: shareForm.limitDownloads ? shareForm.maxDownloads : undefined,
@@ -1921,11 +2010,13 @@ async function createShare(): Promise<void> {
       customPath: shareForm.customPath.trim() || undefined,
       allowedIps: parseAllowedIps(shareForm.allowedIpsText),
     });
+    if (!current()) return;
     resetShareForm();
-    await loadShares(shareFile.value.id);
+    await loadShares(fileId);
+    if (!current()) return;
     await copyText(copyTarget === 'download' ? share.downloadUrl : share.url);
   } finally {
-    sharing.value = false;
+    if (current()) sharing.value = false;
   }
 }
 
@@ -1937,6 +2028,8 @@ async function updateShare(): Promise<void> {
   if (!validateShareForm(true)) {
     return;
   }
+  const current = captureProjectContext();
+  const fileId = shareFile.value.id;
 
   sharing.value = true;
   try {
@@ -1951,11 +2044,12 @@ async function updateShare(): Promise<void> {
       customPath: shareForm.customPath.trim(),
       allowedIps: parseAllowedIps(shareForm.allowedIpsText),
     });
+    if (!current()) return;
     resetShareForm();
     ElMessage.success('分享链接已更新。');
-    await loadShares(shareFile.value.id);
+    await loadShares(fileId);
   } finally {
-    sharing.value = false;
+    if (current()) sharing.value = false;
   }
 }
 
@@ -1999,10 +2093,13 @@ async function disableShare(shareId: string): Promise<void> {
   if (!shareFile.value) {
     return;
   }
+  const current = captureProjectContext();
+  const fileId = shareFile.value.id;
 
   await fileApi.disableShare(shareId);
+  if (!current()) return;
   ElMessage.success('分享链接已停用。');
-  await loadShares(shareFile.value.id);
+  await loadShares(fileId);
 }
 
 async function download(file: ManagedFile): Promise<void> {
@@ -2111,6 +2208,8 @@ async function batchPurge(): Promise<void> {
   await reloadFirstPage();
 }
 
+watch(() => uploadResults.files.map(file => `${file.id}:${file.currentVersion || 1}`).join('|'), () => { void loadUploadResultStorage(); }, { immediate: true });
+
 watch(uploadStrategy, (value) => {
   if (value !== 'replace') {
     replaceTargetFileId.value = '';
@@ -2121,17 +2220,70 @@ watch(uploadStrategy, (value) => {
   }
 });
 
-watch(selectedProjectId, () => {
-  replaceTargetFileId.value = '';
-  replaceTargetOptions.value = [];
-  if (uploadStrategy.value === 'replace' && selectedProjectId.value) {
-    void searchReplaceTargets('');
+watch(uploading, (active, previous) => {
+  if (previous && !active && !uploadQueueState.canceled && uploadQueueState.projectId === selectedProjectId.value) {
+    resetUploadVisibilityFilters();
+    void reloadFirstPage();
   }
 });
 
+function resetProjectContext(): void {
+  projectContextGeneration++;
+  dialogReads.forEach(controller => controller.abort());
+  dialogReads.clear();
+  readController?.abort();
+  targetController?.abort();
+  readGeneration++;
+  targetGeneration++;
+  selectedRows.value = [];
+  pageResult.items = [];
+  pageResult.total = 0;
+  pageResult.page = 1;
+  filters.folderPath = '';
+  folders.value = [];
+  folderTree.value = [];
+  folderPublicPaths.value = new Set();
+  previewVisible.value = false;
+  previewFile.value = null;
+  destroyHlsPlayer();
+  versionsDialogVisible.value = false;
+  versionsFile.value = null;
+  versions.value = [];
+  versionsLoading.value = false;
+  storageDetailsVisible.value = false;
+  storageDetailsFile.value = null;
+  storageSummaryError.value = false;
+  editDialogVisible.value = false;
+  editingFile.value = null;
+  moveDialogVisible.value = false;
+  moveFile.value = null;
+  shareDialogVisible.value = false;
+  shareFile.value = null;
+  shareLinks.value = [];
+  pendingReplaceFileId.value = '';
+  replaceTargetFileId.value = '';
+  replaceTargetOptions.value = [];
+  replaceTargetLoading.value = false;
+  editing.value = false;
+  sharing.value = false;
+  moving.value = false;
+  restoringVersion.value = null;
+  ElMessageBox.close();
+}
+
+watch(selectedProjectId, () => {
+  resetProjectContext();
+  if (uploadStrategy.value === 'replace' && selectedProjectId.value) {
+    void searchReplaceTargets('');
+  }
+}, { flush: 'sync' });
+
 watch(
-  () => route.name,
+  () => [route.name, route.query.projectId],
   async () => {
+    const id = readRouteProjectId();
+    if (selectedProjectId.value !== id) selectedProjectId.value = id;
+    else resetProjectContext();
     filters.status = isRecycleBin.value
       ? 'RECYCLED'
       : 'ACTIVE';
@@ -2140,28 +2292,9 @@ watch(
   },
 );
 
-watch(
-  () => route.query.projectId,
-  async () => {
-    const routeProjectId = readRouteProjectId();
-
-    if (routeProjectId && routeProjectId !== selectedProjectId.value) {
-      selectedProjectId.value = routeProjectId;
-      pageResult.page = 1;
-      await reload();
-      return;
-    }
-
-    if (!routeProjectId && selectedProjectId.value) {
-      selectedProjectId.value = '';
-      pageResult.page = 1;
-      await reload();
-    }
-  },
-);
-
 onMounted(async () => {
-  await loadProjects();
+  void loadProjects();
+  void reload();
   try {
     const settings = await settingsApi.list();
     officePreviewBaseUrl.value =
@@ -2172,11 +2305,25 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  uploadResultGeneration++;
+  uploadResultController?.abort();
+  globalThis.clearTimeout(uploadResultTimer);
+  projectContextGeneration++;
+  dialogReads.forEach(controller => controller.abort());
+  dialogReads.clear();
+  mountController.abort();
+  readController?.abort();
+  targetController?.abort();
+  readGeneration++;
+  targetGeneration++;
   destroyHlsPlayer();
 });
 </script>
 
 <style scoped>
+.upload-results { margin: 18px 0; padding: 16px; background: var(--el-fill-color-light); border: 1px solid var(--el-border-color-lighter); border-radius: 12px; }
+.upload-results > p { font-size: 12px; line-height: 1.7; }
+.upload-results .el-pagination { margin-top: 12px; }
 .hidden-input {
   display: none;
 }

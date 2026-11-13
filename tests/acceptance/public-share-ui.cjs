@@ -1,0 +1,35 @@
+/* Run after browser.cjs. Creates one unlimited share on its retained project. */
+const fs=require('node:fs');
+const path=require('node:path');
+const assert=require('node:assert/strict');
+const crypto=require('node:crypto');
+const root=path.resolve(__dirname,'../..');
+const latest=JSON.parse(fs.readFileSync(path.join(root,'.runtime/acceptance-20261113/primary/latest.json'),'utf8'));
+const results=JSON.parse(fs.readFileSync(latest.results,'utf8'));
+const project=results.projects[0];
+const original=results.checks.find(c=>c.name==='网页小文件上传及列表显示').evidence;
+const renamed=results.checks.find(c=>c.name==='网页编辑名称并按新名称搜索').evidence;
+const env=Object.fromEntries(fs.readFileSync(path.join(root,'.env'),'utf8').split(/\r?\n/).filter(s=>/^\w+=/.test(s)).map(s=>{const n=s.indexOf('=');return [s.slice(0,n),s.slice(n+1).replace(/^['"]|['"]$/g,'')];}));
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE || 'C:/Users/shifuf/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const out=path.dirname(latest.results);
+(async()=>{
+ const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+ const admin=await browser.newContext({permissions:['clipboard-read','clipboard-write']});
+ const login=await admin.request.post(results.base+'/api/auth/login',{data:{username:process.env.ACCEPTANCE_USERNAME || env.ADMIN_USERNAME,password:process.env.ACCEPTANCE_PASSWORD || env.ADMIN_PASSWORD}});assert.ok(login.ok());const user=(await login.json()).user;
+ await admin.addInitScript(u=>localStorage.setItem('ufm_user_profile',JSON.stringify(u)),user);
+ const page=await admin.newPage();await page.goto(project.url);
+ const row=page.locator('.el-table__body tr').filter({hasText:renamed.newName});await row.waitFor();await row.getByRole('button',{name:'分享',exact:true}).click();
+ const dialog=page.getByRole('dialog',{name:'创建分享'});await dialog.waitFor();
+ const pending=page.waitForResponse(r=>r.url().includes('/files/'+original.fileId+'/shares') && r.request().method()==='POST');
+ await dialog.getByRole('button',{name:'创建分享',exact:true}).click();const response=await pending;assert.ok(response.ok());const share=await response.json();
+ const browserUrl=results.base+'/shares/'+share.token;
+ const guest=await browser.newContext({acceptDownloads:true,viewport:{width:1200,height:900}});const publicPage=await guest.newPage();await publicPage.goto(browserUrl);
+ await publicPage.locator('.share-title').filter({hasText:renamed.newName}).waitFor();await publicPage.locator('.text-preview-body').waitFor();
+ await publicPage.screenshot({path:path.join(out,'public-share-ui.png'),fullPage:true});
+ const download=publicPage.waitForEvent('download');await publicPage.getByRole('button',{name:'下载文件',exact:true}).click();const downloaded=await download;const file=path.join(out,'public-share-download.txt');await downloaded.saveAs(file);
+ const sha=crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');assert.equal(sha,original.sha256);
+ const generatedUrlValid=Boolean(share.url && new URL(share.url).origin===new URL(results.base).origin);
+ const report={status:generatedUrlValid?'PASS':'FAIL',checks:3,generatedUrlValid,projectId:project.id,fileId:original.fileId,shareId:share.id,originalUrl:share.url,browserUrl,preview:true,download:{filename:downloaded.suggestedFilename(),sha256:sha},retained:true};
+ fs.writeFileSync(path.join(out,'share-ui-results.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report));
+ await admin.request.post(results.base+'/api/auth/logout',{data:{}});await browser.close(); process.exitCode=generatedUrlValid?0:1;
+})().catch(e=>{console.error(e.message);process.exitCode=1;});

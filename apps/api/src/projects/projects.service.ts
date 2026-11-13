@@ -59,6 +59,7 @@ export class ProjectsService {
         description: dto.description,
         allowedDomains: normalizeDomainAllowlist(dto.allowedDomains) as Prisma.InputJsonValue,
         activeCdnConfigId: defaultStorageConfigId,
+        storageBindings: { create: { configId: defaultStorageConfigId } },
         appId,
         appSecretHash,
         appSecretVault: encryptText(appSecret, cryptoKey),
@@ -76,7 +77,8 @@ export class ProjectsService {
           },
         },
       } as Prisma.ProjectUncheckedCreateInput),
-      include: { activeCdnConfig: true },
+      include: { activeCdnConfig: true,
+        storageBindings: { include: { config: { select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true } } } } },
     });
 
     await this.auditService.write({
@@ -102,12 +104,16 @@ export class ProjectsService {
       },
       include: {
         activeCdnConfig: true,
-        _count: { select: { files: true } },
+        storageBindings: { include: { config: { select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true } } } },
+        _count: { select: { files: { where: { status: FileStatus.ACTIVE, deletedAt: null } } } },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    return projects.map((project) => this.toProjectResponse(project, user));
+    const needsFallback = projects.some(project => !project.storageBindings.some(binding =>
+      binding.config.provider === CdnProvider.LOCAL && binding.config.enabled && binding.config.projectId == null));
+    const fallback = needsFallback ? await this.readLocalStorageFallback() : null;
+    return projects.map((project) => this.toProjectResponse(project, user, fallback));
   }
 
   async get(projectId: string, user: RequestUser): Promise<Record<string, unknown>> {
@@ -116,7 +122,8 @@ export class ProjectsService {
       where: { id: projectId, deletedAt: null },
       include: {
         activeCdnConfig: true,
-        _count: { select: { files: true } },
+        storageBindings: { include: { config: { select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true } } } },
+        _count: { select: { files: { where: { status: FileStatus.ACTIVE, deletedAt: null } } } },
       },
     });
 
@@ -124,7 +131,9 @@ export class ProjectsService {
       throw new NotFoundException('项目不存在。');
     }
 
-    return this.toProjectResponse(project, user);
+    const fallback = project.storageBindings.some(binding => binding.config.provider === CdnProvider.LOCAL && binding.config.enabled && binding.config.projectId == null)
+      ? null : await this.readLocalStorageFallback();
+    return this.toProjectResponse(project, user, fallback);
   }
 
   /**
@@ -220,7 +229,8 @@ export class ProjectsService {
       data,
       include: {
         activeCdnConfig: true,
-        _count: { select: { files: true } },
+        storageBindings: { include: { config: { select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true } } } },
+        _count: { select: { files: { where: { status: FileStatus.ACTIVE, deletedAt: null } } } },
       },
     });
 
@@ -235,7 +245,9 @@ export class ProjectsService {
       } as Prisma.InputJsonObject,
     });
 
-    return this.toProjectResponse(project, user);
+    const fallback = project.storageBindings.some(binding => binding.config.provider === CdnProvider.LOCAL && binding.config.enabled && binding.config.projectId == null)
+      ? null : await this.readLocalStorageFallback();
+    return this.toProjectResponse(project, user, fallback);
   }
 
   async remove(projectId: string, user: RequestUser): Promise<{ success: boolean }> {
@@ -678,9 +690,15 @@ export class ProjectsService {
     createdAt: Date;
     updatedAt: Date;
     activeCdnConfig?: { provider: CdnProvider; name: string } | null;
+    storageBindings?: Array<{ config: { id: string; name: string; provider: CdnProvider; enabled: boolean; priority: number; projectId?: string | null } }>;
     _count?: { files: number };
-  }, user?: RequestUser): Record<string, unknown> {
+  }, user?: RequestUser, localFallback?: { id: string; name: string; provider: CdnProvider; enabled: boolean; priority: number } | null): Record<string, unknown> {
     const canManage = user?.role === UserRole.SUPER_ADMIN;
+    const storages = (project.storageBindings ?? []).map(binding => binding.config);
+    if (localFallback && !storages.some(config => config.provider === CdnProvider.LOCAL && config.enabled && config.projectId == null)
+      && !storages.some(config => config.id === localFallback.id)) storages.push(localFallback);
+    storages.sort((a, b) => Number(a.provider === CdnProvider.LOCAL) - Number(b.provider === CdnProvider.LOCAL)
+      || a.priority - b.priority || a.id.localeCompare(b.id));
 
     return {
       id: project.id,
@@ -698,11 +716,20 @@ export class ProjectsService {
       webdavUsername: project.webdavUsername ?? null,
       activeCdnProvider: project.activeCdnConfig?.provider ?? null,
       activeCdnName: project.activeCdnConfig?.name ?? null,
+      storages: storages.map(config => ({ id: config.id, name: config.name, provider: config.provider, enabled: config.enabled, priority: config.priority })),
       fileCount: project._count?.files ?? 0,
       canManage,
       createdAt: project.createdAt,
       updatedAt: project.updatedAt,
     };
+  }
+
+  private readLocalStorageFallback() {
+    return this.prisma.cdnConfig.findFirst({
+      where: { provider: CdnProvider.LOCAL, projectId: null, enabled: true },
+      orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, name: true, provider: true, enabled: true, priority: true, projectId: true },
+    });
   }
 
   private async ensureDefaultLocalStorageConfig(): Promise<string> {

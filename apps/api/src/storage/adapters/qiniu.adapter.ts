@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { Readable } from 'node:stream';
+import { createReadStream } from 'node:fs';
 
 import { Injectable } from '@nestjs/common';
 import { CdnProvider } from '@prisma/client';
@@ -11,9 +12,10 @@ import type {
   StorageAdapter,
   StorageUsageSnapshot,
   StorageUploadParams,
+  StorageUploadFileParams,
   StoredObject,
 } from '../storage.types';
-import { configText, publicUrlFromDomain, withScheme } from '../storage.util';
+import { configText, encodeKeyPath, publicUrlFromDomain, withScheme } from '../storage.util';
 
 const QINIU_API_HOST = 'https://api.qiniu.com';
 const QINIU_UPLOAD_HOST = 'https://upload.qiniup.com';
@@ -48,6 +50,22 @@ export class QiniuAdapter implements StorageAdapter {
     return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
   }
 
+  async uploadFile(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject> {
+    const uploadToken = new qiniu.rs.PutPolicy({ scope: `${configText(config, 'bucket')}:${params.key}` }).uploadToken(this.mac(config));
+    const body = createReadStream(params.path);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        void new qiniu.form_up.FormUploader().putStream(uploadToken, params.key, body, new qiniu.form_up.PutExtra(),
+          (error?: Error, _response?: unknown, info?: { statusCode?: number }) => {
+            if (error) reject(error);
+            else if (info?.statusCode && (info.statusCode < 200 || info.statusCode >= 300)) reject(new Error(`七牛流式上传失败：${info.statusCode}`));
+            else resolve();
+          });
+      });
+      return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
+    } finally { body.destroy(); }
+  }
+
   async remove(config: RuntimeCdnConfig, key: string): Promise<void> {
     const manager = new qiniu.rs.BucketManager(this.mac(config));
     const bucket = configText(config, 'bucket');
@@ -66,12 +84,8 @@ export class QiniuAdapter implements StorageAdapter {
   async getDownloadUrl(config: RuntimeCdnConfig, key: string, expiresSeconds: number): Promise<string> {
     const mac = this.mac(config);
     const domain = withScheme(configText(config, 'domain'));
-    const objectUrl = `${domain}/${Buffer.from(key, 'utf8').toString('base64url')}`;
     const deadline = Math.floor(Date.now() / 1000) + Math.max(1, Math.floor(expiresSeconds));
-    const signed = `${objectUrl}?e=${deadline}`;
-    const token = qiniu.util.generateAccessToken(mac, signed);
-
-    return `${signed}&token=${token}`;
+    return new qiniu.rs.BucketManager(mac).privateDownloadUrl(domain, encodeKeyPath(key), deadline);
   }
 
   async objectExists(config: RuntimeCdnConfig, key: string): Promise<boolean> {

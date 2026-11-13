@@ -1,6 +1,51 @@
 /** Console is single super-admin only. */
 export type UserRole = 'SUPER_ADMIN';
 export type CdnProvider = 'LOCAL' | 'QINIU' | 'UPYUN' | 'ALIYUN' | 'S3';
+
+export type StorageReplicaStatus = 'PENDING' | 'SYNCING' | 'READY' | 'FAILED' | 'MISSING' | 'SKIPPED';
+export interface StorageReplica {
+  id: string;
+  configId: string;
+  configName?: string;
+  provider?: CdnProvider;
+  storageKey: string;
+  size: number | string;
+  status: StorageReplicaStatus;
+  attempts: number;
+  lastError?: string | null;
+  verifiedAt?: string | null;
+}
+export interface StorageReplicaSummary {
+  items: StorageReplica[];
+  counts: Partial<Record<StorageReplicaStatus, number>>;
+  nextCursor?: string | null;
+  total?: number;
+  page?: number;
+  pageSize?: number;
+}
+export interface FileStorageLocation {
+  configId: string;
+  configName: string;
+  provider: CdnProvider;
+  enabled: boolean;
+  assigned: boolean;
+  desired: boolean;
+  priority: number;
+  status: StorageReplicaStatus | 'NOT_SYNCED' | 'UNVERIFIED';
+  attempts: number;
+  lastError: string | null;
+  verifiedAt: string | null;
+  replicaId?: string;
+}
+export interface FileReplicaDetail {
+  fileId: string;
+  projectId: string;
+  storageKey: string;
+  currentVersion: number;
+  canManage: boolean;
+  updatedAt: string;
+  items: FileStorageLocation[];
+}
 export type FileCategory = 'IMAGE' | 'DOCUMENT' | 'VIDEO' | 'AUDIO' | 'ARCHIVE' | 'CODE' | 'OTHER';
 export type FileStatus = 'ACTIVE' | 'RECYCLED' | 'DELETED' | 'QUARANTINED';
 export type ScanStatus = 'SKIPPED' | 'PENDING' | 'CLEAN' | 'INFECTED' | 'ERROR';
@@ -105,6 +150,7 @@ export interface UserProfile {
 
 export interface Project {
   id: string;
+  storages?: Array<{ id: string; name: string; provider: CdnProvider; enabled: boolean; priority: number }>;
   name: string;
   description?: string | null;
   appId: string;
@@ -125,6 +171,12 @@ export interface Project {
   updatedAt: string;
 }
 
+export interface StorageProjectBinding {
+  id: string;
+  name: string;
+  current: boolean;
+}
+
 export interface CdnConfig {
   id: string;
   projectId?: string | null;
@@ -133,6 +185,7 @@ export interface CdnConfig {
   config: Record<string, unknown>;
   active: boolean;
   enabled: boolean;
+  projects?: StorageProjectBinding[];
   priority?: number;
   storageQuotaBytes?: string | null;
   manualStorageUsedBytes?: string | null;

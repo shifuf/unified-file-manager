@@ -1,6 +1,6 @@
 {
   "name": "@ufm/api",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "private": true,
   "type": "commonjs",
   "scripts": {
@@ -12,7 +12,7 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:seed": "ts-node prisma/seed.ts",
-    "test": "node --require ts-node/register/transpile-only --test test/*.test.cjs"
+    "test": "node --test ../../tests/regression/*.test.cjs"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.9",

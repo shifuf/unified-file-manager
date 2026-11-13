@@ -26,6 +26,7 @@ jobs:
       - run: npm ci --include=optional --no-audit --fund=false
       - run: npm --workspace apps/api run prisma:generate
       - run: npm run lint
+      - run: npm test
       - run: npm run build
 
   publish:

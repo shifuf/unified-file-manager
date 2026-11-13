@@ -7,8 +7,15 @@ import { S3Adapter } from './adapters/s3.adapter';
 import { UpyunAdapter } from './adapters/upyun.adapter';
 import { StorageAdapterRegistry } from './storage-registry.service';
 import { StorageService } from './storage.service';
+import { ReplicaService } from './replica.service';
+import { ReplicaController } from './replica.controller';
+import { FileReplicaController } from './file-replica.controller';
+import { FileReplicaService } from './file-replica.service';
+import { ReplicaWorker } from './replica.worker';
+import { ProjectAccessService } from '../projects/project-access.service';
 
 @Module({
+  controllers: [ReplicaController, FileReplicaController],
   providers: [
     AliyunOssAdapter,
     LocalStorageAdapter,
@@ -17,7 +24,11 @@ import { StorageService } from './storage.service';
     StorageAdapterRegistry,
     StorageService,
     UpyunAdapter,
+    ReplicaService,
+    FileReplicaService,
+    ReplicaWorker,
+    ProjectAccessService,
   ],
-  exports: [StorageAdapterRegistry, StorageService],
+  exports: [StorageAdapterRegistry, StorageService, ReplicaService],
 })
 export class StorageModule {}

@@ -1,0 +1,28 @@
+const {test}=require('node:test'),assert=require('node:assert/strict'),path=require('node:path');
+require('ts-node').register({project:path.resolve(__dirname,'../../apps/api/tsconfig.json'),transpileOnly:true});
+const {FilesService}=require('../../apps/api/src/files/files.service.ts');
+test('overlapping replacements cannot both claim success for one revision number',async()=>{
+ let head={id:'f',projectId:'p',storageKey:'p/old',checksum:'old',size:3n,status:'ACTIVE',currentVersion:1,cdnConfigId:'local',originalName:'old'};
+ const snapshots=new Map();let arrived=0,release;const gate=new Promise(r=>release=r);
+ const service=Object.create(FilesService.prototype);
+ const update=data=>(head={...head,...data});
+ service.prisma={managedFile:{findFirst:async()=>({...head}),findUnique:async()=>({...head}),update:async({data})=>update(data),updateMany:async({where,data})=>{if(head.storageKey!==where.storageKey||head.currentVersion!==where.currentVersion)return {count:0};update(data);return {count:1};}},fileVersion:{findFirst:async()=>({version:Math.max(0,...snapshots.keys())})}};
+ service.prisma.$transaction=async fn=>fn(service.prisma);
+ service.prisma.fileDerivative={updateMany:async()=>({count:0})};
+ service.snapshotCurrentVersion=async f=>{if(!snapshots.has(f.currentVersion))snapshots.set(f.currentVersion,f.storageKey);};
+ service.storageService={upload:async(_,p)=>{if(++arrived===2)release();await gate;return {storageKey:'p/'+p.originalName,cdnConfigId:'local',publicUrl:null};}};
+ service.auditService={write:async()=>{}};service.eventBus={emit:()=>{}};service.toResponse=x=>x;service.buildStorageKey=(_,name)=>'p/'+name;
+ const call=name=>service.replaceExistingFile({projectId:'p',projectName:'p',targetFileId:'f',buffer:Buffer.from(name),originalName:name,mimeType:'text/plain',size:3,folderPath:null,extension:'txt',category:'DOCUMENT',checksum:name});
+ const results=await Promise.allSettled([call('one'),call('two')]);
+ assert.equal(results.filter(r=>r.status==='fulfilled').length,1,'stale write must be explicitly rejected rather than report success');
+ assert.equal(results.filter(r=>r.status==='rejected'&&r.reason.getStatus()===409).length,1);
+ assert.equal(head.currentVersion,2);
+ assert.equal(snapshots.get(1),'p/old');
+});
+test('committing a changed file version invalidates old READY derivatives in the same transaction',async()=>{
+ const s=Object.create(FilesService.prototype);let derivativeStatus='READY',inTransaction=false;
+ const tx={managedFile:{updateMany:async()=>({count:1}),findUnique:async()=>({id:'f',storageKey:'new',currentVersion:2})},fileDerivative:{updateMany:async({data})=>{assert.equal(inTransaction,true);derivativeStatus=data.status;return {count:1};}}};
+ s.prisma={...tx,$transaction:async fn=>{inTransaction=true;try{return await fn(tx);}finally{inTransaction=false;}}};
+ await s.updateRevisionIfCurrent({id:'f',storageKey:'old',currentVersion:1},{storageKey:'new',currentVersion:2});
+ assert.equal(derivativeStatus,'FAILED');
+});

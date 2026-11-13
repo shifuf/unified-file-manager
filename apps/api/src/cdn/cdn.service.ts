@@ -3,9 +3,9 @@ import { constants } from 'node:fs';
 import { access, mkdir, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
 
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { AuditAction, CdnProvider, UserRole, type CdnConfig, type Prisma } from '@prisma/client';
+import { AuditAction, CdnProvider, Prisma, UserRole, type CdnConfig } from '@prisma/client';
 
 import { AuditService } from '../audit/audit.service';
 import type { RequestUser } from '../common/types/request-user.type';
@@ -18,6 +18,7 @@ import { AliyunOssAdapter } from '../storage/adapters/aliyun-oss.adapter';
 import { QiniuAdapter } from '../storage/adapters/qiniu.adapter';
 import { S3Adapter } from '../storage/adapters/s3.adapter';
 import { UpyunAdapter } from '../storage/adapters/upyun.adapter';
+import { ReplicaService } from '../storage/replica.service';
 import type { RuntimeCdnConfig, StorageAdapter, StorageUsageSnapshot } from '../storage/storage.types';
 import { CreateCdnConfigDto } from './dto/create-cdn-config.dto';
 import { UpdateCdnConfigDto } from './dto/update-cdn-config.dto';
@@ -89,6 +90,7 @@ export class CdnService {
     private readonly qiniuAdapter: QiniuAdapter,
     private readonly s3Adapter: S3Adapter,
     private readonly upyunAdapter: UpyunAdapter,
+    @Optional() private readonly replicaService?: ReplicaService,
   ) {}
 
   async list(user: RequestUser): Promise<Record<string, unknown>[]> {
@@ -96,9 +98,10 @@ export class CdnService {
     const configs = await this.prisma.cdnConfig.findMany({
       where: { enabled: true, projectId: null },
       orderBy: [{ provider: 'asc' }, { createdAt: 'desc' }],
+      include: { projectBindings: { where: { project: { deletedAt: null } }, include: { project: { select: { id: true, name: true, activeCdnConfigId: true } } } } },
     });
 
-    return this.dedupeConfigs(configs).map((config) => this.toResponse(config));
+    return configs.map((config) => this.toResponse(config));
   }
 
   async listForProject(projectId: string, user: RequestUser): Promise<Record<string, unknown>[]> {
@@ -111,14 +114,15 @@ export class CdnService {
       this.prisma.cdnConfig.findMany({
         where: {
           enabled: true,
-          OR: [{ projectId: null }, { projectId }],
+          projectId: null,
+          projectBindings: { some: { projectId } },
         },
         orderBy: [{ provider: 'asc' }, { createdAt: 'desc' }],
       }),
     ]);
 
     const activeConfigId = project?.activeCdnConfigId ?? null;
-    return this.dedupeConfigs(configs, activeConfigId).map((config) => this.toResponse(config, activeConfigId));
+    return configs.map((config) => this.toResponse(config, activeConfigId));
   }
 
   async create(dto: CreateCdnConfigDto, user: RequestUser): Promise<Record<string, unknown>> {
@@ -150,27 +154,10 @@ export class CdnService {
     user: RequestUser,
   ): Promise<Record<string, unknown>> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
-    await this.assertRemoteConfigHostsSafe(dto.provider, dto.config);
-    await this.assertConfigHealthy(dto.provider, dto.name, dto.config, user, projectId);
-    const config = await this.prisma.cdnConfig.create({
-      data: {
-        projectId,
-        provider: dto.provider,
-        name: dto.name,
-        config: this.secureConfig(dto.config),
-        active: false,
-        ...this.storagePolicyData(dto),
-      },
-    });
-
-    await this.auditService.write({
-      action: AuditAction.CDN_CREATE,
-      actorId: user.id,
-      projectId,
-      detail: { provider: dto.provider, name: dto.name, storageConfigId: config.id, scope: 'project' },
-    });
-
-    return this.toResponse(config);
+    const config = await this.create(dto, user);
+    await this.prisma.projectStorageBinding.create({ data: { projectId, configId: String(config.id) } });
+    if (dto.active) return this.selectForProject(projectId, String(config.id), user);
+    return config;
   }
 
   async update(configId: string, dto: UpdateCdnConfigDto, user: RequestUser): Promise<Record<string, unknown>> {
@@ -195,6 +182,7 @@ export class CdnService {
         ...this.storagePolicyData(dto),
       },
     });
+    this.usageCache.delete(configId);
 
     await this.auditService.write({
       action: AuditAction.CDN_UPDATE,
@@ -212,35 +200,8 @@ export class CdnService {
     user: RequestUser,
   ): Promise<Record<string, unknown>> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
-    const existing = await this.findProjectOwnedConfig(configId, projectId);
-    const mergedConfig = dto.config
-      ? this.mergeConfigPreservingSecrets(this.revealConfig(existing.config), dto.config)
-      : undefined;
-
-    if (mergedConfig) {
-      const provider = dto.provider ?? existing.provider;
-      await this.assertRemoteConfigHostsSafe(provider, mergedConfig);
-      await this.assertConfigHealthy(provider, dto.name ?? existing.name, mergedConfig, user, projectId);
-    }
-
-    const config = await this.prisma.cdnConfig.update({
-      where: { id: configId },
-      data: {
-        provider: dto.provider,
-        name: dto.name,
-        config: mergedConfig ? this.secureConfig(mergedConfig) : undefined,
-        ...this.storagePolicyData(dto),
-      },
-    });
-
-    await this.auditService.write({
-      action: AuditAction.CDN_UPDATE,
-      actorId: user.id,
-      projectId,
-      detail: { configId, provider: dto.provider, name: dto.name, scope: 'project' },
-    });
-
-    return this.toResponse(config);
+    await this.findConfigForProject(configId, projectId);
+    return this.update(configId, dto, user);
   }
 
   async selectForProject(
@@ -250,11 +211,15 @@ export class CdnService {
   ): Promise<Record<string, unknown>> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
     const config = await this.findConfigForProject(configId, projectId);
-
-    const project = await this.prisma.project.update({
-      where: { id: projectId },
-      data: { activeCdnConfigId: config.id },
-      include: { activeCdnConfig: true },
+    const project = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
+      const binding = await tx.projectStorageBinding.findUnique({ where: { projectId_configId: { projectId, configId } } });
+      if (!binding) throw new BadRequestException('请先在全局存储页面为此项目分配该存储。');
+      return tx.project.update({
+        where: { id: projectId },
+        data: { activeCdnConfigId: config.id },
+        include: { activeCdnConfig: true },
+      });
     });
 
     await this.auditService.write({
@@ -267,33 +232,35 @@ export class CdnService {
     return this.toResponse(config, project.activeCdnConfigId);
   }
 
+  async listAssignments(configId: string, user: RequestUser) {
+    await this.assertCanManageStorage(user, true);
+    await this.findConfig(configId);
+    const rows = await this.prisma.projectStorageBinding.findMany({
+      where: { configId, project: { deletedAt: null } },
+      include: { project: { select: { id: true, name: true, activeCdnConfigId: true } } },
+      orderBy: { projectId: 'asc' },
+    });
+    return rows.map(({ project }) => ({ id: project.id, name: project.name, current: project.activeCdnConfigId === configId }));
+  }
+
+  async assignProjects(configId: string, projectIds: string[], user: RequestUser) {
+    await this.assertCanManageStorage(user, true);
+    await this.findConfig(configId);
+    const ids = [...new Set(projectIds)];
+    await this.runBindingTransaction(async (tx) => {
+      await this.replaceAssignments(tx, configId, ids);
+      if (this.replicaService) {
+        for (const projectId of ids) await this.replicaService.enqueueProject(projectId, '', tx);
+      }
+    });
+    await this.auditService.write({ action: AuditAction.CDN_UPDATE, actorId: user.id, detail: { configId, projectIds: ids, operation: 'assign-projects' } });
+    return this.listAssignments(configId, user);
+  }
+
   async remove(configId: string, user: RequestUser, force = false): Promise<{ success: boolean }> {
     await this.assertCanManageStorage(user, true);
-    const config = await this.findConfig(configId);
-    const activeProjectCount = await this.prisma.project.count({
-      where: { activeCdnConfigId: configId, deletedAt: null },
-    });
-
-    if (activeProjectCount > 0 && !force) {
-      throw new BadRequestException(
-        `该存储配置仍被 ${activeProjectCount} 个项目使用，请先切换项目存储，或选择“强制删除”自动解绑。`,
-      );
-    }
-
-    await this.assertNotLastLocalConfig(config);
-
-    if (activeProjectCount > 0) {
-      // Detach first: projects fall back to the shared LOCAL config.
-      await this.prisma.project.updateMany({
-        where: { activeCdnConfigId: configId },
-        data: { activeCdnConfigId: null },
-      });
-    }
-
-    await this.prisma.cdnConfig.update({
-      where: { id: configId },
-      data: { enabled: false, active: false },
-    });
+    const activeProjectCount = await this.runBindingTransaction((tx) => this.replaceAssignments(tx, configId, [], true, force));
+    this.usageCache.delete(configId);
 
     await this.auditService.write({
       action: AuditAction.CDN_DELETE,
@@ -304,42 +271,71 @@ export class CdnService {
     return { success: true };
   }
 
+  private async runBindingTransaction<T>(operation: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(operation);
+      } catch (error) {
+        const deadlock = error instanceof Prisma.PrismaClientKnownRequestError
+          && (error.code === 'P2034' || (error.code === 'P2010' && String(error.meta?.code) === '1213'));
+        if (!deadlock || attempt >= 3) throw error;
+      }
+    }
+  }
+
+  private async replaceAssignments(
+    tx: Prisma.TransactionClient,
+    configId: string,
+    ids: string[],
+    removing = false,
+    force = false,
+  ): Promise<number> {
+    // A locking read serializes this config's binding range without opening a
+    // repeatable-read snapshot before waiting for the affected project locks.
+    const current = await tx.$queryRaw<Array<{ projectId: string }>>`
+      SELECT projectId FROM ProjectStorageBinding WHERE configId = ${configId} FOR UPDATE
+    `;
+    const affected = [...new Set([...ids, ...current.map((binding) => binding.projectId)])].sort();
+    for (const id of affected) await tx.$queryRaw`SELECT id FROM Project WHERE id = ${id} FOR UPDATE`;
+    // Selection and failover lock Project before the CdnConfig foreign key.
+    await tx.$queryRaw`SELECT id FROM CdnConfig WHERE id = ${configId} FOR UPDATE`;
+    const config = await tx.cdnConfig.findFirst({ where: { id: configId, enabled: true, projectId: null } });
+    if (!config) throw new NotFoundException('存储配置不存在。');
+    const activeProjectCount = removing
+      ? await tx.project.count({ where: { activeCdnConfigId: configId, deletedAt: null } })
+      : 0;
+    if (activeProjectCount > 0 && !force) {
+      throw new BadRequestException(`该存储配置仍被 ${activeProjectCount} 个项目使用，请先切换项目存储，或选择“强制删除”自动解绑。`);
+    }
+    if (removing) await this.assertNotLastLocalConfig(config, tx);
+    const projects = await tx.project.findMany({ where: { id: { in: ids }, deletedAt: null } });
+    if (projects.length !== ids.length) throw new BadRequestException('包含不存在或已删除的项目。');
+    const removed = current.map((binding) => binding.projectId).filter((id) => !ids.includes(id));
+    for (const projectId of removed) {
+      const project = await tx.project.findUnique({ where: { id: projectId } });
+      if (project?.deletedAt || project?.activeCdnConfigId !== configId) continue;
+      const replacement = await tx.cdnConfig.findFirst({
+        where: { id: { not: configId }, enabled: true, projectId: null, projectBindings: { some: { projectId } } },
+        orderBy: [{ priority: 'asc' }, { id: 'asc' }],
+      });
+      if (!replacement) throw new BadRequestException(`项目“${project.name}”没有其他已分配存储，请先分配后再解绑。`);
+      await tx.project.update({ where: { id: projectId }, data: { activeCdnConfigId: replacement.id } });
+    }
+    await tx.projectStorageBinding.deleteMany({ where: { configId, projectId: { notIn: ids } } });
+    if (ids.length) await tx.projectStorageBinding.createMany({ data: ids.map((projectId) => ({ projectId, configId })), skipDuplicates: true });
+    if (removing) await tx.cdnConfig.update({ where: { id: configId }, data: { enabled: false, active: false } });
+    return activeProjectCount;
+  }
+
   async removeForProject(
     projectId: string,
     configId: string,
     user: RequestUser,
-    force = false,
+    _force = false,
   ): Promise<{ success: boolean }> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
-    await this.findProjectOwnedConfig(configId, projectId);
-    const activeProjectCount = await this.prisma.project.count({
-      where: { id: projectId, activeCdnConfigId: configId, deletedAt: null },
-    });
-
-    if (activeProjectCount > 0 && !force) {
-      throw new BadRequestException('该存储配置正在被当前项目使用，请先切换项目存储，或选择“强制删除”自动解绑。');
-    }
-
-    if (activeProjectCount > 0) {
-      await this.prisma.project.updateMany({
-        where: { id: projectId, activeCdnConfigId: configId },
-        data: { activeCdnConfigId: null },
-      });
-    }
-
-    await this.prisma.cdnConfig.update({
-      where: { id: configId },
-      data: { enabled: false, active: false },
-    });
-
-    await this.auditService.write({
-      action: AuditAction.CDN_DELETE,
-      actorId: user.id,
-      projectId,
-      detail: { configId, scope: 'project', forced: force },
-    });
-
-    return { success: true };
+    await this.findConfigForProject(configId, projectId);
+    throw new BadRequestException('存储配置由多个项目共享，请在全局存储管理中解除项目绑定或删除配置。');
   }
 
   /** Dry-run a configuration that has not been saved yet (create dialog gate). */
@@ -394,7 +390,7 @@ export class CdnService {
     }
 
     const existing = projectId
-      ? await this.findProjectOwnedConfig(configId, projectId)
+      ? await this.findConfigForProject(configId, projectId)
       : await this.findConfig(configId);
     const provider = dto.provider ?? existing.provider;
     const name = dto.name ?? existing.name;
@@ -475,12 +471,12 @@ export class CdnService {
    * connectivity probe (upload + read + delete) has passed.
    */
   /** The shared LOCAL fallback must survive: without it uploads have nowhere to go. */
-  private async assertNotLastLocalConfig(config: CdnConfig): Promise<void> {
+  private async assertNotLastLocalConfig(config: CdnConfig, client: Prisma.TransactionClient = this.prisma): Promise<void> {
     if (config.provider !== CdnProvider.LOCAL) {
       return;
     }
 
-    const remaining = await this.prisma.cdnConfig.count({
+    const remaining = await client.cdnConfig.count({
       where: { enabled: true, provider: CdnProvider.LOCAL, id: { not: config.id } },
     });
 
@@ -534,28 +530,13 @@ export class CdnService {
     return config;
   }
 
-  private async findProjectOwnedConfig(configId: string, projectId: string): Promise<CdnConfig> {
-    const config = await this.prisma.cdnConfig.findFirst({
-      where: {
-        id: configId,
-        projectId,
-        enabled: true,
-      },
-    });
-
-    if (!config) {
-      throw new NotFoundException('项目存储配置不存在。');
-    }
-
-    return config;
-  }
-
   private async findConfigForProject(configId: string, projectId: string): Promise<CdnConfig> {
     const config = await this.prisma.cdnConfig.findFirst({
       where: {
         id: configId,
         enabled: true,
-        OR: [{ projectId: null }, { projectId }],
+        projectId: null,
+        projectBindings: { some: { projectId } },
       },
     });
 
@@ -705,6 +686,7 @@ export class CdnService {
       manualUsageUpdatedAt: Date | null;
       createdAt: Date;
       updatedAt: Date;
+      projectBindings?: Array<{ project: { id: string; name: string; activeCdnConfigId: string | null } }>;
     },
     activeConfigId?: string | null,
   ): Record<string, unknown> {
@@ -726,6 +708,7 @@ export class CdnService {
       manualUsageUpdatedAt: config.manualUsageUpdatedAt,
       createdAt: config.createdAt,
       updatedAt: config.updatedAt,
+      projects: config.projectBindings?.map(({ project }) => ({ id: project.id, name: project.name, current: project.activeCdnConfigId === config.id })) ?? [],
     };
   }
 

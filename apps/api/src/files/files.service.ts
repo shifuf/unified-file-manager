@@ -45,6 +45,8 @@ import { UpdateShareLinkDto } from './dto/update-share-link.dto';
 import { FolderPublicService } from './folder-public.service';
 import { ShareIpAbuseService } from './share-ip-abuse.service';
 import { getAdminAccessRoute } from './share-access-route.util';
+import { parseByteRange } from '../common/utils/http-range.util';
+import { consumeShareDownload, findShareDownloadSession, issueShareDownloadSession, requireVerifiedShareTarget, shareSessionIp } from './share-download-session.util';
 
 type FileWithStorage = ManagedFile & {
   cdnConfig: CdnConfig | null;
@@ -55,6 +57,7 @@ type FileWithStorage = ManagedFile & {
     status: DerivativeStatus;
     publicUrl: string | null;
     storageKey: string;
+    meta?: Prisma.JsonValue;
   }>;
   /** Content-addressed reuse short-circuit marker for upload responses. */
   _duplicateReused?: boolean;
@@ -110,7 +113,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
   });
   /**
    * Share download anti-abuse: more than 5 download hits / IP / 60s → lock ~10 min + notify.
-   * Counts every real download response (including ticket reuse), not previews.
+   * Counts download issuance; resumed requests share the original ticket budget.
    */
   private readonly shareDownloadRateLimiter = new InMemoryAttemptLimiter({
     maxAttempts: 5,
@@ -576,7 +579,6 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       originalName: params.originalName,
     });
 
-    const previousCdnConfig = existing.cdnConfig;
     const previousStorageKey = existing.storageKey;
 
     // Keep identity fields that define stable external links:
@@ -591,9 +593,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
         : uploadedName || existing.originalName;
     const nextFolderPath =
       params.forceRename ? existing.folderPath : params.folderPath ?? existing.folderPath;
-    const updated = await this.prisma.managedFile.update({
-      where: { id: existing.id },
-      data: {
+    const updated = await this.updateRevisionIfCurrent(existing, {
         cdnConfigId: uploadResult.cdnConfigId,
         originalName: nextOriginalName,
         storageKey: uploadResult.storageKey,
@@ -615,27 +615,10 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
         purgeAt: null,
         // Clear stale duplicate pointers after content rewrite.
         duplicateOfId: null,
-        currentVersion: Math.max(1, Number(existing.currentVersion || 1)) + 1,
-      },
-      include: { cdnConfig: true },
+        currentVersion: await this.nextFileRevision(existing.id, existing.currentVersion),
     });
 
-    // Best-effort cleanup of the previous object (skip if key reused).
-    if (
-      previousCdnConfig &&
-      previousStorageKey &&
-      previousStorageKey !== uploadResult.storageKey
-    ) {
-      try {
-        await this.storageService.remove(previousCdnConfig, previousStorageKey);
-      } catch (error) {
-        this.logger.warn(
-          `覆盖上传后清理旧对象失败：fileId=${existing.id} key=${previousStorageKey} reason=${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
+    // Historical versions retain this immutable key for later restoration.
 
     await this.auditService.write({
       action: AuditAction.FILE_UPLOAD,
@@ -1774,21 +1757,19 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       throw new NotFoundException('历史版本不存在。');
     }
 
+    const nextVersion = await this.verifySnapshotAndNextVersion(file, snapshot);
     // Snapshot current HEAD before restoring.
     await this.snapshotCurrentVersion(file, undefined, 'restore-precheck');
 
-    const updated = await this.prisma.managedFile.update({
-      where: { id: fileId },
-      data: {
+    const updated = await this.updateRevisionIfCurrent(file, {
         storageKey: snapshot.storageKey,
         cdnConfigId: snapshot.cdnConfigId,
         size: snapshot.size,
         checksum: snapshot.checksum,
         mimeType: snapshot.mimeType,
         originalName: snapshot.originalName,
-        currentVersion: snapshot.version,
-      },
-      include: { cdnConfig: true },
+        currentVersion: nextVersion,
+        thumbnailUrl: null,
     });
 
     await this.auditService.write({
@@ -2193,21 +2174,19 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       throw new NotFoundException('历史版本不存在。');
     }
 
+    const nextVersion = await this.verifySnapshotAndNextVersion(file, snapshot);
     // Snapshot current HEAD before restoring.
     await this.snapshotCurrentVersion(file, user.id, 'restore-precheck');
 
-    const updated = await this.prisma.managedFile.update({
-      where: { id: fileId },
-      data: {
+    const updated = await this.updateRevisionIfCurrent(file, {
         storageKey: snapshot.storageKey,
         cdnConfigId: snapshot.cdnConfigId,
         size: snapshot.size,
         checksum: snapshot.checksum,
         mimeType: snapshot.mimeType,
         originalName: snapshot.originalName,
-        currentVersion: snapshot.version,
-      },
-      include: { cdnConfig: true },
+        currentVersion: nextVersion,
+        thumbnailUrl: null,
     });
 
     await this.auditService.write({
@@ -2227,6 +2206,47 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     return this.toResponse(updated);
   }
 
+  private async updateRevisionIfCurrent(
+    file: Pick<ManagedFile, 'id' | 'storageKey' | 'currentVersion'>,
+    data: Prisma.ManagedFileUncheckedUpdateManyInput,
+  ): Promise<FileWithStorage> {
+    return this.prisma.$transaction(async tx => {
+      const changed = await tx.managedFile.updateMany({
+        where: { id: file.id, storageKey: file.storageKey, currentVersion: file.currentVersion }, data,
+      });
+      if (changed.count !== 1) throw new ConflictException('文件已被其他操作更新，请刷新后重新执行。');
+      await tx.fileDerivative.updateMany({ where: { fileId: file.id }, data: {
+        status: DerivativeStatus.FAILED, error: '原文件内容版本已改变，等待重新生成。',
+      } });
+      const updated = await tx.managedFile.findUnique({ where: { id: file.id }, include: { cdnConfig: true } });
+      if (!updated) throw new NotFoundException('文件已删除。');
+      return updated;
+    });
+  }
+
+  private async nextFileRevision(fileId: string, currentVersion: number): Promise<number> {
+    const latest = await this.prisma.fileVersion.findFirst({ where: { fileId }, orderBy: { version: 'desc' }, select: { version: true } });
+    return Math.max(1, currentVersion, latest?.version ?? 0) + 1;
+  }
+
+  private async verifySnapshotAndNextVersion(
+    file: FileWithStorage,
+    snapshot: { storageKey: string; cdnConfigId: string | null; size: bigint; checksum: string | null; mimeType: string; originalName: string; version: number },
+  ): Promise<number> {
+    const cdnConfig = snapshot.cdnConfigId
+      ? await this.prisma.cdnConfig.findUnique({ where: { id: snapshot.cdnConfigId } })
+      : null;
+    const target = await this.storageService.getDownloadTarget({ ...file, ...snapshot, id: file.id, cdnConfig });
+    try {
+      if (target.type !== 'stream' || !target.stream || target.verified !== true ||
+          target.contentLength !== Number(snapshot.size) ||
+          (snapshot.checksum && target.checksum !== snapshot.checksum)) {
+        throw new BadRequestException('历史版本内容无法通过完整性校验，当前文件未改变。');
+      }
+    } finally { target.stream?.destroy(); }
+    return this.nextFileRevision(file.id, Math.max(file.currentVersion, snapshot.version));
+  }
+
   async snapshotCurrentVersion(
     file: Pick<
       ManagedFile,
@@ -2244,22 +2264,35 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     remark?: string,
   ): Promise<void> {
     const version = Math.max(1, Number(file.currentVersion || 1));
-    await this.prisma.fileVersion.upsert({
-      where: { fileId_version: { fileId: file.id, version } },
-      create: {
-        fileId: file.id,
-        version,
-        storageKey: file.storageKey,
-        cdnConfigId: file.cdnConfigId,
-        size: file.size,
-        checksum: file.checksum,
-        mimeType: file.mimeType,
-        originalName: file.originalName,
-        createdById: actorId,
-        remark: remark?.slice(0, 256),
-      },
-      update: {},
-    });
+    try {
+      await this.prisma.fileVersion.upsert({
+        where: { fileId_version: { fileId: file.id, version } },
+        create: {
+          fileId: file.id,
+          version,
+          storageKey: file.storageKey,
+          cdnConfigId: file.cdnConfigId,
+          size: file.size,
+          checksum: file.checksum,
+          mimeType: file.mimeType,
+          originalName: file.originalName,
+          createdById: actorId,
+          remark: remark?.slice(0, 256),
+        },
+        update: {},
+      });
+    } catch (error) {
+      if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'P2002') {
+        throw error;
+      }
+      // MySQL can race between the read and insert of Prisma's emulated upsert.
+      const saved = await this.prisma.fileVersion.findUnique({
+        where: { fileId_version: { fileId: file.id, version } },
+      });
+      if (!saved || saved.storageKey !== file.storageKey || saved.size !== file.size || saved.checksum !== file.checksum) {
+        throw new ConflictException('历史版本已被其他请求修改，请刷新后重试。');
+      }
+    }
     await this.auditService.write({
       action: AuditAction.FILE_VERSION_CREATE,
       actorId,
@@ -2729,27 +2762,49 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     meta: {
       countDownload?: boolean;
       ip?: string;
-      skipPassword?: boolean;
-      /** When true, do not consume IP rate-limit budget (e.g. ticket path already limited at session issue). */
-      skipRateLimit?: boolean;
+      head?: boolean;
+      rangeHeader?: string;
+      range?: { start: number; end: number };
+      ticket?: string;
+      expires?: number;
     } = {},
   ) {
     const share = await this.findShareByAccessKey(tokenOrPath, {
-      include: { file: { include: { cdnConfig: true } } },
+      include: { file: { include: { cdnConfig: true, project: { select: { enabled: true, deletedAt: true } } } } },
     });
 
     this.assertShareExists(share);
     if (!share.file) {
       throw new NotFoundException('分享链接不存在或已失效。');
     }
-    await this.assertShareUsable(share, share.token, password, meta.ip, meta.skipPassword);
+    const session = await findShareDownloadSession(this.prisma, share, share.fileId, meta.ip, 'file', meta.ticket, meta.expires);
+    await this.assertShareUsable(share, share.token, password, meta.ip, Boolean(session));
+    await this.shareIpAbuseService.assertNotBanned(shareSessionIp(meta.ip));
     if (share.previewOnly && meta.countDownload !== false) {
       throw new ForbiddenException('该分享仅允许在线预览，禁止下载。');
     }
-    if (meta.countDownload !== false) {
-      // Rate-limit real download issuance. Ticket downloads skip here because
-      // createShareDownloadSession already counted the same logical click.
-      if (!meta.skipRateLimit) {
+    if (!session?.consumedAt) this.assertShareDownloadAvailable(share.downloadCount, share.maxDownloads);
+    const size = Number(share.file.size);
+    const parsedRange = meta.range
+      ? parseByteRange(`bytes=${meta.range.start}-${meta.range.end}`, size)
+      : parseByteRange(meta.rangeHeader, size);
+    if (parsedRange && typeof parsedRange === 'object' && share.watermarkText && share.file.category === FileCategory.IMAGE && !/(html|xhtml|svg|xml|javascript|ecmascript)/i.test(share.file.mimeType)) {
+      throw new BadRequestException('带水印的图片分享不支持范围下载。');
+    }
+    const result = {
+      file: share.file, watermarkText: share.watermarkText,
+      range: parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
+      unsatisfiable: parsedRange === 'unsatisfiable',
+    };
+    if (meta.head || result.unsatisfiable) return { ...result, target: { type: 'stream' as const } };
+    const range = result.range ? { start: result.range.start, end: result.range.end } : undefined;
+    const target = await requireVerifiedShareTarget(
+      await this.storageService.getDownloadTarget(share.file, 120, range, { preferRedirect: false }),
+      result.range?.length ?? size,
+    );
+    try {
+      if (meta.countDownload !== false) {
+        if (!session) {
         await this.assertShareDownloadRateLimit({
           ip: meta.ip,
           shareId: share.id,
@@ -2758,26 +2813,19 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
           originalName: share.file.originalName,
           kind: 'file-share',
         });
-      }
-      await this.incrementShareDownloadCount(share.id, share.maxDownloads);
-      await this.auditService.write({
+        }
+        const counted = await consumeShareDownload(this.prisma, share, 'file', session?.id);
+        if (counted) await this.auditService.write({
         action: AuditAction.FILE_SHARE_DOWNLOAD,
         projectId: share.file.projectId,
         detail: { fileId: share.fileId, shareId: share.id },
-      });
-    } else {
-      this.assertShareDownloadAvailable(share.downloadCount, share.maxDownloads);
+        });
+      }
+    } catch (error) {
+      target.stream?.destroy();
+      throw error;
     }
-
-    return {
-      file: share.file,
-      // Never 302 to a long-lived CDN URL for share downloads — that bypasses IP rate limits.
-      // Always proxy/stream through the API so every hit is counted.
-      target: await this.storageService.getDownloadTarget(share.file, 120, undefined, {
-        preferRedirect: false,
-      }),
-      watermarkText: share.watermarkText,
-    };
+    return { ...result, target };
   }
 
   async createShareDownloadSession(
@@ -2788,7 +2836,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     // Lightweight lookup: only fields needed for access checks (no CDN / stream setup).
     const share = await this.findShareByAccessKey(tokenOrPath, {
       include: {
-        file: { select: { id: true, status: true, projectId: true, originalName: true } },
+        file: { include: { project: { select: { enabled: true, deletedAt: true } } } },
       },
     });
     this.assertShareExists(share);
@@ -2807,20 +2855,24 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       kind: 'file-share',
     });
     // Short-lived ticket: reduces reuse window if a URL is copied out of DevTools.
-    const expiresAt = new Date(Date.now() + 60 * 1000);
+    const { ticket, expiresAt } = await issueShareDownloadSession(this.prisma, share, share.fileId, meta.ip, 'file');
     const expires = Math.floor(expiresAt.getTime() / 1000);
-    const ticket = this.storageService.signShareAccess(share.token, expires);
 
     // Use the dedicated download route so browsers stream the file immediately
     // (Content-Disposition: attachment) without buffering in the SPA.
     return {
-      url: `/api/shares/${share.token}/download?ticket=${encodeURIComponent(ticket)}&expires=${expires}`,
+      url: `${resolvePublicBaseUrl(this.configService.get<string>('PUBLIC_URL')) ?? ''}/api/shares/${share.token}/download?ticket=${encodeURIComponent(ticket)}&expires=${expires}`,
       expiresAt,
     };
   }
 
-  verifyShareDownloadSession(token: string, expires?: number, ticket?: string): boolean {
-    return Boolean(expires && ticket && this.storageService.verifyShareAccess(token, expires, ticket));
+  async verifyShareDownloadSession(token: string, expires?: number, ticket?: string, ip?: string): Promise<boolean> {
+    if (!ticket) return false;
+    const share = await this.findShareByAccessKey(token, { include: { file: { include: { project: { select: { enabled: true, deletedAt: true } } } } } });
+    this.assertShareExists(share);
+    await findShareDownloadSession(this.prisma, share, share.fileId, ip, 'file', ticket, expires);
+    await this.assertShareUsable(share, share.token, undefined, ip, true);
+    return true;
   }
 
   async purgeExpiredRecycledFiles(batchSize = 100): Promise<{ scanned: number; purged: number; failed: number }> {
@@ -2900,7 +2952,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       folderPath: file.folderPath,
       // Prefer persisted derivative thumbnail; fall back to access URL for images.
       thumbnailUrl: file.thumbnailUrl
-        ? this.storageService.absolutizeIfNeeded(file.thumbnailUrl)
+        ? this.storageService.buildPublicDerivativeUrl(file.id, file.category === FileCategory.VIDEO ? DerivativeKind.COVER : DerivativeKind.THUMB)
         : file.category === 'IMAGE'
           ? accessUrl
           : null,
@@ -2930,20 +2982,23 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
     const ready = file._videoDerivatives?.find(
-      (item) => item.kind === kind && item.status === DerivativeStatus.READY && item.storageKey,
+      (item) => item.kind === kind && item.status === DerivativeStatus.READY && item.storageKey && this.derivativeMatchesSource(file, item.meta),
     );
     if (!ready) {
       return null;
     }
-    // Prefer stored publicUrl (API derivative route or CDN); never fall back to original
-    // accessUrl for HLS (m3u8 would be wrong). MP4 can fall back to source as last resort.
-    if (ready.publicUrl) {
-      return this.storageService.absolutizeIfNeeded(ready.publicUrl);
-    }
+    // Persisted cloud URLs remain backend sources; viewers use the public gateway.
     if (kind === DerivativeKind.HLS || kind === DerivativeKind.MP4_720) {
       return this.storageService.buildPublicDerivativeUrl(file.id, kind);
     }
     return accessUrl;
+  }
+
+  private derivativeMatchesSource(file: Pick<ManagedFile, 'storageKey' | 'checksum' | 'currentVersion'>, meta?: Prisma.JsonValue): boolean {
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return true;
+    return (meta.sourceStorageKey === undefined || meta.sourceStorageKey === file.storageKey) &&
+      (meta.sourceChecksum === undefined || meta.sourceChecksum === file.checksum) &&
+      (meta.sourceVersion === undefined || meta.sourceVersion === file.currentVersion);
   }
 
   async getPublicDerivativeTarget(
@@ -2972,7 +3027,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     const derivative = await this.prisma.fileDerivative.findUnique({
       where: { fileId_kind: { fileId, kind } },
     });
-    if (!derivative || derivative.status !== DerivativeStatus.READY || !derivative.storageKey) {
+    if (!derivative || derivative.status !== DerivativeStatus.READY || !derivative.storageKey || !this.derivativeMatchesSource(file, derivative.meta)) {
       throw new NotFoundException('派生资源不存在或未就绪。');
     }
 
@@ -3006,7 +3061,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       file,
       target,
       mimeType,
-      size: Number(derivative.size || 0),
+      size: target.contentLength ?? Number(derivative.size || 0),
     };
   }
 
@@ -3042,6 +3097,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
         status: true,
         publicUrl: true,
         storageKey: true,
+        meta: true,
       },
     });
 
@@ -3053,6 +3109,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
         status: row.status,
         publicUrl: row.publicUrl,
         storageKey: row.storageKey,
+        meta: row.meta,
       });
       byFile.set(row.fileId, list);
     }
@@ -3324,9 +3381,9 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     const extension = resolveExtension(originalName);
     const category = resolveFileCategory(originalName, mimeType);
     const folderPath = this.normalizeFolderPath(params.folderPath);
-    const checksum = params.checksum?.trim() || null;
+    let checksum = params.checksum?.trim() || null;
     const strategy = params.duplicateStrategy ?? 'reject';
-    const publicUrl = params.publicUrl?.trim() || null;
+    const publicUrl = null;
 
     let cdnConfigId = params.cdnConfigId ?? null;
     if (!cdnConfigId) {
@@ -3339,6 +3396,12 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     if (!exists) {
       throw new BadRequestException('存储中未找到已上传对象，请确认直传完成后再调用 complete-presign。');
     }
+
+    const safeObject = await this.storageService.materializeUploadedObject(
+      params.projectId, cdnConfigId, storageKey, size, checksum, mimeType, originalName,
+    );
+    cdnConfigId = safeObject.cdnConfigId;
+    checksum = safeObject.checksum ?? checksum;
 
     // Name-based replace: keep fileId so public URLs / share links stay valid.
     if (strategy === 'replace') {
@@ -3398,12 +3461,9 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
           await this.snapshotCurrentVersion(nameMatch, params.actorId, 'before-replace');
         }
 
-        const previousCdnConfig = nameMatch.cdnConfig;
         const previousStorageKey = nameMatch.storageKey;
 
-        const updated = await this.prisma.managedFile.update({
-          where: { id: nameMatch.id },
-          data: {
+        const updated = await this.updateRevisionIfCurrent(nameMatch, {
             cdnConfigId,
             originalName,
             storageKey,
@@ -3412,7 +3472,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
             size: BigInt(size),
             category,
             checksum,
-            publicUrl: publicUrl ?? nameMatch.publicUrl,
+            publicUrl,
             folderPath: folderPath ?? nameMatch.folderPath,
             thumbnailUrl: null,
             scanStatus: 'SKIPPED',
@@ -3422,22 +3482,10 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
             deletedAt: null,
             purgeAt: null,
             duplicateOfId: null,
-            currentVersion: Math.max(1, Number(nameMatch.currentVersion || 1)) + 1,
-          },
-          include: { cdnConfig: true },
+            currentVersion: await this.nextFileRevision(nameMatch.id, nameMatch.currentVersion),
         });
 
-        if (previousCdnConfig && previousStorageKey && previousStorageKey !== storageKey) {
-          try {
-            await this.storageService.remove(previousCdnConfig, previousStorageKey);
-          } catch (error) {
-            this.logger.warn(
-              `直传覆盖后清理旧对象失败：fileId=${nameMatch.id} key=${previousStorageKey} reason=${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-          }
-        }
+        // The old key is retained by FileVersion and must not be deleted here.
 
         await this.auditService.write({
           action: AuditAction.FILE_UPLOAD,
@@ -3910,9 +3958,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     publicBaseUrl?: string,
     includeAdminAccessInfo = false,
   ): Record<string, unknown> {
-    // Prefer request Host (passed as publicBaseUrl) so IP/domain deploys work without PUBLIC_URL.
-    // PUBLIC_URL, when set, overrides (fixed CDN/site domain).
-    const siteUrl = resolvePublicBaseUrl(publicBaseUrl, this.configService.get<string>('PUBLIC_URL'));
+    const siteUrl = resolvePublicBaseUrl(this.configService.get<string>('PUBLIC_URL'), publicBaseUrl);
     const appPublicUrl = siteUrl;
     const webPublicUrl = siteUrl;
     const sharePath = share.customPath ? `/s/${share.customPath}` : `/shares/${share.token}`;
@@ -4023,29 +4069,6 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  private async incrementShareDownloadCount(shareId: string, maxDownloads: number | null): Promise<void> {
-    if (maxDownloads === null) {
-      await this.prisma.shareLink.update({
-        where: { id: shareId },
-        data: { downloadCount: { increment: 1 } },
-      });
-      return;
-    }
-
-    const result = await this.prisma.shareLink.updateMany({
-      where: {
-        id: shareId,
-        enabled: true,
-        downloadCount: { lt: maxDownloads },
-      },
-      data: { downloadCount: { increment: 1 } },
-    });
-
-    if (result.count === 0) {
-      throw new BadRequestException('分享链接下载次数已用完。');
-    }
-  }
-
   /**
    * IP-based download anti-abuse for public share downloads.
    * Manual/DB ban → reject; >5 downloads within 60s → lock ~10 min + notify + DB stats.
@@ -4112,14 +4135,14 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       passwordHash: string | null;
       expiresAt: Date | null;
       allowedIps: Prisma.JsonValue;
-      file: { status: FileStatus };
+      file: { status: FileStatus; project?: { enabled: boolean; deletedAt: Date | null } | null };
     } | null,
     token: string,
     password?: string,
     ip?: string,
     skipPassword = false,
   ): Promise<void> {
-    if (!share || !share.enabled || share.file.status !== FileStatus.ACTIVE) {
+    if (!share || !share.enabled || share.file.status !== FileStatus.ACTIVE || (share.file.project && (!share.file.project.enabled || share.file.project.deletedAt))) {
       throw new NotFoundException('分享链接不存在或已失效。');
     }
 

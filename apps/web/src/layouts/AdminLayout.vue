@@ -21,16 +21,6 @@
       <el-header class="admin-header" height="64px">
         <div class="header-left">
           <el-button class="mobile-menu-button" :icon="MenuIcon" circle @click="mobileMenuVisible = true" />
-          <el-select
-            v-model="selectedProjectId"
-            filterable
-            clearable
-            placeholder="选择当前项目"
-            class="project-select"
-            @change="handleProjectChange"
-          >
-            <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
-          </el-select>
         </div>
         <div class="header-right">
           <el-popover placement="bottom-end" :width="360" trigger="click" @show="loadNotifications">
@@ -237,12 +227,11 @@ import {
 } from '@element-plus/icons-vue';
 import { ElMessage } from 'element-plus';
 import { toDataURL } from 'qrcode';
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { authApi, notificationApi, projectApi, sessionApi, versionApi, type TotpSetupResult, type VersionCheckResult } from '@/api/modules';
+import { authApi, notificationApi, sessionApi, versionApi, type TotpSetupResult, type VersionCheckResult } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
-import type { Project } from '@/types';
 import { copyText } from '@/utils/io';
 
 const versionCheck = ref<VersionCheckResult | null>(null);
@@ -253,8 +242,6 @@ const versionTooltip = computed(() => versionCheck.value
 const route = useRoute();
 const router = useRouter();
 const authStore = useAuthStore();
-const projects = ref<Project[]>([]);
-const selectedProjectId = ref<string>('');
 const securityDialogVisible = ref(false);
 const mobileMenuVisible = ref(false);
 const totpLoading = ref(false);
@@ -290,14 +277,6 @@ const passwordForm = reactive({
   newPassword: '',
 });
 const activePath = computed(() => (route.path.startsWith('/projects/') ? '/projects' : route.path));
-const projectScopedPaths = new Set([
-  '/files',
-  '/recycle-bin',
-  '/storage-configs',
-  '/developer-integration',
-  '/tasks',
-  '/webhooks',
-]);
 const menuItems = computed(() => {
   const items = [
     { path: '/dashboard', label: '概览', icon: DataAnalysis },
@@ -324,55 +303,9 @@ const menuItems = computed(() => {
   return items;
 });
 
-async function loadProjects(): Promise<void> {
-  projects.value = await projectApi.list();
-  syncSelectedProjectFromRoute();
-}
-
-function handleProjectChange(): void {
-  if (!selectedProjectId.value) {
-    if (['/files', '/recycle-bin'].includes(route.path)) {
-      void router.replace({ path: route.path, query: {} });
-    }
-
-    return;
-  }
-
-  if (route.name === 'project-detail') {
-    void router.replace({ path: `/projects/${selectedProjectId.value}` });
-    return;
-  }
-
-  if (projectScopedPaths.has(route.path)) {
-    void router.replace({ path: route.path, query: { projectId: selectedProjectId.value } });
-  }
-}
-
 function handleMenuSelect(path: string): void {
   mobileMenuVisible.value = false;
-  const query =
-    projectScopedPaths.has(path) && !['/files', '/recycle-bin'].includes(path) && selectedProjectId.value
-      ? { projectId: selectedProjectId.value }
-      : {};
-  void router.push({ path, query });
-}
-
-function syncSelectedProjectFromRoute(): void {
-  const routeProjectId = readRouteProjectId();
-
-  if (routeProjectId && projects.value.some((project) => project.id === routeProjectId)) {
-    selectedProjectId.value = routeProjectId;
-    return;
-  }
-
-  if (!selectedProjectId.value) {
-    selectedProjectId.value = projects.value[0]?.id || '';
-  }
-}
-
-function readRouteProjectId(): string {
-  const value = route.query.projectId || route.params.projectId;
-  return Array.isArray(value) ? String(value[0] || '') : String(value || '');
+  void router.push({ path });
 }
 
 function openSecurityDialog(): void {
@@ -523,7 +456,6 @@ onMounted(async () => {
   if (authStore.currentUser?.role === 'SUPER_ADMIN') {
     try { versionCheck.value = await versionApi.check(); } catch { /* configured source may be offline */ }
   }
-  await loadProjects();
   await loadNotifications();
   if (authStore.currentUser?.mustChangePassword) {
     ElMessage.warning('管理员要求修改密码后才能继续使用。');
@@ -540,10 +472,6 @@ onBeforeUnmount(() => {
   }
 });
 
-watch(
-  () => route.fullPath,
-  () => syncSelectedProjectFromRoute(),
-);
 </script>
 
 <style scoped>
@@ -614,11 +542,6 @@ watch(
 
 .mobile-menu-button {
   display: none;
-}
-
-.project-select {
-  width: 280px;
-  max-width: 48vw;
 }
 
 .notify-badge {
@@ -792,11 +715,6 @@ watch(
   .mobile-menu-button {
     display: inline-flex;
     flex: 0 0 auto;
-  }
-
-  .project-select {
-    width: 100%;
-    max-width: none;
   }
 
   .header-right {

@@ -57,7 +57,7 @@ export class StorageMigrationWorker implements OnModuleInit, OnModuleDestroy {
       where: {
         type: 'STORAGE_MIGRATION',
         status: 'RUNNING',
-        OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }],
+        OR: [{ leaseOwner: this.workerId }, { leaseUntil: null }, { leaseUntil: { lt: now } }],
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -66,7 +66,7 @@ export class StorageMigrationWorker implements OnModuleInit, OnModuleDestroy {
       where: {
         id: candidate.id,
         status: 'RUNNING',
-        OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }],
+        OR: [{ leaseOwner: this.workerId }, { leaseUntil: null }, { leaseUntil: { lt: now } }],
       },
       data: { leaseOwner: this.workerId, leaseUntil: new Date(Date.now() + 5 * 60_000) },
     });

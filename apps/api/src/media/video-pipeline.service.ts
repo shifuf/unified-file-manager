@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdtemp, readdir, readFile, rm, stat, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,6 +14,8 @@ import {
   DerivativeStatus,
   FileCategory,
   FileStatus,
+  type ManagedFile,
+  type Prisma,
 } from '@prisma/client';
 
 import { getConfigBoolean } from '../common/utils/security-config.util';
@@ -22,7 +25,10 @@ import { EventBusService } from '../events/event-bus.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 
-type VideoFile = { id: string; projectId: string; storageKey: string; originalName: string };
+type VideoFile = Pick<
+  ManagedFile,
+  'id' | 'projectId' | 'storageKey' | 'originalName' | 'checksum' | 'currentVersion'
+>;
 
 const HLS_LADDER = [
   { name: '480p', height: 480, videoBitrate: '1000k', audioBitrate: '96k', bandwidth: 1_200_000 },
@@ -53,8 +59,11 @@ export class VideoPipelineService implements OnModuleInit {
       if (payload.category !== FileCategory.VIDEO && payload.category !== 'VIDEO') {
         return;
       }
-      void this.withSlot(() => this.processVideo(payload.fileId));
+      return this.withSlot(() => this.processVideo(payload.fileId));
     });
+    this.eventBus.on(DOMAIN_EVENTS.FILE_UPDATED, (payload) =>
+      this.withSlot(() => this.processVideo(payload.fileId, true)),
+    );
   }
 
   private async withSlot(fn: () => Promise<void>): Promise<void> {
@@ -74,16 +83,64 @@ export class VideoPipelineService implements OnModuleInit {
     return this.configService.get<string>('FFMPEG_PATH') || 'ffmpeg';
   }
 
-  private async processVideo(fileId: string): Promise<void> {
+  private async processVideo(fileId: string, onlyIfNeeded = false): Promise<void> {
     const file = await this.prisma.managedFile.findFirst({
       where: { id: fileId, status: FileStatus.ACTIVE, category: FileCategory.VIDEO },
-      include: { cdnConfig: true },
+      include: { cdnConfig: true, derivatives: true },
     });
     if (!file) {
       return;
     }
 
-    await this.markDerivative(file.id, DerivativeKind.COVER, 'image/jpeg', DerivativeStatus.PENDING);
+    const requiredKinds: DerivativeKind[] = [DerivativeKind.COVER];
+    if (getConfigBoolean(this.configService, 'VIDEO_TRANSCODE_ENABLED', false))
+      requiredKinds.push(DerivativeKind.MP4_720);
+    if (getConfigBoolean(this.configService, 'VIDEO_HLS_ENABLED', false))
+      requiredKinds.push(DerivativeKind.HLS);
+    if (
+      onlyIfNeeded &&
+      requiredKinds.every((kind) =>
+        file.derivatives.some(
+          (derivative) =>
+            derivative.kind === kind &&
+            derivative.status === DerivativeStatus.READY &&
+            this.matchesSource(file, derivative.meta),
+        ),
+      )
+    )
+      return;
+
+    if (
+      !(await this.markDerivative(
+        file,
+        DerivativeKind.COVER,
+        'image/jpeg',
+        DerivativeStatus.PENDING,
+      ))
+    )
+      return;
+    if (getConfigBoolean(this.configService, 'VIDEO_TRANSCODE_ENABLED', false)) {
+      if (
+        !(await this.markDerivative(
+          file,
+          DerivativeKind.MP4_720,
+          'video/mp4',
+          DerivativeStatus.PENDING,
+        ))
+      )
+        return;
+    }
+    if (getConfigBoolean(this.configService, 'VIDEO_HLS_ENABLED', false)) {
+      if (
+        !(await this.markDerivative(
+          file,
+          DerivativeKind.HLS,
+          'application/vnd.apple.mpegurl',
+          DerivativeStatus.PENDING,
+        ))
+      )
+        return;
+    }
 
     const workDir = await mkdtemp(join(tmpdir(), 'ufm-video-'));
     const inputPath = join(workDir, 'source.bin');
@@ -117,7 +174,7 @@ export class VideoPipelineService implements OnModuleInit {
       ]);
 
       const coverBuffer = await readFile(coverPath);
-      const coverKey = `${this.dirPrefix(file.storageKey)}thumbs/${file.id}-cover.jpg`;
+      const coverKey = `${this.derivativePrefix(file)}-cover.jpg`;
       const uploaded = await this.storageService.upload(file.projectId, {
         key: coverKey,
         buffer: coverBuffer,
@@ -125,32 +182,39 @@ export class VideoPipelineService implements OnModuleInit {
         originalName: `${file.originalName}.cover.jpg`,
       });
 
-      const publicUrl = uploaded.publicUrl || this.storageService.buildPublicAccessUrl(file.id);
+      const publicUrl = this.storageService.buildPublicDerivativeUrl(file.id, 'COVER');
 
-      await this.prisma.fileDerivative.upsert({
-        where: { fileId_kind: { fileId, kind: DerivativeKind.COVER } },
-        create: {
-          fileId,
-          kind: DerivativeKind.COVER,
-          storageKey: uploaded.storageKey,
-          mimeType: 'image/jpeg',
-          size: BigInt(coverBuffer.length),
-          status: DerivativeStatus.READY,
-          publicUrl,
-        },
-        update: {
-          storageKey: uploaded.storageKey,
-          size: BigInt(coverBuffer.length),
-          status: DerivativeStatus.READY,
-          publicUrl,
-          error: null,
-        },
-      });
+      if (
+        !(await this.withCurrentSource(file, async (tx) => {
+          await tx.fileDerivative.upsert({
+            where: { fileId_kind: { fileId, kind: DerivativeKind.COVER } },
+            create: {
+              fileId,
+              kind: DerivativeKind.COVER,
+              storageKey: uploaded.storageKey,
+              mimeType: 'image/jpeg',
+              size: BigInt(coverBuffer.length),
+              status: DerivativeStatus.READY,
+              publicUrl,
+              meta: this.sourceMeta(file),
+            },
+            update: {
+              storageKey: uploaded.storageKey,
+              size: BigInt(coverBuffer.length),
+              status: DerivativeStatus.READY,
+              publicUrl,
+              error: null,
+              meta: this.sourceMeta(file),
+            },
+          });
 
-      await this.prisma.managedFile.update({
-        where: { id: fileId },
-        data: { thumbnailUrl: publicUrl },
-      });
+          await tx.managedFile.update({
+            where: { id: fileId },
+            data: { thumbnailUrl: publicUrl },
+          });
+        }))
+      )
+        return;
 
       if (getConfigBoolean(this.configService, 'VIDEO_TRANSCODE_ENABLED', false)) {
         await this.generateMp4_720(file, inputPath);
@@ -162,20 +226,89 @@ export class VideoPipelineService implements OnModuleInit {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(`Video pipeline failed fileId=${fileId}: ${message}`);
-      await this.markDerivative(file.id, DerivativeKind.COVER, 'image/jpeg', DerivativeStatus.FAILED, message);
+      await this.markDerivative(
+        file,
+        DerivativeKind.COVER,
+        'image/jpeg',
+        DerivativeStatus.FAILED,
+        message,
+      );
     } finally {
       await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
-  private dirPrefix(storageKey: string): string {
-    return storageKey.replace(/\/[^/]+$/, '/') || '';
+  private sourceRevision(file: VideoFile): string {
+    return createHash('sha256')
+      .update(JSON.stringify([file.storageKey, file.checksum, file.currentVersion]))
+      .digest('hex')
+      .slice(0, 32);
+  }
+
+  private sourceMeta(file: VideoFile) {
+    return {
+      sourceStorageKey: file.storageKey,
+      sourceChecksum: file.checksum,
+      sourceVersion: file.currentVersion,
+      sourceRevision: this.sourceRevision(file),
+    };
+  }
+
+  private matchesSource(file: VideoFile, meta: Prisma.JsonValue): boolean {
+    return (
+      meta !== null &&
+      typeof meta === 'object' &&
+      !Array.isArray(meta) &&
+      meta.sourceStorageKey === file.storageKey &&
+      meta.sourceChecksum === file.checksum &&
+      meta.sourceVersion === file.currentVersion
+    );
+  }
+
+  private derivativePrefix(file: VideoFile): string {
+    const lastSlash = file.storageKey.lastIndexOf('/');
+    const dir = lastSlash >= 0 ? file.storageKey.slice(0, lastSlash + 1) : '';
+    return `${dir}thumbs/${file.id}-${this.sourceRevision(file)}`;
+  }
+
+  private async withCurrentSource(
+    file: VideoFile,
+    write: (tx: Prisma.TransactionClient) => Promise<unknown>,
+  ): Promise<boolean> {
+    return this.prisma.$transaction(async (tx) => {
+      // A conditional write locks the source row until derivative publication commits.
+      // Replacements serialize against this check, closing the check/upsert race.
+      const locked = await tx.managedFile.updateMany({
+        where: {
+          id: file.id,
+          storageKey: file.storageKey,
+          checksum: file.checksum,
+          currentVersion: file.currentVersion,
+          status: FileStatus.ACTIVE,
+          category: FileCategory.VIDEO,
+        },
+        data: { currentVersion: file.currentVersion },
+      });
+      if (!locked.count) return false;
+      await write(tx);
+      return true;
+    });
   }
 
   private async generateMp4_720(file: VideoFile, inputPath: string): Promise<void> {
     const workDir = await mkdtemp(join(tmpdir(), 'ufm-mp4-'));
     const outPath = join(workDir, '720p.mp4');
-    await this.markDerivative(file.id, DerivativeKind.MP4_720, 'video/mp4', DerivativeStatus.PENDING);
+    if (
+      !(await this.markDerivative(
+        file,
+        DerivativeKind.MP4_720,
+        'video/mp4',
+        DerivativeStatus.PENDING,
+      ))
+    ) {
+      await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+      return;
+    }
 
     try {
       await this.runFfmpeg([
@@ -200,43 +333,48 @@ export class VideoPipelineService implements OnModuleInit {
       ]);
 
       const buffer = await readFile(outPath);
-      const key = `${this.dirPrefix(file.storageKey)}thumbs/${file.id}-720p.mp4`;
+      const key = `${this.derivativePrefix(file)}-720p.mp4`;
       const uploaded = await this.storageService.upload(file.projectId, {
         key,
         buffer,
         mimeType: 'video/mp4',
         originalName: `${file.originalName}.720p.mp4`,
       });
-      // Prefer CDN public URL; otherwise stable API derivative route.
-      const publicUrl =
-        uploaded.publicUrl ||
-        this.storageService.buildPublicDerivativeUrl(file.id, 'MP4_720');
+      const publicUrl = this.storageService.buildPublicDerivativeUrl(file.id, 'MP4_720');
 
-      await this.prisma.fileDerivative.upsert({
-        where: { fileId_kind: { fileId: file.id, kind: DerivativeKind.MP4_720 } },
-        create: {
-          fileId: file.id,
-          kind: DerivativeKind.MP4_720,
-          storageKey: uploaded.storageKey,
-          mimeType: 'video/mp4',
-          size: BigInt(buffer.length),
-          status: DerivativeStatus.READY,
-          publicUrl,
-          meta: { height: 720, format: 'mp4' },
-        },
-        update: {
-          storageKey: uploaded.storageKey,
-          size: BigInt(buffer.length),
-          status: DerivativeStatus.READY,
-          publicUrl,
-          error: null,
-          meta: { height: 720, format: 'mp4' },
-        },
-      });
+      await this.withCurrentSource(file, (tx) =>
+        tx.fileDerivative.upsert({
+          where: { fileId_kind: { fileId: file.id, kind: DerivativeKind.MP4_720 } },
+          create: {
+            fileId: file.id,
+            kind: DerivativeKind.MP4_720,
+            storageKey: uploaded.storageKey,
+            mimeType: 'video/mp4',
+            size: BigInt(buffer.length),
+            status: DerivativeStatus.READY,
+            publicUrl,
+            meta: { ...this.sourceMeta(file), height: 720, format: 'mp4' },
+          },
+          update: {
+            storageKey: uploaded.storageKey,
+            size: BigInt(buffer.length),
+            status: DerivativeStatus.READY,
+            publicUrl,
+            error: null,
+            meta: { ...this.sourceMeta(file), height: 720, format: 'mp4' },
+          },
+        }),
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(`MP4_720 failed fileId=${file.id}: ${message}`);
-      await this.markDerivative(file.id, DerivativeKind.MP4_720, 'video/mp4', DerivativeStatus.FAILED, message);
+      await this.markDerivative(
+        file,
+        DerivativeKind.MP4_720,
+        'video/mp4',
+        DerivativeStatus.FAILED,
+        message,
+      );
     } finally {
       await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
     }
@@ -247,18 +385,25 @@ export class VideoPipelineService implements OnModuleInit {
    * Segment paths in playlists are rewritten to public derivative URLs so players
    * can fetch ts without knowing storage layout.
    */
-  private async generateHlsMultiBitrate(file: VideoFile, inputPath: string, workDir: string): Promise<void> {
+  private async generateHlsMultiBitrate(
+    file: VideoFile,
+    inputPath: string,
+    workDir: string,
+  ): Promise<void> {
     const hlsRoot = join(workDir, 'hls');
     await mkdir(hlsRoot, { recursive: true });
-    await this.markDerivative(
-      file.id,
-      DerivativeKind.HLS,
-      'application/vnd.apple.mpegurl',
-      DerivativeStatus.PENDING,
-    );
+    if (
+      !(await this.markDerivative(
+        file,
+        DerivativeKind.HLS,
+        'application/vnd.apple.mpegurl',
+        DerivativeStatus.PENDING,
+      ))
+    )
+      return;
 
     try {
-      const prefix = `${this.dirPrefix(file.storageKey)}thumbs/${file.id}-hls`;
+      const prefix = `${this.derivativePrefix(file)}-hls`;
       const masterLines = ['#EXTM3U', '#EXT-X-VERSION:3'];
       let totalSize = 0;
       const uploadedNames: string[] = [];
@@ -331,9 +476,7 @@ export class VideoPipelineService implements OnModuleInit {
 
           const relativeName = `${rung.name}/${name}`;
           const key = `${prefix}/${relativeName}`;
-          const mimeType = name.endsWith('.m3u8')
-            ? 'application/vnd.apple.mpegurl'
-            : 'video/mp2t';
+          const mimeType = name.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp2t';
           await this.storageService.upload(file.projectId, {
             key,
             buffer,
@@ -346,7 +489,9 @@ export class VideoPipelineService implements OnModuleInit {
         masterLines.push(
           `#EXT-X-STREAM-INF:BANDWIDTH=${rung.bandwidth},RESOLUTION=1280x${rung.height},NAME="${rung.name}"`,
         );
-        masterLines.push(this.storageService.buildPublicDerivativePath(file.id, 'HLS', `${rung.name}/index.m3u8`));
+        masterLines.push(
+          this.storageService.buildPublicDerivativePath(file.id, 'HLS', `${rung.name}/index.m3u8`),
+        );
       }
 
       const masterBody = `${masterLines.join('\n')}\n`;
@@ -364,44 +509,48 @@ export class VideoPipelineService implements OnModuleInit {
       // even when CDN domain is missing or CORS-blocked for m3u8.
       const playlistPublicUrl = this.storageService.buildPublicDerivativeUrl(file.id, 'HLS');
 
-      await this.prisma.fileDerivative.upsert({
-        where: { fileId_kind: { fileId: file.id, kind: DerivativeKind.HLS } },
-        create: {
-          fileId: file.id,
-          kind: DerivativeKind.HLS,
-          storageKey: masterUpload.storageKey,
-          mimeType: 'application/vnd.apple.mpegurl',
-          size: BigInt(totalSize),
-          status: DerivativeStatus.READY,
-          publicUrl: playlistPublicUrl,
-          meta: {
-            format: 'hls',
-            multiBitrate: true,
-            ladders: HLS_LADDER.map((r) => r.name),
-            segmentPrefix: prefix,
-            files: uploadedNames,
+      await this.withCurrentSource(file, (tx) =>
+        tx.fileDerivative.upsert({
+          where: { fileId_kind: { fileId: file.id, kind: DerivativeKind.HLS } },
+          create: {
+            fileId: file.id,
+            kind: DerivativeKind.HLS,
+            storageKey: masterUpload.storageKey,
+            mimeType: 'application/vnd.apple.mpegurl',
+            size: BigInt(totalSize),
+            status: DerivativeStatus.READY,
+            publicUrl: playlistPublicUrl,
+            meta: {
+              ...this.sourceMeta(file),
+              format: 'hls',
+              multiBitrate: true,
+              ladders: HLS_LADDER.map((r) => r.name),
+              segmentPrefix: prefix,
+              files: uploadedNames,
+            },
           },
-        },
-        update: {
-          storageKey: masterUpload.storageKey,
-          size: BigInt(totalSize),
-          status: DerivativeStatus.READY,
-          publicUrl: playlistPublicUrl,
-          error: null,
-          meta: {
-            format: 'hls',
-            multiBitrate: true,
-            ladders: HLS_LADDER.map((r) => r.name),
-            segmentPrefix: prefix,
-            files: uploadedNames,
+          update: {
+            storageKey: masterUpload.storageKey,
+            size: BigInt(totalSize),
+            status: DerivativeStatus.READY,
+            publicUrl: playlistPublicUrl,
+            error: null,
+            meta: {
+              ...this.sourceMeta(file),
+              format: 'hls',
+              multiBitrate: true,
+              ladders: HLS_LADDER.map((r) => r.name),
+              segmentPrefix: prefix,
+              files: uploadedNames,
+            },
           },
-        },
-      });
+        }),
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(`HLS multi-bitrate failed fileId=${file.id}: ${message}`);
       await this.markDerivative(
-        file.id,
+        file,
         DerivativeKind.HLS,
         'application/vnd.apple.mpegurl',
         DerivativeStatus.FAILED,
@@ -411,14 +560,15 @@ export class VideoPipelineService implements OnModuleInit {
   }
 
   private async markDerivative(
-    fileId: string,
+    file: VideoFile,
     kind: DerivativeKind,
     mimeType: string,
     status: DerivativeStatus,
     error?: string,
-  ): Promise<void> {
-    await this.prisma.fileDerivative
-      .upsert({
+  ): Promise<boolean> {
+    const fileId = file.id;
+    return this.withCurrentSource(file, (tx) =>
+      tx.fileDerivative.upsert({
         where: { fileId_kind: { fileId, kind } },
         create: {
           fileId,
@@ -428,13 +578,15 @@ export class VideoPipelineService implements OnModuleInit {
           size: BigInt(0),
           status,
           error: error ? error.slice(0, 512) : null,
+          meta: this.sourceMeta(file),
         },
         update: {
           status,
           error: error ? error.slice(0, 512) : null,
+          meta: this.sourceMeta(file),
         },
-      })
-      .catch(() => undefined);
+      }),
+    ).catch(() => false);
   }
 
   private runFfmpeg(args: string[]): Promise<void> {

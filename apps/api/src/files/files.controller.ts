@@ -37,6 +37,7 @@ import {
   getRequestRangeHeader,
   parseByteRange,
   pipeStreamToResponse,
+  sliceByteRange,
   writeUnsatisfiableRange,
 } from '../common/utils/http-range.util';
 import { safeFetch } from '../common/utils/ssrf-guard.util';
@@ -630,8 +631,7 @@ export class PublicFilesController {
    *   /api/public/files/:fileId/derivatives/HLS/480p/seg_000.ts
    *   /api/public/files/:fileId/derivatives/MP4_720
    */
-  @Get(':fileId/derivatives/:kind')
-  @Get(':fileId/derivatives/:kind/*')
+  @Get([':fileId/derivatives/:kind', ':fileId/derivatives/:kind/*path'])
   async accessDerivative(
     @Param('fileId') fileId: string,
     @Param('kind') kind: string,
@@ -666,7 +666,8 @@ export class PublicFilesController {
         request.query.expires === undefined ? undefined : Number(request.query.expires),
         typeof request.query.signature === 'string' ? request.query.signature : undefined,
       );
-      const accessMode = await this.enforcePublicAccessPolicy(request, access);
+      const accessMode = await this.enforcePublicAccessPolicy(request, access)
+        .finally(() => access.target.stream?.destroy());
 
       const { target, mimeType, size } = await this.filesService.getPublicDerivativeTarget(
         fileId,
@@ -674,8 +675,9 @@ export class PublicFilesController {
         subPath,
       );
 
-      const parsed = parseByteRange(getRequestRangeHeader(request), size > 0 ? size : Number.MAX_SAFE_INTEGER);
+      const parsed = parseByteRange(getRequestRangeHeader(request), size);
       if (parsed === 'unsatisfiable') {
+        target.stream?.destroy();
         writeUnsatisfiableRange(response, size);
         return;
       }
@@ -696,6 +698,8 @@ export class PublicFilesController {
         response.status(404).send('Derivative stream not found.');
         return;
       }
+
+      if (parsed && typeof parsed === 'object') stream = sliceByteRange(stream as Readable, parsed);
 
       this.applyPublicCacheHeaders(response, accessMode);
       response.setHeader('Access-Control-Allow-Origin', '*');
@@ -843,11 +847,7 @@ export class PublicFilesController {
               'Content-Disposition',
               `inline; filename*=UTF-8''${encodeURIComponent(file.originalName)}.thumb.webp`,
             );
-            if (accessMode === 'open') {
-              response.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
-            } else {
-              this.applyPublicCacheHeaders(response, accessMode);
-            }
+            this.applyPublicCacheHeaders(response, accessMode);
             response.setHeader('ETag', thumbEtag);
             stream.once('error', (error) => this.handlePublicStreamError(response, error));
             stream.pipe(response);
@@ -900,11 +900,7 @@ export class PublicFilesController {
         'Content-Disposition',
         `inline; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,
       );
-      if (accessMode === 'open') {
-        response.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
-      } else {
-        this.applyPublicCacheHeaders(response, accessMode);
-      }
+      this.applyPublicCacheHeaders(response, accessMode);
       if (transformOptions.negotiated) {
         response.setHeader('Vary', 'Accept');
       }
@@ -949,12 +945,8 @@ export class PublicFilesController {
     etag: string | null,
     mode: 'open' | 'signed' | 'restricted' = 'restricted',
   ): void {
-    // Only open/public files get shared edge cache. Signed/restricted stay private/no-store.
-    // Originals may be overwritten in place (same fileId URL) — never immutable.
+    // A stable file ID may point to a replacement, restored version or revoked file.
     this.applyPublicCacheHeaders(response, mode);
-    if (mode === 'open') {
-      response.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
-    }
     if (etag) {
       response.setHeader('ETag', etag);
     }
@@ -1062,10 +1054,10 @@ export class PublicFilesController {
   }
 
   private applyPublicCacheHeaders(response: Response, mode: 'open' | 'signed' | 'restricted'): void {
-    // Only fully public files may be edge-cached. Signed/restricted must stay private so
-    // nginx proxy_cache cannot serve them to unauthorized clients.
+    // These stable file-ID URLs change after replacement, restoration or revocation.
+    // Require a fresh authorization and current object on every request.
     if (mode === 'open') {
-      response.setHeader('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+      response.setHeader('Cache-Control', 'public, no-store, max-age=0, must-revalidate');
       return;
     }
     response.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
@@ -1178,23 +1170,7 @@ export class PublicSharesController {
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
-    const { file, target, watermarkText } = await this.filesService.getShareDownloadTarget(token, password, {
-      ip: getClientIp(request),
-    });
-    this.downloadStatsService.record({
-      projectId: file.projectId,
-      fileId: file.id,
-      originalName: file.originalName,
-      bytes: Number(file.size),
-      source: DownloadSource.SHARE,
-      ip: getClientIp(request),
-      userAgent: request.get('user-agent') ?? null,
-    });
-    await this.writeShareFileResponse(response, file as ShareFileRef, target, 'attachment', {
-      watermarkText,
-      category: file.category,
-      size: Number(file.size),
-    });
+    await this.downloadShareFile(token, password, undefined, undefined, request, response);
   }
 
   @Post(':token/download-session')
@@ -1226,35 +1202,38 @@ export class PublicSharesController {
     expires: string | undefined,
     request: Request,
     response: Response,
+    disposition: 'attachment' | 'inline' = 'attachment',
   ): Promise<void> {
-    const sessionValid = this.filesService.verifyShareDownloadSession(
-      token,
-      expires === undefined ? undefined : Number(expires),
-      ticket,
-    );
-    if (!sessionValid && !password && (await this.filesService.shareRequiresPassword(token))) {
-      response.redirect(`/shares/${token}`);
+    const head = request.method === 'HEAD';
+    const { file, target, watermarkText, range, unsatisfiable } = await this.filesService.getShareDownloadTarget(token, password, {
+      ip: getClientIp(request),
+      ticket, expires: expires === undefined ? undefined : Number(expires),
+      head, rangeHeader: getRequestRangeHeader(request),
+      countDownload: disposition === 'attachment',
+    });
+    if (unsatisfiable) { writeUnsatisfiableRange(response, Number(file.size)); return; }
+    if (head) {
+      response.setHeader('Cache-Control', 'no-store');
+      applyRangeHeaders(response, file.mimeType, Number(file.size), range, disposition, file.originalName);
+      response.end();
       return;
     }
-    const { file, target, watermarkText } = await this.filesService.getShareDownloadTarget(token, sessionValid ? undefined : password, {
-      ip: getClientIp(request),
-      // Ticket path already rate-limited when the session was issued.
-      skipPassword: sessionValid,
-      skipRateLimit: sessionValid,
-    });
-    this.downloadStatsService.record({
+    if (disposition === 'attachment') this.downloadStatsService.record({
       projectId: file.projectId,
       fileId: file.id,
       originalName: file.originalName,
-      bytes: Number(file.size),
+      bytes: range?.length ?? Number(file.size),
       source: DownloadSource.SHARE,
       ip: getClientIp(request),
       userAgent: request.get('user-agent') ?? null,
+      rangeStart: range?.start ?? null,
+      rangeEnd: range?.end ?? null,
     });
-    await this.writeShareFileResponse(response, file as ShareFileRef, target, 'attachment', {
+    await this.writeShareFileResponse(response, file as ShareFileRef, target, disposition, {
       watermarkText,
       category: file.category,
       size: Number(file.size),
+      range,
     });
   }
 
@@ -1271,15 +1250,7 @@ export class PublicSharesController {
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
-    const { file, target, watermarkText } = await this.filesService.getShareDownloadTarget(token, password, {
-      countDownload: false,
-      ip: getClientIp(request),
-    });
-    await this.writeShareFileResponse(response, file as ShareFileRef, target, 'inline', {
-      watermarkText,
-      category: file.category,
-      size: Number(file.size),
-    });
+    await this.downloadShareFile(token, password, undefined, undefined, request, response, 'inline');
   }
 
   private async writeShareFileResponse(
@@ -1294,11 +1265,6 @@ export class PublicSharesController {
       range?: { start: number; end: number; size: number; length: number } | null;
     } = {},
   ): Promise<void> {
-    if (target.type === 'redirect' && target.url && !options.range) {
-      response.redirect(target.url);
-      return;
-    }
-
     if (!target.stream) {
       response.status(404).send('File stream not found.');
       return;

@@ -16,6 +16,23 @@ export type StorageUploadParams = {
   originalName: string;
 };
 
+/** A verified disk object for bounded-memory background replication. */
+export type StorageUploadFileParams = {
+  key: string;
+  path: string;
+  size: number;
+  checksum: string;
+  mimeType: string;
+  originalName: string;
+};
+
+export type StorageObjectFingerprint = {
+  size: number;
+  checksum: string;
+  /** Filesystem identity and modification stamp captured from one open file. */
+  identity: string;
+};
+
 export type StoredObject = {
   storageKey: string;
   publicUrl?: string | null;
@@ -27,6 +44,8 @@ export type StorageDownloadTarget = {
   stream?: Readable;
   contentType?: string;
   contentLength?: number;
+  verified?: boolean;
+  checksum?: string;
 };
 
 export type StorageByteRange = {
@@ -66,6 +85,12 @@ export interface StorageAdapter {
   readonly provider: CdnProvider;
 
   upload(config: RuntimeCdnConfig, params: StorageUploadParams): Promise<StoredObject>;
+
+  uploadFile?(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject>;
+
+  getObjectFingerprint?(config: RuntimeCdnConfig, key: string): Promise<StorageObjectFingerprint | null>;
+
+  repairFile?(config: RuntimeCdnConfig, params: StorageUploadFileParams, corrupt: StorageObjectFingerprint): Promise<StoredObject>;
 
   remove(config: RuntimeCdnConfig, key: string): Promise<void>;
 

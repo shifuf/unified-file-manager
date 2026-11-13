@@ -1,11 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CdnProvider, type CdnConfig } from '@prisma/client';
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 
 import { PrismaService } from '../prisma/prisma.service';
 import { decryptText, getSigningSecret, hmacSha256Base64Url } from './crypto.util';
 import { StorageAdapterRegistry } from './storage-registry.service';
+import { ReplicaService, spoolVerifiedStream, verifiedTarget } from './replica.service';
 import { isAnyStorageUsageAtThreshold, resolveUsageValue, selectFailoverStorage } from './storage-policy.util';
 import type {
   DirectUploadCredential,
@@ -21,6 +23,7 @@ export type StorageFileInput = {
   mimeType: string;
   originalName: string;
   size?: bigint | number;
+  checksum?: string | null;
   cdnConfigId?: string | null;
   cdnConfig?: CdnConfig | null;
 };
@@ -33,6 +36,8 @@ export type StorageUploadResult = {
   cdnConfigId: string;
   storageKey: string;
   publicUrl: string | null;
+  checksum?: string;
+  size?: number;
 };
 
 const VAULT_PREFIX = 'vault:';
@@ -41,23 +46,32 @@ const DEFAULT_URL_TTL_SECONDS = 3600;
 @Injectable()
 export class StorageService {
   private readonly logger = new Logger(StorageService.name);
-  private readonly thresholdCache = new Map<string, { value: boolean | null; expiresAt: number }>();
+  private readonly thresholdCache = new Map<string, { revision: string; value: boolean | null; expiresAt: number }>();
 
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly registry: StorageAdapterRegistry,
+    @Optional() private readonly replicas?: ReplicaService,
   ) {}
 
   async upload(projectId: string, params: StorageUploadParams): Promise<StorageUploadResult> {
-    const config = await this.getActiveStorage(projectId);
+    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry);
+    const config = await replicas.getLocalStorage(projectId);
     const storageKey = normalizeStorageKey(params.key);
+    const checksum = createHash('sha256').update(params.buffer).digest('hex');
+    await this.replicas?.assertImmutable(projectId, storageKey, BigInt(params.buffer.length), checksum);
     const result = await this.registry.adapter(config.provider).upload(config, { ...params, key: storageKey });
+    if (result.storageKey !== storageKey) throw new Error('本地存储返回了不同的不可变 key。');
+    await replicas.verifyLocalObject(config, storageKey, BigInt(params.buffer.length), checksum);
+    await this.replicas?.recordLocalAndEnqueue(projectId, config.id, storageKey, BigInt(params.buffer.length), checksum);
 
     return {
       cdnConfigId: config.id,
       storageKey: result.storageKey,
-      publicUrl: result.publicUrl ?? null,
+      publicUrl: null,
+      checksum,
+      size: params.buffer.length,
     };
   }
 
@@ -68,6 +82,12 @@ export class StorageService {
 
     const runtime = this.runtimeConfig(cdnConfig);
     await this.registry.adapter(runtime.provider).remove(runtime, normalizeStorageKey(key));
+  }
+
+  async materializeUploadedObject(projectId: string, configId: string, key: string, size: bigint | number | undefined,
+    checksum: string | null | undefined, mimeType: string, originalName: string): Promise<StorageUploadResult> {
+    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry);
+    return replicas.materializeUploadedObject(projectId, configId, key, size, checksum, mimeType, originalName);
   }
 
   async getDownloadTarget(
@@ -84,30 +104,30 @@ export class StorageService {
     key: string,
     expiresSeconds = DEFAULT_URL_TTL_SECONDS,
     range?: { start?: number; end?: number },
-    options: StorageTargetOptions = {},
+    _options: StorageTargetOptions = {},
   ): Promise<StorageDownloadTarget> {
+    if (this.replicas) return this.replicas.getDownloadTargetForKey(file, key, range);
     const config = this.runtimeConfigForFile(file);
     const adapter = this.registry.adapter(config.provider);
     const storageKey = normalizeStorageKey(key);
 
     if (config.provider === CdnProvider.LOCAL) {
-      return adapter.getDownloadTarget?.(config, storageKey, range) ?? this.emptyTarget();
+      const target = await adapter.getDownloadTarget?.(config, storageKey);
+      if (!target?.stream) throw new NotFoundException('存储对象不可读取。');
+      const current = storageKey === normalizeStorageKey(file.storageKey);
+      return verifiedTarget(await spoolVerifiedStream(target.stream, current ? file.size : undefined, current ? file.checksum : undefined), range, file.mimeType);
     }
 
     const url = await adapter.getDownloadUrl(config, storageKey, expiresSeconds);
 
-    // Full-body reads can hand the client the signed CDN URL directly. Ranged
-    // reads cannot: the caller stamps Content-Range from the requested byte range,
-    // so the body has to be proxied back through the API with that exact range.
-    if (options.preferRedirect !== false && !range) {
-      return { type: 'redirect', url };
-    }
-
-    return this.streamRemote(url, range);
+    const target = await this.streamRemote(url);
+    const current = storageKey === normalizeStorageKey(file.storageKey);
+    return verifiedTarget(await spoolVerifiedStream(target.stream!, current ? file.size : undefined, current ? file.checksum : undefined), range, file.mimeType);
   }
 
   /** Copy an object into a selected config without removing the source object. */
   async copyToConfig(file: StorageFileInput, targetConfigId: string): Promise<StorageUploadResult> {
+    if (this.replicas) return this.replicas.copyToConfig(file, targetConfigId);
     if (!file.cdnConfig || file.cdnConfigId === targetConfigId) {
       throw new Error('源文件或目标存储配置无效。');
     }
@@ -160,7 +180,7 @@ export class StorageService {
     let current = project.activeCdnConfig;
     if (!current) {
       current = await this.prisma.cdnConfig.findFirst({
-        where: { provider: CdnProvider.LOCAL, enabled: true, projectId: null },
+        where: { enabled: true, projectId: null, projectBindings: { some: { projectId } } },
         orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
       });
     }
@@ -168,7 +188,7 @@ export class StorageService {
 
     if (current.autoFailover && await this.configAtFailoverThreshold(current)) {
       const candidates = await this.prisma.cdnConfig.findMany({
-        where: { enabled: true, id: { not: current.id }, OR: [{ projectId: null }, { projectId }] },
+        where: { enabled: true, id: { not: current.id }, projectId: null, projectBindings: { some: { projectId } } },
         orderBy: [{ priority: 'asc' }, { id: 'asc' }],
       });
       const candidateStates = await Promise.all(candidates.map(async (candidate) => ({
@@ -183,53 +203,39 @@ export class StorageService {
       }
 
       const switched = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
+        const binding = await tx.projectStorageBinding.findUnique({ where: { projectId_configId: { projectId, configId: target.id } } });
+        if (!binding) return false;
         const changed = await tx.project.updateMany({
           where: { id: projectId, activeCdnConfigId: project.activeCdnConfigId },
           data: { activeCdnConfigId: target.id },
         });
         if (changed.count !== 1) return false;
-        await tx.task.create({
-          data: {
-            projectId,
-            type: 'STORAGE_MIGRATION',
-            title: `存储自动迁移：${current!.name} → ${target.name}`,
-            status: 'RUNNING',
-            progress: 0,
-            detail: {
-              sourceConfigId: current!.id,
-              targetConfigId: target.id,
-              cursor: '',
-              scanned: 0,
-              migrated: 0,
-              skipped: 0,
-              failed: 0,
-              failures: [],
-              batchSize: 20,
-              trigger: 'quota-failover',
-            },
-          },
-        });
         return true;
       });
 
       if (switched) return this.runtimeConfig(target);
       const latest = await this.prisma.project.findUnique({ where: { id: projectId }, include: { activeCdnConfig: true } });
-      if (latest?.activeCdnConfig?.enabled) return this.runtimeConfig(latest.activeCdnConfig);
+      if (latest?.activeCdnConfig?.enabled && latest.activeCdnConfigId !== current.id) return this.runtimeConfig(latest.activeCdnConfig);
       throw new Error('存储目标刚刚被其他请求切换，请重试上传。');
     }
     return this.runtimeConfig(current);
   }
 
   private async configAtFailoverThreshold(config: CdnConfig): Promise<boolean | null> {
+    const revision = JSON.stringify([
+      config.updatedAt?.getTime(), config.storageQuotaBytes?.toString(), config.manualStorageUsedBytes?.toString(),
+      config.trafficQuotaBytes?.toString(), config.manualTrafficUsedBytes?.toString(), config.failoverThresholdPercent,
+    ]);
     const cached = this.thresholdCache.get(config.id);
-    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    if (cached?.revision === revision && cached.expiresAt > Date.now()) return cached.value;
     const runtime = this.runtimeConfig(config);
     let snapshot: { storageUsedBytes?: number | null; storageQuotaBytes?: number | null; trafficUsedBytes?: number | null; trafficQuotaBytes?: number | null } = {};
     try {
       const adapter = this.registry.adapter(config.provider);
       if (adapter.getUsage) snapshot = await adapter.getUsage(runtime);
-    } catch (error) {
-      this.logger.warn(`获取存储用量失败 config=${config.id}: ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+      this.logger.warn(`获取存储用量失败 config=${config.id}。`);
     }
     const storageUsed = resolveUsageValue(snapshot.storageUsedBytes, config.manualStorageUsedBytes);
     const storageQuota = resolveUsageValue(snapshot.storageQuotaBytes, config.storageQuotaBytes);
@@ -242,7 +248,7 @@ export class StorageService {
       trafficUsedBytes: trafficUsed.value,
       trafficQuotaBytes: trafficQuota.value,
     });
-    this.thresholdCache.set(config.id, { value, expiresAt: Date.now() + 30_000 });
+    this.thresholdCache.set(config.id, { revision, value, expiresAt: Date.now() + 30_000 });
     return value;
   }
 
@@ -338,18 +344,10 @@ export class StorageService {
   }
 
   async createDirectUploadCredential(
-    projectId: string,
-    params: { fileName: string; mimeType: string; size: number; folderPath?: string | null },
+    _projectId: string,
+    _params: { fileName: string; mimeType: string; size: number; folderPath?: string | null },
   ): Promise<DirectUploadCredential | null> {
-    const config = await this.getActiveStorage(projectId);
-    const adapter = this.registry.adapter(config.provider);
-
-    if (!adapter.createDirectUpload) {
-      return null;
-    }
-
-    const key = this.buildKey(projectId, params.fileName, params.folderPath ?? null);
-    return adapter.createDirectUpload(config, { key, ...params }, 3600);
+    return null;
   }
 
   private runtimeConfigForFile(file: StorageFileInput): RuntimeCdnConfig {
@@ -390,15 +388,6 @@ export class StorageService {
     return this.runtimeConfig(config);
   }
 
-  private buildKey(projectId: string, fileName: string, folderPath: string | null): string {
-    const safeFolder = (folderPath ?? '')
-      .split('/')
-      .map((part) => part.replace(/[^\w.-]+/g, '_'))
-      .filter(Boolean)
-      .join('/');
-    const safeName = fileName.replace(/[^\w.-]+/g, '_');
-    return [projectId, safeFolder, `${Date.now()}-${safeName}`].filter(Boolean).join('/');
-  }
 
   /** Proxy a signed remote URL, optionally honoring a single byte range. */
   private async streamRemote(
@@ -415,16 +404,15 @@ export class StorageService {
     let response: Response;
     try {
       response = await fetch(url, { headers, signal: AbortSignal.timeout(60_000) });
-    } catch (error) {
-      this.logger.warn(
-        `远程存储读取失败：${error instanceof Error ? error.message : String(error)}`,
-      );
-      return this.emptyTarget();
+    } catch {
+      this.logger.warn('远程存储读取失败。');
+      throw new NotFoundException('远程存储连接失败，文件不可读取。');
     }
 
     if (!response.ok || !response.body) {
       this.logger.warn(`远程存储返回 ${response.status}，无法转发文件流。`);
-      return this.emptyTarget();
+      await response.body?.cancel();
+      throw new NotFoundException('远程存储对象不可读取。');
     }
 
     const rawLength = response.headers.get('content-length');
@@ -438,9 +426,6 @@ export class StorageService {
     };
   }
 
-  private emptyTarget(): StorageDownloadTarget {
-    return { type: 'stream', stream: Readable.from([]) };
-  }
 }
 
 function normalizeStorageKey(key: string): string {

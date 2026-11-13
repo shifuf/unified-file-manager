@@ -11,6 +11,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  type OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AuditAction, Prisma, UserRole, type Backup } from '@prisma/client';
@@ -112,7 +113,7 @@ const MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024;
  * provider and are referenced by `cdnConfigId` + `storageKey`.
  */
 @Injectable()
-export class BackupService {
+export class BackupService implements OnModuleInit {
   private readonly logger = new Logger(BackupService.name);
 
   constructor(
@@ -121,6 +122,16 @@ export class BackupService {
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    // Archive creation runs inside the request in this API process. A stored
+    // RUNNING record at startup has no surviving task that can complete it.
+    const result = await this.prisma.backup.updateMany({
+      where: { status: 'RUNNING' },
+      data: { status: 'FAILED', message: '服务重启中断了备份，请重新创建。', finishedAt: new Date() },
+    });
+    if (result.count) this.logger.warn(`已恢复 ${result.count} 条中断备份的失败状态。`);
+  }
 
   async list(user: RequestUser): Promise<BackupView[]> {
     this.assertCanManageBackups(user);
@@ -699,7 +710,10 @@ export class BackupService {
   }
 
   private errorMessage(error: unknown): string {
-    return error instanceof Error && error.message ? error.message : String(error);
+    const message = error instanceof Error && error.message ? error.message : String(error);
+    // MySQL TEXT is limited to 64KB. A verbose upstream error must not make
+    // recording the FAILED state fail with another data-too-long error.
+    return message.length > 8_000 ? `${message.slice(0, 8_000)}…（错误信息已截断）` : message;
   }
 
   private async readStream(stream: NodeJS.ReadableStream): Promise<Buffer> {

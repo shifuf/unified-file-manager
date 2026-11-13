@@ -7,12 +7,30 @@ import type { UserProfile } from '@/types';
 
 const USER_STORAGE_KEY = 'ufm_user_profile';
 
+function readCachedProfile(): UserProfile | null {
+  try {
+    const cached = localStorage.getItem(USER_STORAGE_KEY);
+    if (!cached) return null;
+    const parsed: unknown = JSON.parse(cached);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const user = parsed as Partial<UserProfile>;
+      if (typeof user.id === 'string' && user.id.trim() &&
+          typeof user.username === 'string' && user.username.trim() &&
+          typeof user.displayName === 'string' && user.role === 'SUPER_ADMIN' &&
+          (user.mustChangePassword === undefined || typeof user.mustChangePassword === 'boolean') &&
+          (user.totpEnabled === undefined || typeof user.totpEnabled === 'boolean')) {
+        return user as UserProfile;
+      }
+    }
+  } catch { /* Corrupt or unavailable browser storage must not prevent login. */ }
+  try { localStorage.removeItem(USER_STORAGE_KEY); } catch { /* Cookie login still works. */ }
+  return null;
+}
+
 export const useAuthStore = defineStore('auth', () => {
   // Session is primarily httpOnly cookies. We keep a soft logged-in flag + profile
   // so the UI can render without reading tokens from JS (XSS-resistant).
-  const currentUser = ref<UserProfile | null>(
-    localStorage.getItem(USER_STORAGE_KEY) ? JSON.parse(String(localStorage.getItem(USER_STORAGE_KEY))) : null,
-  );
+  const currentUser = ref<UserProfile | null>(readCachedProfile());
   const sessionKnown = ref(Boolean(currentUser.value));
   const loggedIn = computed(() => sessionKnown.value || Boolean(currentUser.value));
   // Single-operator console: any authenticated session is the super admin.

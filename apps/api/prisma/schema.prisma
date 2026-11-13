@@ -185,6 +185,8 @@ model Project {
   updatedAt            DateTime           @updatedAt
   deletedAt            DateTime?
   cdnConfigs           CdnConfig[]        @relation("LegacyProjectCdnConfigs")
+  storageBindings      ProjectStorageBinding[]
+  storageReplicas      StorageReplica[]
   activeCdnConfig      CdnConfig?         @relation("ProjectActiveStorageConfig", fields: [activeCdnConfigId], references: [id], onDelete: SetNull)
   files                ManagedFile[]
   auditLogs            AuditLog[]
@@ -223,10 +225,23 @@ model CdnConfig {
   updatedAt      DateTime      @updatedAt
   project        Project?      @relation("LegacyProjectCdnConfigs", fields: [projectId], references: [id], onDelete: SetNull)
   activeProjects Project[]     @relation("ProjectActiveStorageConfig")
+  projectBindings ProjectStorageBinding[]
+  storageReplicas StorageReplica[]
   files          ManagedFile[]
 
   @@index([projectId, active])
   @@index([enabled, provider])
+}
+
+model ProjectStorageBinding {
+  projectId String
+  configId  String
+  createdAt DateTime @default(now())
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  config    CdnConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, configId])
+  @@index([configId])
 }
 
 model ManagedFile {
@@ -276,6 +291,30 @@ model ManagedFile {
   @@index([originalName])
 }
 
+model StorageReplica {
+  id            String    @id @default(cuid())
+  projectId     String    @db.VarChar(128)
+  configId      String    @db.VarChar(128)
+  storageKey    String    @db.VarChar(512)
+  size          BigInt
+  checksum      String?   @db.VarChar(128)
+  status        String    @default("PENDING") @db.VarChar(16)
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  leaseOwner    String?   @db.VarChar(128)
+  leaseUntil    DateTime?
+  lastError     String?   @db.VarChar(512)
+  verifiedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  config        CdnConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, storageKey, configId])
+  @@index([status, nextAttemptAt])
+  @@index([leaseUntil])
+}
+
 model FileDerivative {
   id         String           @id @default(cuid())
   fileId     String
@@ -313,6 +352,8 @@ model ShareLink {
   updatedAt     DateTime    @updatedAt
   file          ManagedFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
 
+  downloadSessions ShareDownloadSession[]
+
   @@index([fileId, enabled])
   @@index([expiresAt])
 }
@@ -330,6 +371,25 @@ model ProjectSecret {
   project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId, enabled])
+}
+
+model ShareDownloadSession {
+  id            String    @id @default(cuid())
+  ticketHash    String    @unique @db.VarChar(64)
+  shareId       String?
+  folderShareId String?
+  fileId        String
+  policyHash    String    @db.VarChar(64)
+  ip            String    @db.VarChar(64)
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  share         ShareLink? @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  folderShare   FolderShareLink? @relation(fields: [folderShareId], references: [id], onDelete: Cascade)
+
+  @@index([shareId])
+  @@index([folderShareId])
+  @@index([expiresAt])
 }
 
 model UploadCredential {
@@ -466,6 +526,7 @@ model FolderShareLink {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   project       Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  downloadSessions ShareDownloadSession[]
 
   @@index([projectId, folderPath, enabled])
   @@index([expiresAt])

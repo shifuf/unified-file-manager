@@ -5,6 +5,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { AuditModule } from './audit/audit.module';
 import { AuthModule } from './auth/auth.module';
 import { CdnModule } from './cdn/cdn.module';
+import { DashboardModule } from './dashboard/dashboard.module';
 import { ThrottleGuard } from './common/guards/throttle.guard';
 import { EventsModule } from './events/events.module';
 import { FilesModule } from './files/files.module';
@@ -41,6 +42,7 @@ function resolveEnvFilePath(): string[] {
     ProjectsModule,
     StorageModule,
     CdnModule,
+    DashboardModule,
     MediaModule,
     SearchModule,
     FilesModule,

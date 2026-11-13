@@ -1,12 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { CdnProvider } from '@prisma/client';
 import OSS from 'ali-oss';
+import { createReadStream } from 'node:fs';
 
 import type {
   DirectUploadCredential,
   RuntimeCdnConfig,
   StorageAdapter,
   StorageUploadParams,
+  StorageUploadFileParams,
   StoredObject,
 } from '../storage.types';
 import { configText, hostnameOnly, publicUrlFromDomain, withScheme } from '../storage.util';
@@ -22,6 +24,16 @@ export class AliyunOssAdapter implements StorageAdapter {
       headers: { 'Content-Type': params.mimeType },
     });
 
+    return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
+  }
+
+  async uploadFile(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject> {
+    const body = createReadStream(params.path);
+    try {
+      const client = this.client(config) as unknown as { putStream(key: string, stream: typeof body, options: Record<string, unknown>): Promise<unknown> };
+      await client.putStream(params.key, body, { mime: params.mimeType, timeout: 10 * 60_000,
+        contentLength: params.size, headers: { 'Content-Type': params.mimeType } });
+    } finally { body.destroy(); }
     return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
   }
 

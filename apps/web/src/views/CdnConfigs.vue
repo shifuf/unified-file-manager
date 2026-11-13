@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">存储配置</h1>
-        <p class="page-subtitle">维护当前项目或全局共享的本地、七牛云、又拍云或阿里 OSS 存储配置。</p>
+        <p class="page-subtitle">统一维护存储账户，并分配给可使用这些存储的项目。</p>
       </div>
       <el-button
         v-if="canCreateConfig"
@@ -11,23 +11,13 @@
         :icon="Plus"
         @click="openCreateDialog"
       >
-        {{ createButtonLabel }}
+        新建全局配置
       </el-button>
     </div>
 
     <section class="surface">
       <div class="surface-body">
         <div class="toolbar">
-          <el-select
-            v-model="selectedProjectId"
-            filterable
-            clearable
-            placeholder="选择项目以标记生效配置"
-            style="width: 300px"
-            @change="reload"
-          >
-            <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
-          </el-select>
           <el-button :icon="Refresh" @click="reload">刷新</el-button>
         </div>
 
@@ -38,14 +28,19 @@
               <el-tag>{{ providerLabel(row.provider) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="范围" width="120">
+          <el-table-column label="可使用项目" min-width="220">
             <template #default="{ row }">
-              <el-tag :type="row.projectId ? 'success' : 'info'">{{ scopeLabel(row) }}</el-tag>
+              <div v-if="row.projects?.length" class="assigned-project-tags">
+                <el-tag v-for="project in row.projects" :key="project.id" :type="project.current ? 'success' : 'info'">
+                  {{ project.name }}{{ project.current ? ' · 当前' : '' }}
+                </el-tag>
+              </div>
+              <span v-else class="muted">未分配项目</span>
             </template>
           </el-table-column>
-          <el-table-column :label="selectedProjectId ? '当前项目状态' : '配置状态'" width="140">
+          <el-table-column label="配置状态" width="110">
             <template #default="{ row }">
-              <el-tag :type="row.active ? 'success' : 'info'">{{ row.active ? '生效' : '可选' }}</el-tag>
+              <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '可用' : '停用' }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="配置摘要" min-width="220" show-overflow-tooltip>
@@ -112,17 +107,16 @@
                   刷新用量
                 </el-button>
                 <el-button
-                  v-if="canManageSelectedProject"
+                  v-if="authStore.isSuperAdmin"
                   link
                   type="primary"
-                  :disabled="row.active"
-                  @click="activate(row)"
+                  @click="openAssignmentDialog(row)"
                 >
-                  设为当前项目存储
+                  分配项目
                 </el-button>
-                <el-button v-if="canEditConfig(row)" link type="primary" @click="openEditDialog(row)">编辑</el-button>
+                <el-button v-if="authStore.isSuperAdmin" link type="primary" @click="openEditDialog(row)">编辑</el-button>
                 <el-button
-                  v-if="canRemoveConfig(row)"
+                  v-if="authStore.isSuperAdmin"
                   link
                   type="danger"
                   :disabled="row.active"
@@ -130,7 +124,7 @@
                 >
                   删除
                 </el-button>
-                <span v-if="!canManageSelectedProject && !canEditConfig(row) && !canRemoveConfig(row)" class="muted">-</span>
+                <span v-if="!authStore.isSuperAdmin" class="muted">-</span>
               </div>
             </template>
           </el-table-column>
@@ -181,9 +175,6 @@
           <el-checkbox v-model="form.autoFailover">达到阈值后自动切换新上传目标</el-checkbox>
           <div class="field-help">平台用量优先使用平台回报；查不到时使用这里录入的用量。应用访问统计不等同于 CDN 账单流量。</div>
         </div>
-        <el-checkbox v-if="selectedProjectId && canManageSelectedProject" v-model="form.selectForProject">
-          保存后设为当前项目存储
-        </el-checkbox>
       </el-form>
 
       <div v-if="draftTestResult" class="draft-test-panel">
@@ -222,6 +213,23 @@
             </el-tooltip>
           </div>
         </div>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="assignmentDialogVisible" title="分配项目" width="560px">
+      <div v-loading="assignmentLoading" class="assignment-panel">
+        <p class="assignment-description">选择可使用「{{ assignmentConfig?.name }}」的项目。一个项目可以使用多个存储，当前上传存储在项目详情中选择。</p>
+        <el-checkbox-group v-model="assignedProjectIds" class="assignment-projects" :disabled="assignmentLoading || assignmentSubmitting">
+          <el-checkbox v-for="project in projects" :key="project.id" :value="project.id">
+            {{ project.name }}
+            <el-tag v-if="currentAssignmentProjectIds.includes(project.id)" size="small" type="success">当前存储</el-tag>
+          </el-checkbox>
+        </el-checkbox-group>
+        <el-empty v-if="!assignmentLoading && projects.length === 0" description="暂无可分配的项目" :image-size="64" />
+      </div>
+      <template #footer>
+        <el-button :disabled="assignmentSubmitting" @click="assignmentDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="assignmentSubmitting" :disabled="assignmentLoading" @click="saveAssignments">保存</el-button>
       </template>
     </el-dialog>
 
@@ -279,14 +287,11 @@
 import { Connection, Plus, Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
 import { computed, onMounted, reactive, ref } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
 
 import { cdnApi, projectApi } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import type { CdnConfig, CdnProvider, Project, StorageHealthResult, StorageUsageResult } from '@/types';
 
-const route = useRoute();
-const router = useRouter();
 const authStore = useAuthStore();
 const loading = ref(false);
 const submitting = ref(false);
@@ -297,13 +302,13 @@ const projects = ref<Project[]>([]);
 const configs = ref<CdnConfig[]>([]);
 const healthDialogVisible = ref(false);
 const healthResult = ref<StorageHealthResult | null>(null);
-const selectedProjectId = ref(String(route.query.projectId || ''));
-const selectedProject = computed(() => projects.value.find((project) => project.id === selectedProjectId.value));
-const canManageSelectedProject = computed(() => Boolean(selectedProject.value?.canManage));
-const canCreateConfig = computed(() => authStore.isSuperAdmin || canManageSelectedProject.value);
-const createButtonLabel = computed(() =>
-  selectedProjectId.value && canManageSelectedProject.value ? '新建项目配置' : '新建全局配置',
-);
+const canCreateConfig = computed(() => authStore.isSuperAdmin);
+const assignmentDialogVisible = ref(false);
+const assignmentLoading = ref(false);
+const assignmentSubmitting = ref(false);
+const assignmentConfig = ref<CdnConfig | null>(null);
+const assignedProjectIds = ref<string[]>([]);
+const currentAssignmentProjectIds = ref<string[]>([]);
 const dialogVisible = ref(false);
 const editingConfig = ref<CdnConfig | null>(null);
 const draftTesting = ref(false);
@@ -395,7 +400,6 @@ const form = reactive({
   provider: 'LOCAL' as CdnProvider,
   name: '',
   configValues: {} as Record<string, string>,
-  selectForProject: false,
   priority: 100,
   failoverThresholdPercent: 90,
   storageQuotaGiB: null as number | null,
@@ -466,43 +470,15 @@ function summarizeConfig(config: CdnConfig): string {
   return parts.length > 0 ? parts.join(' / ') : '未填写';
 }
 
-function scopeLabel(config: CdnConfig): string {
-  return config.projectId ? '当前项目' : '全局共享';
-}
-
-function configProjectScope(config: CdnConfig): string | undefined {
-  return config.projectId ? config.projectId : undefined;
-}
-
-function canEditConfig(config: CdnConfig): boolean {
-  if (config.projectId) {
-    return config.projectId === selectedProjectId.value && canManageSelectedProject.value;
-  }
-
-  return authStore.isSuperAdmin;
-}
-
-function canRemoveConfig(config: CdnConfig): boolean {
-  return canEditConfig(config);
-}
-
 function fillTemplate(): void {
   const source = editingConfig.value?.provider === form.provider ? editingConfig.value.config : {};
   form.configValues = buildConfigValues(form.provider, source);
 }
 
-async function loadProjects(): Promise<void> {
-  projects.value = await projectApi.list();
-  selectedProjectId.value = selectedProjectId.value || projects.value[0]?.id || '';
-  await reload();
-}
-
 async function reload(): Promise<void> {
-  const query = selectedProjectId.value ? { projectId: selectedProjectId.value } : {};
-  void router.replace({ path: '/storage-configs', query });
   loading.value = true;
   try {
-    configs.value = await cdnApi.list(selectedProjectId.value || undefined);
+    configs.value = await cdnApi.list();
     void loadUsageForCloudConfigs();
   } finally {
     loading.value = false;
@@ -518,7 +494,7 @@ async function loadUsage(config: CdnConfig, force = false): Promise<void> {
   }
   usageLoadingId.value = config.id;
   try {
-    const usage = await cdnApi.usage(config.id, configProjectScope(config));
+    const usage = await cdnApi.usage(config.id);
     usageByConfigId.value = { ...usageByConfigId.value, [config.id]: usage };
   } catch {
     usageByConfigId.value = {
@@ -565,14 +541,13 @@ function openCreateDialog(): void {
   form.provider = 'ALIYUN';
   form.name = '';
   Object.assign(form, { priority: 100, failoverThresholdPercent: 90, storageQuotaGiB: null, manualStorageUsedGiB: null, trafficQuotaGiB: null, manualTrafficUsedGiB: null, autoFailover: false });
-  form.selectForProject = Boolean(selectedProjectId.value && canManageSelectedProject.value);
   form.configValues = buildConfigValues(form.provider);
   resetDraftTest();
   dialogVisible.value = true;
 }
 
 function openEditDialog(config: CdnConfig): void {
-  if (!canEditConfig(config)) {
+  if (!authStore.isSuperAdmin) {
     return;
   }
 
@@ -588,7 +563,6 @@ function openEditDialog(config: CdnConfig): void {
     manualTrafficUsedGiB: config.manualTrafficUsedBytes == null ? null : Number(config.manualTrafficUsedBytes) / 1073741824,
     autoFailover: config.autoFailover ?? false,
   });
-  form.selectForProject = false;
   form.configValues = buildConfigValues(config.provider, config.config);
   resetDraftTest();
   dialogVisible.value = true;
@@ -636,11 +610,8 @@ async function testDraftConfig(): Promise<void> {
   try {
     const payload = { provider: form.provider, name: form.name, config: parsedConfig };
     const result = editingConfig.value
-      ? await cdnApi.testDraftForConfig(editingConfig.value.id, payload, configProjectScope(editingConfig.value))
-      : await cdnApi.testDraft(
-          payload,
-          selectedProjectId.value && canManageSelectedProject.value ? selectedProjectId.value : undefined,
-        );
+      ? await cdnApi.testDraftForConfig(editingConfig.value.id, payload)
+      : await cdnApi.testDraft(payload);
 
     draftTestResult.value = result;
     draftTestedKey.value = fingerprint;
@@ -676,11 +647,11 @@ async function submitConfig(): Promise<void> {
   submitting.value = true;
   try {
     if (editingConfig.value) {
-      if (!canEditConfig(editingConfig.value)) {
+      if (!authStore.isSuperAdmin) {
         return;
       }
 
-      const result = await cdnApi.update(editingConfig.value.id, {
+      await cdnApi.update(editingConfig.value.id, {
         provider: form.provider,
         name: form.name,
         config: parsedConfig,
@@ -691,18 +662,14 @@ async function submitConfig(): Promise<void> {
         manualStorageUsedBytes: form.manualStorageUsedGiB == null ? null : Math.round(form.manualStorageUsedGiB * 1073741824),
         trafficQuotaBytes: form.trafficQuotaGiB == null ? null : Math.round(form.trafficQuotaGiB * 1073741824),
         manualTrafficUsedBytes: form.manualTrafficUsedGiB == null ? null : Math.round(form.manualTrafficUsedGiB * 1073741824),
-      }, configProjectScope(editingConfig.value));
-      if (form.selectForProject && selectedProjectId.value) {
-        await cdnApi.activate(selectedProjectId.value, result.id);
-      }
+      });
       ElMessage.success('存储配置已更新。');
     } else {
       if (!canCreateConfig.value) {
         return;
       }
 
-      const projectScope = selectedProjectId.value && canManageSelectedProject.value ? selectedProjectId.value : undefined;
-      const result = await cdnApi.create({
+      await cdnApi.create({
         provider: form.provider,
         name: form.name,
         config: parsedConfig,
@@ -713,10 +680,7 @@ async function submitConfig(): Promise<void> {
         manualStorageUsedBytes: form.manualStorageUsedGiB == null ? null : Math.round(form.manualStorageUsedGiB * 1073741824),
         trafficQuotaBytes: form.trafficQuotaGiB == null ? null : Math.round(form.trafficQuotaGiB * 1073741824),
         manualTrafficUsedBytes: form.manualTrafficUsedGiB == null ? null : Math.round(form.manualTrafficUsedGiB * 1073741824),
-      }, projectScope);
-      if (form.selectForProject && selectedProjectId.value) {
-        await cdnApi.activate(selectedProjectId.value, result.id);
-      }
+      });
       ElMessage.success('存储配置已创建。');
     }
     dialogVisible.value = false;
@@ -767,18 +731,47 @@ function collectConfigValues(
   return config;
 }
 
-async function activate(config: CdnConfig): Promise<void> {
-  if (!selectedProjectId.value || !canManageSelectedProject.value) {
+async function openAssignmentDialog(config: CdnConfig): Promise<void> {
+  if (!authStore.isSuperAdmin) {
     return;
   }
+  assignmentConfig.value = config;
+  assignedProjectIds.value = [];
+  currentAssignmentProjectIds.value = [];
+  assignmentDialogVisible.value = true;
+  assignmentLoading.value = true;
+  try {
+    const [allProjects, bindings] = await Promise.all([projectApi.list(), cdnApi.projects(config.id)]);
+    projects.value = allProjects;
+    assignedProjectIds.value = bindings.map((project) => project.id);
+    currentAssignmentProjectIds.value = bindings.filter((project) => project.current).map((project) => project.id);
+  } catch {
+    assignmentDialogVisible.value = false;
+  } finally {
+    assignmentLoading.value = false;
+  }
+}
 
-  await cdnApi.activate(selectedProjectId.value, config.id);
-  ElMessage.success('项目存储配置已切换。');
-  await reload();
+async function saveAssignments(): Promise<void> {
+  if (!assignmentConfig.value || !authStore.isSuperAdmin || assignmentLoading.value) {
+    return;
+  }
+  assignmentSubmitting.value = true;
+  try {
+    const bindings = await cdnApi.assignProjects(assignmentConfig.value.id, assignedProjectIds.value);
+    assignmentConfig.value.projects = bindings;
+    assignmentConfig.value.active = bindings.some((project) => project.current);
+    assignmentDialogVisible.value = false;
+    ElMessage.success('项目分配已保存。');
+  } catch {
+    // The HTTP client displays the server reason; keep the choices available to revise.
+  } finally {
+    assignmentSubmitting.value = false;
+  }
 }
 
 async function removeConfig(config: CdnConfig): Promise<void> {
-  if (!canRemoveConfig(config)) {
+  if (!authStore.isSuperAdmin) {
     return;
   }
 
@@ -787,7 +780,7 @@ async function removeConfig(config: CdnConfig): Promise<void> {
     confirmButtonText: '确认删除',
     cancelButtonText: '取消',
   });
-  await cdnApi.remove(config.id, configProjectScope(config));
+  await cdnApi.remove(config.id);
   ElMessage.success('存储配置已删除。');
   await reload();
 }
@@ -795,7 +788,7 @@ async function removeConfig(config: CdnConfig): Promise<void> {
 async function testConfig(config: CdnConfig): Promise<void> {
   testingConfigId.value = config.id;
   try {
-    healthResult.value = await cdnApi.test(config.id, configProjectScope(config));
+    healthResult.value = await cdnApi.test(config.id);
     if (healthResult.value.usage) {
       usageByConfigId.value = {
         ...usageByConfigId.value,
@@ -808,12 +801,29 @@ async function testConfig(config: CdnConfig): Promise<void> {
   }
 }
 
-onMounted(loadProjects);
+onMounted(reload);
 </script>
 
 <style scoped>
 .data-table {
   margin-top: 14px;
+}
+
+.assigned-project-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.assignment-description {
+  margin-top: 0;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.assignment-projects {
+  display: grid;
+  gap: 8px;
 }
 
 .config-summary {

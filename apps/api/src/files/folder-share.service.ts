@@ -23,6 +23,8 @@ import { SettingsService } from '../settings/settings.service';
 import { CreateShareLinkDto } from './dto/create-share-link.dto';
 import { ShareIpAbuseService } from './share-ip-abuse.service';
 import { StorageService } from '../storage/storage.service';
+import { parseByteRange } from '../common/utils/http-range.util';
+import { consumeShareDownload, findShareDownloadSession, issueShareDownloadSession, requireVerifiedShareTarget, shareSessionIp } from './share-download-session.util';
 
 @Injectable()
 export class FolderShareService {
@@ -140,20 +142,16 @@ export class FolderShareService {
       projectId: share.projectId,
       status: FileStatus.ACTIVE,
 
-      ...(folderPath
-        ? {
-            OR: [{ folderPath }, { folderPath: { startsWith: `${folderPath}/` } }],
-          }
-        : {}),
-      ...(keyword
-        ? {
+      AND: [
+        ...(folderPath ? [{ OR: [{ folderPath }, { folderPath: { startsWith: `${folderPath}/` } }] }] : []),
+        ...(keyword ? [{
             OR: [
               { originalName: { contains: keyword } },
               { remark: { contains: keyword } },
               { tags: { contains: keyword } },
             ],
-          }
-        : {}),
+          }] : []),
+      ],
     };
 
     const [items, total] = await this.prisma.$transaction([
@@ -198,18 +196,22 @@ export class FolderShareService {
       ip?: string;
       allowPreviewOnly?: boolean;
       range?: { start?: number; end?: number };
-      /** Skip rate-limit + downloadCount (e.g. Range re-fetch after first counted hit). */
-      skipCount?: boolean;
+      rangeHeader?: string;
+      head?: boolean;
+      ticket?: string;
+      expires?: number;
     },
   ) {
     const share = await this.requireShare(token);
-    await this.assertAccess(share, password, meta.ip);
+    const session = await findShareDownloadSession(this.prisma, share, fileId, meta.ip, 'folder', meta.ticket, meta.expires);
+    await this.assertAccess(share, password, meta.ip, Boolean(session));
+    await this.shareIpAbuseService.assertNotBanned(shareSessionIp(meta.ip));
 
     if (share.previewOnly && !meta.allowPreviewOnly) {
       throw new ForbiddenException('该目录分享仅允许预览。');
     }
 
-    if (share.maxDownloads !== null && share.downloadCount >= share.maxDownloads) {
+    if (!session?.consumedAt && share.maxDownloads !== null && share.downloadCount >= share.maxDownloads) {
       throw new ForbiddenException('下载次数已用尽。');
     }
 
@@ -228,8 +230,44 @@ export class FolderShareService {
       throw new ForbiddenException('文件不在该分享目录下。');
     }
 
-    if (!meta.allowPreviewOnly && !meta.skipCount) {
-      const ip = (meta.ip || 'unknown').trim().replace(/^::ffff:/i, '') || 'unknown';
+    const size = Number(file.size);
+    const parsedRange = meta.range
+      ? parseByteRange(`bytes=${meta.range.start ?? 0}-${meta.range.end ?? size - 1}`, size)
+      : parseByteRange(meta.rangeHeader, size);
+    const result = { file, watermarkText: share.watermarkText,
+      range: parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
+      unsatisfiable: parsedRange === 'unsatisfiable' };
+    if (meta.head || result.unsatisfiable) return { ...result, target: { type: 'stream' as const } };
+    const range = result.range ? { start: result.range.start, end: result.range.end } : undefined;
+    const target = await requireVerifiedShareTarget(
+      await this.storageService.getDownloadTarget(file, 120, range, { preferRedirect: false }), result.range?.length ?? size,
+    );
+    try {
+      if (!meta.allowPreviewOnly) {
+        if (!session) await this.assertDownloadRateLimit(share, file, meta.ip);
+        const counted = await consumeShareDownload(this.prisma, share, 'folder', session?.id);
+        if (counted) await this.auditService.write({
+          action: AuditAction.FOLDER_SHARE_DOWNLOAD,
+          projectId: share.projectId,
+          detail: { shareId: share.id, fileId },
+        });
+      }
+    } catch (error) { target.stream?.destroy(); throw error; }
+    return { ...result, target };
+  }
+
+  async createDownloadSession(token: string, fileId: string, password?: string, meta: { ip?: string } = {}) {
+    const { file } = await this.getFileDownloadTarget(token, fileId, password, { ip: meta.ip, head: true });
+    const share = await this.requireShare(token);
+    await this.assertAccess(share, password, meta.ip);
+    await this.assertDownloadRateLimit(share, file, meta.ip);
+    const { ticket, expiresAt } = await issueShareDownloadSession(this.prisma, share, fileId, meta.ip, 'folder');
+    const base = resolvePublicBaseUrl(this.configService.get<string>('PUBLIC_URL')) ?? '';
+    return { url: `${base}/api/folder-shares/${share.token}/files/${fileId}/download?ticket=${ticket}&expires=${Math.floor(expiresAt.getTime() / 1000)}`, expiresAt };
+  }
+
+  private async assertDownloadRateLimit(share: { id: string; projectId: string }, file: { id: string; originalName: string }, clientIp?: string) {
+      const ip = shareSessionIp(clientIp);
       await this.shareIpAbuseService.assertNotBanned(ip);
       const rateKey = `share-dl:${ip}`;
       this.downloadRateLimiter.assertAllowed(
@@ -259,25 +297,6 @@ export class FolderShareService {
         });
       }
 
-      await this.prisma.folderShareLink.update({
-        where: { id: share.id },
-        data: { downloadCount: { increment: 1 } },
-      });
-      await this.auditService.write({
-        action: AuditAction.FOLDER_SHARE_DOWNLOAD,
-        projectId: share.projectId,
-        detail: { shareId: share.id, fileId },
-      });
-    }
-
-    return {
-      file,
-      // Force stream via API so each download hit is subject to IP rate limits (no CDN 302 bypass).
-      target: await this.storageService.getDownloadTarget(file, 120, meta.range, {
-        preferRedirect: false,
-      }),
-      watermarkText: share.watermarkText,
-    };
   }
 
   private async requireShare(token: string) {
@@ -304,8 +323,9 @@ export class FolderShareService {
     },
     password: string | undefined,
     ip?: string,
+    sessionValid = false,
   ) {
-    if (share.passwordHash) {
+    if (share.passwordHash && !sessionValid) {
       const ok = password ? await bcrypt.compare(password, share.passwordHash) : false;
       if (!ok) {
         throw new ForbiddenException('分享密码错误。');
@@ -349,7 +369,7 @@ export class FolderShareService {
     },
     publicBaseUrl?: string,
   ) {
-    const webPublicUrl = resolvePublicBaseUrl(publicBaseUrl, this.configService.get<string>('PUBLIC_URL'));
+    const webPublicUrl = resolvePublicBaseUrl(this.configService.get<string>('PUBLIC_URL'), publicBaseUrl);
     const path = `/folder-shares/${share.token}`;
     return {
       id: share.id,

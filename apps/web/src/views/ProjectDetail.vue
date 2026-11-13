@@ -51,20 +51,6 @@
         <div class="metric-label">重复文件</div>
         <div class="metric-value">{{ stats?.duplicateCount || 0 }}</div>
       </div>
-      <div v-if="activeCloudUsage" class="metric">
-        <div class="metric-label">当前云存储 · {{ activeCloudUsage.provider }}</div>
-        <div class="metric-value">{{ formatSize(activeCloudUsage.storageUsedBytes || 0) }}</div>
-        <div class="metric-sub">
-          <template v-if="activeCloudUsage.storageQuotaBytes != null">
-            配额 {{ formatSize(activeCloudUsage.storageQuotaBytes) }}
-          </template>
-          <template v-else>空间用量</template>
-          <span v-if="activeCloudUsage.trafficUsedBytes != null">
-            · 本月流量 {{ formatSize(activeCloudUsage.trafficUsedBytes) }}
-          </span>
-        </div>
-        <div v-if="activeCloudUsage.message" class="metric-sub muted">{{ activeCloudUsage.message }}</div>
-      </div>
     </section>
 
     <section class="surface">
@@ -74,7 +60,7 @@
             <div class="section-title">下载流量统计（近 {{ downloadDays }} 日）</div>
             <div class="muted">统计所有下载入口：后台、开放 API、公开访问、分享与 WebDAV。</div>
           </div>
-          <el-select v-model="downloadDays" size="small" style="width: 130px" @change="loadDownloadStats">
+          <el-select v-model="downloadDays" size="small" style="width: 130px" @change="changeDownloadDays">
             <el-option :value="1" label="近 1 日" />
             <el-option :value="7" label="近 7 日" />
             <el-option :value="30" label="近 30 日" />
@@ -82,19 +68,20 @@
           </el-select>
         </div>
 
-        <div class="metric-grid">
+        <el-alert v-if="downloadSummaryError" :title="downloadSummaryError" type="error" :closable="false" />
+        <div v-loading="downloadSummaryLoading" class="metric-grid">
           <div class="metric">
             <div class="metric-label">下载流量</div>
-            <div class="metric-value">{{ formatSize(downloadSummary?.totalBytes || 0) }}</div>
+            <div class="metric-value">{{ downloadSummary ? formatSize(downloadSummary.totalBytes) : '未知' }}</div>
           </div>
           <div class="metric">
-            <div class="metric-label">下载次数</div>
-            <div class="metric-value">{{ downloadSummary?.totalCount || 0 }}</div>
+            <div class="metric-label">下载请求数</div>
+            <div class="metric-value">{{ downloadSummary?.totalCount ?? '未知' }}</div>
           </div>
           <div class="metric">
             <div class="metric-label">成功 / 失败</div>
             <div class="metric-value small-value">
-              {{ downloadSummary?.successCount || 0 }} / {{ downloadSummary?.failedCount || 0 }}
+              {{ downloadSummary?.successCount ?? '未知' }} / {{ downloadSummary?.failedCount ?? '未知' }}
             </div>
           </div>
         </div>
@@ -126,7 +113,8 @@
           </el-col>
         </el-row>
 
-        <div class="muted" style="margin: 16px 0 8px">最近下载明细</div>
+        <div class="section-head" style="margin-top: 16px"><div class="muted">最近下载明细</div><el-button size="small" :loading="downloadLoading" @click="loadDownloadItems">刷新明细</el-button></div>
+        <el-alert v-if="downloadError" :title="downloadError" type="error" :closable="false" />
         <el-table v-loading="downloadLoading" :data="downloadItems" size="small" empty-text="暂无下载记录">
           <el-table-column label="时间" width="170">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
@@ -150,13 +138,15 @@
           </el-table-column>
         </el-table>
         <el-pagination
-          v-if="downloadTotal > downloadPageSize"
-          v-model:current-page="downloadPage"
+          :current-page="downloadPage"
           :page-size="downloadPageSize"
+          :page-sizes="pageSizes"
           :total="downloadTotal"
-          layout="prev, pager, next"
-          style="margin-top: 12px"
-          @current-change="loadDownloadStats"
+          layout="total, sizes, prev, pager, next, jumper"
+          class="panel-pagination"
+          :pager-count="5"
+          @update:current-page="changeDownloadPage"
+          @update:page-size="changeDownloadPageSize"
         />
       </div>
     </section>
@@ -228,8 +218,14 @@
 
     <section class="metric-grid">
       <div class="metric">
-        <div class="metric-label">当前存储</div>
-        <div class="metric-value small-value">{{ project?.activeCdnName || '未配置' }}</div>
+        <div class="metric-label">项目存储</div>
+        <div class="storage-tags">
+          <el-tag v-for="storage in projectStorages" :key="storage.id" :type="storage.enabled ? 'success' : 'info'" size="small">
+            {{ storage.name }} · {{ storage.enabled ? '启用' : '停用' }} · {{ storage.provider === 'LOCAL' ? '本地兜底' : `优先级 ${storage.priority}` }}
+          </el-tag>
+          <span v-if="!projectStorages.length" class="muted">暂无配置关系</span>
+        </div>
+        <div class="metric-sub">配置关系；文件的实际副本请查看文件详情。</div>
       </div>
       <div class="metric">
         <div class="metric-label">分享链接</div>
@@ -278,41 +274,73 @@
       <div class="surface-body">
         <div class="section-head">
           <div>
-            <div class="section-title">存储配置</div>
-            <div class="muted">当前项目可选择全局配置，也可以使用项目自己的存储配置。</div>
+            <div class="section-title">使用的存储</div>
+            <div class="muted">项目绑定配置；云按全局优先级升序、同值按配置 ID 排序，本地兜底。下载使用已校验且可用的副本。</div>
           </div>
-          <el-button :icon="Connection" @click="$router.push({ path: '/storage-configs', query: { projectId } })">
-            {{ project?.canManage ? '选择存储' : '查看存储' }}
+          <el-button :icon="Connection" @click="$router.push('/storage-configs')">
+            管理全局存储
           </el-button>
         </div>
-        <el-table :data="cdnConfigs" row-key="id">
+        <el-table :data="projectStorages" row-key="id" empty-text="暂无存储配置关系">
           <el-table-column prop="name" label="配置名称" min-width="180" />
           <el-table-column prop="provider" label="平台" width="120" />
-          <el-table-column label="范围" width="110">
-            <template #default="{ row }">
-              <el-tag :type="row.projectId ? 'success' : 'info'">{{ row.projectId ? '项目' : '全局' }}</el-tag>
-            </template>
-          </el-table-column>
           <el-table-column label="状态" width="120">
             <template #default="{ row }">
-              <el-tag :type="row.active ? 'success' : 'info'">{{ row.active ? '生效' : '备用' }}</el-tag>
+              <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="云用量" min-width="180">
+          <el-table-column label="下载排序" min-width="150">
+            <template #default="{ row }">{{ row.provider === 'LOCAL' ? '本地兜底' : `全局优先级 ${row.priority}` }}</template>
+          </el-table-column>
+          <el-table-column label="云账户用量" min-width="250">
             <template #default="{ row }">
-              <template v-if="row.active && activeCloudUsage && activeCloudUsage.configId === row.id">
-                {{ formatSize(activeCloudUsage.storageUsedBytes || 0) }}
-                <span v-if="activeCloudUsage.trafficUsedBytes != null" class="muted">
-                  · 流 {{ formatSize(activeCloudUsage.trafficUsedBytes) }}
+              <span v-if="row.provider === 'LOCAL'" class="muted">不适用</span>
+              <template v-else>
+                空间 {{ cloudUsages[row.id]?.storageUsedBytes != null ? formatSize(cloudUsages[row.id]!.storageUsedBytes!) : '未知' }}
+                <span class="muted">
+                  · 本月流量 {{ cloudUsages[row.id]?.trafficUsedBytes != null ? formatSize(cloudUsages[row.id]!.trafficUsedBytes!) : '未知' }}
                 </span>
+                <div v-if="cloudUsages[row.id]" class="muted">读取时间 {{ formatTime(cloudUsages[row.id]!.checkedAt) }} · {{ cloudUsages[row.id]!.message || '云账户口径，不是项目副本体积' }}</div>
+                <div v-if="cloudUsageErrors[row.id]" class="muted">{{ cloudUsageErrors[row.id] }}</div>
+                <el-button link type="primary" :loading="cloudUsageLoading[row.id]" @click="loadCloudUsage(row.id)">读取用量</el-button>
               </template>
-              <span v-else class="muted">—</span>
             </template>
-          </el-table-column>
-          <el-table-column label="更新时间" min-width="170">
-            <template #default="{ row }">{{ formatTime(row.updatedAt) }}</template>
           </el-table-column>
         </el-table>
+      </div>
+    </section>
+
+    <section class="surface replica-section">
+      <div class="surface-body">
+        <div class="section-head">
+          <div>
+            <div class="section-title">存储副本</div>
+            <div class="muted">索引记录包含历史版本与派生对象；状态统计覆盖完整项目。当前版本的原文件副本请查看文件详情。</div>
+          </div>
+          <div class="toolbar">
+            <el-button :loading="replicasLoading" @click="loadReplicas()">刷新状态</el-button>
+            <template v-if="project?.canManage">
+              <el-button :disabled="Boolean(replicaAction)" :loading="replicaAction === 'sync'" @click="runReplicaAction('sync')">{{ replicaCursors.sync ? '继续补同步' : '补同步' }}</el-button>
+              <el-button :disabled="Boolean(replicaAction)" :loading="replicaAction === 'inspect'" @click="runReplicaAction('inspect')">{{ replicaCursors.inspect ? '继续巡检' : '巡检' }}</el-button>
+              <el-button :disabled="Boolean(replicaAction)" :loading="replicaAction === 'retry'" @click="runReplicaAction('retry')">重试失败</el-button>
+            </template>
+          </div>
+        </div>
+        <el-alert v-if="replicasError" :title="replicasError" type="error" :closable="false" />
+        <p v-if="replicaResult" class="muted">{{ replicaResult }}</p>
+        <div class="toolbar" style="margin-bottom: 12px">
+          <el-tag v-for="state in replicaStates" :key="state" :type="replicaStatusType(state)">{{ replicaStatusLabel(state) }} {{ replicas ? (replicas.counts?.[state] || 0) : '未知' }}</el-tag>
+        </div>
+        <el-table v-loading="replicasLoading" :data="replicas?.items || []" row-key="id" empty-text="暂无副本记录">
+          <el-table-column label="存储" min-width="150"><template #default="{ row }">{{ row.configName || row.provider || row.configId }}</template></el-table-column>
+          <el-table-column prop="storageKey" label="对象" min-width="220" show-overflow-tooltip />
+          <el-table-column label="大小" width="110"><template #default="{ row }">{{ formatSize(Number(row.size)) }}</template></el-table-column>
+          <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="replicaStatusType(row.status)">{{ replicaStatusLabel(row.status) }}</el-tag></template></el-table-column>
+          <el-table-column prop="attempts" label="尝试次数" width="100" />
+          <el-table-column prop="lastError" label="最近失败" min-width="160" show-overflow-tooltip />
+          <el-table-column label="最近校验" min-width="170"><template #default="{ row }">{{ formatTime(row.verifiedAt) }}</template></el-table-column>
+        </el-table>
+        <el-pagination :current-page="replicaPage" :page-size="replicaPageSize" :page-sizes="pageSizes" :total="replicaTotal" layout="total, sizes, prev, pager, next, jumper" class="panel-pagination" :pager-count="5" @update:current-page="changeReplicaPage" @update:page-size="changeReplicaPageSize" />
       </div>
     </section>
 
@@ -423,8 +451,10 @@
       <div class="surface-body">
         <div class="section-head">
           <div class="section-title">最近文件</div>
+          <el-button :loading="filesLoading" @click="loadFiles">刷新</el-button>
         </div>
-        <el-table :data="files" row-key="id">
+        <el-alert v-if="filesError" :title="filesError" type="error" :closable="false" />
+        <el-table v-loading="filesLoading" :data="files" row-key="id" empty-text="暂无文件">
           <el-table-column prop="originalName" label="文件名" min-width="220" show-overflow-tooltip />
           <el-table-column prop="folderPath" label="目录" min-width="140">
             <template #default="{ row }">{{ row.folderPath || '/' }}</template>
@@ -436,9 +466,15 @@
           <el-table-column label="上传时间" min-width="170">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
           </el-table-column>
+          <el-table-column label="操作" width="90">
+            <template #default="{ row }"><el-button link type="primary" @click="openFileDetails(row)">详情</el-button></template>
+          </el-table-column>
         </el-table>
+        <el-pagination :current-page="filesPage" :page-size="filesPageSize" :page-sizes="pageSizes" :total="filesTotal" layout="total, sizes, prev, pager, next, jumper" class="panel-pagination" :pager-count="5" @update:current-page="changeFilesPage" @update:page-size="changeFilesPageSize" />
       </div>
     </section>
+
+    <FileStorageDetails v-model="detailsVisible" :file="detailFile" />
 
     <el-dialog v-model="secretDialogVisible" title="项目密钥" width="560px">
       <el-alert type="warning" show-icon :closable="false" title="AppSecret 仅展示本次，关闭后无法再次查看。" />
@@ -470,11 +506,12 @@
 <script setup lang="ts">
 import { Back, Connection, Download, Key, Upload, UploadFilled } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { http } from '@/api/http';
-import { cdnApi, downloadStatsApi, fileApi, projectApi, uploadCredentialApi } from '@/api/modules';
+import { cdnApi, downloadStatsApi, fileApi, projectApi, replicaApi, uploadCredentialApi } from '@/api/modules';
+import FileStorageDetails from '@/components/FileStorageDetails.vue';
 import type {
   CdnConfig,
   DownloadStatsSummary,
@@ -483,15 +520,114 @@ import type {
   ProjectSecret,
   ProjectStats,
   StorageUsageResult,
+  StorageReplicaStatus,
+  StorageReplicaSummary,
 } from '@/types';
 import { saveBlob } from '@/utils/io';
 
 const route = useRoute();
 const router = useRouter();
-const projectId = String(route.params.projectId);
+const projectId = computed(() => String(route.params.projectId || ''));
+let contextGeneration = 0;
+const panelReads = new Map<string, globalThis.AbortController>();
+
+function captureContext() {
+  const id = projectId.value;
+  const generation = contextGeneration;
+  return { id, current: () => generation === contextGeneration && id === projectId.value };
+}
+
+async function readPanel<T>(key: string, fetch: (id: string, signal: globalThis.AbortSignal) => Promise<T>, commit: (result: T) => void | Promise<void>, busy?: { value: boolean }, fail?: () => void, matches = () => true): Promise<void> {
+  const context = captureContext();
+  panelReads.get(key)?.abort();
+  const controller = new globalThis.AbortController();
+  panelReads.set(key, controller);
+  const current = () => context.current() && panelReads.get(key) === controller && !controller.signal.aborted;
+  if (busy) busy.value = true;
+  try {
+    const result = await fetch(context.id, controller.signal);
+    if (current() && matches()) await commit(result);
+  } catch {
+    if (current() && matches()) fail?.();
+  } finally {
+    if (current() && busy) busy.value = false;
+  }
+}
+
+const pageSizes = [10, 20, 50, 100];
+function validPage(value: number): number { return Number.isSafeInteger(value) && value > 0 ? value : 1; }
+function validPageSize(value: number): number { return pageSizes.includes(value) ? value : 20; }
+
+async function readPagedPanel<T extends { total?: number; page?: number }>(
+  key: string, pageState: { value: number }, sizeState: { value: number }, totalState: { value: number },
+  busy: { value: boolean }, error: { value: string },
+  fetch: (id: string, signal: globalThis.AbortSignal, page: number, pageSize: number) => Promise<T>,
+  commit: (result: T) => void, message: string, matches = () => true,
+): Promise<void> {
+  const page = validPage(pageState.value), pageSize = validPageSize(sizeState.value);
+  pageState.value = page; sizeState.value = pageSize; error.value = '';
+  await readPanel(key, (id, signal) => fetch(id, signal, page, pageSize), async result => {
+    const total = Number.isSafeInteger(result.total) && result.total! >= 0 ? result.total! : 0;
+    const last = Math.max(1, Math.ceil(total / pageSize));
+    totalState.value = total;
+    if (page > last && result.page !== last) {
+      pageState.value = last;
+      await readPagedPanel(key, pageState, sizeState, totalState, busy, error, fetch, commit, message, matches);
+      return;
+    }
+    pageState.value = Math.min(last, validPage(result.page ?? page));
+    commit(result);
+  }, busy, () => { error.value = message; }, () => pageState.value === page && sizeState.value === pageSize && matches());
+}
+
+const replicas = ref<StorageReplicaSummary | null>(null);
+const replicasLoading = ref(false);
+const replicasError = ref('');
+const replicaPage = ref(1);
+const replicaPageSize = ref(20);
+const replicaTotal = ref(0);
+const replicaAction = ref('');
+const replicaCursors = reactive<{ sync: string | null; inspect: string | null }>({ sync: null, inspect: null });
+const replicaResult = ref('');
+const replicaStates: StorageReplicaStatus[] = ['READY', 'PENDING', 'SYNCING', 'FAILED', 'MISSING', 'SKIPPED'];
+function replicaStatusLabel(status: StorageReplicaStatus): string {
+  return { READY: '已就绪', PENDING: '待同步', SYNCING: '同步中', FAILED: '失败', MISSING: '缺失', SKIPPED: '已解绑' }[status] || status;
+}
+function replicaStatusType(status: StorageReplicaStatus): 'success' | 'warning' | 'danger' | 'info' {
+  return status === 'READY' ? 'success' : status === 'FAILED' || status === 'MISSING' ? 'danger' : status === 'PENDING' || status === 'SYNCING' ? 'warning' : 'info';
+}
+async function loadReplicas(): Promise<void> {
+  await readPagedPanel('replicas', replicaPage, replicaPageSize, replicaTotal, replicasLoading, replicasError,
+    (id, signal, page, pageSize) => replicaApi.list(id, { signal, _silent: true }, { page, pageSize }),
+    result => { replicas.value = result; }, '副本状态暂不可用，已知记录仍保留，请刷新重试。');
+}
+async function changeReplicaPage(page: number): Promise<void> { replicaPage.value = validPage(page); await loadReplicas(); }
+async function changeReplicaPageSize(size: number): Promise<void> { replicaPageSize.value = validPageSize(size); replicaPage.value = 1; await loadReplicas(); }
+async function runReplicaAction(action: 'sync' | 'inspect' | 'retry'): Promise<void> {
+  if (!project.value?.canManage || replicaAction.value) return;
+  const context = captureContext();
+  replicaAction.value = action;
+  try {
+    const result = await replicaApi.run(context.id, action, action === 'retry' ? {} : { cursor: replicaCursors[action] || undefined, limit: 20 });
+    if (!context.current()) return;
+    if (action !== 'retry') replicaCursors[action] = result.nextCursor || null;
+    replicaResult.value = action === 'inspect'
+      ? `本批次巡检 ${result.scanned || 0} 项，就绪 ${result.ready || 0} 项，失败 ${result.failed || 0} 项。`
+      : action === 'sync'
+        ? `本批次扫描 ${result.scanned || 0} 项，加入同步队列 ${result.queued || 0} 项。`
+        : `已将 ${result.queued || 0} 个失败副本加入重试队列。`;
+    if (result.nextCursor) replicaResult.value += '仍有后续批次。';
+    ElMessage.success(action === 'inspect' ? '本批次巡检已完成。' : '副本同步任务已提交。');
+    await loadReplicas();
+  } catch { /* Keep status visible and allow another attempt. */ }
+  finally { if (context.current()) replicaAction.value = ''; }
+}
 const project = ref<Project | null>(null);
 const stats = ref<ProjectStats | null>(null);
-const activeCloudUsage = ref<StorageUsageResult | null>(null);
+const projectStorages = computed(() => [...(project.value?.storages || [])].sort((a, b) => Number(a.provider === 'LOCAL') - Number(b.provider === 'LOCAL') || a.priority - b.priority || a.id.localeCompare(b.id)));
+const cloudUsages = ref<Record<string, StorageUsageResult>>({});
+const cloudUsageLoading = ref<Record<string, boolean>>({});
+const cloudUsageErrors = ref<Record<string, string>>({});
 const hotspotsLoading = ref(false);
 const hotspotDays = ref(7);
 const hotspots = ref<{
@@ -501,6 +637,26 @@ const hotspots = ref<{
 } | null>(null);
 const cdnConfigs = ref<CdnConfig[]>([]);
 const files = ref<ManagedFile[]>([]);
+const filesPage = ref(1);
+const filesPageSize = ref(20);
+const filesTotal = ref(0);
+const filesLoading = ref(false);
+const filesError = ref('');
+const detailFile = ref<ManagedFile | null>(null);
+const detailsVisible = ref(false);
+
+function openFileDetails(file: ManagedFile): void {
+  if (file.projectId !== projectId.value) return;
+  detailFile.value = file; detailsVisible.value = true;
+}
+
+async function loadFiles(): Promise<void> {
+  await readPagedPanel('files', filesPage, filesPageSize, filesTotal, filesLoading, filesError,
+    (id, signal, page, pageSize) => fileApi.list({ projectId: id, status: 'ACTIVE', page, pageSize }, { signal, _silent: true }),
+    result => { files.value = result.items; }, '最近文件加载失败，已知记录仍保留，请刷新重试。');
+}
+async function changeFilesPage(page: number): Promise<void> { filesPage.value = validPage(page); await loadFiles(); }
+async function changeFilesPageSize(size: number): Promise<void> { filesPageSize.value = validPageSize(size); filesPage.value = 1; await loadFiles(); }
 const secrets = ref<ProjectSecret[]>([]);
 const importInputRef = ref<HTMLInputElement>();
 const secretDialogVisible = ref(false);
@@ -541,6 +697,9 @@ const lifecyclePolicies = ref<
 
 const downloadDays = ref(30);
 const downloadLoading = ref(false);
+const downloadError = ref('');
+const downloadSummaryLoading = ref(false);
+const downloadSummaryError = ref('');
 const downloadSummary = ref<DownloadStatsSummary | null>(null);
 const downloadItems = ref<
   Array<{
@@ -556,29 +715,32 @@ const downloadItems = ref<
 >([]);
 const downloadTotal = ref(0);
 const downloadPage = ref(1);
-const downloadPageSize = 20;
+const downloadPageSize = ref(20);
 
 function sourceLabel(source: string): string {
   return downloadSummary.value?.labels?.[source] || source;
 }
 
 async function loadDownloadStats(): Promise<void> {
-  downloadLoading.value = true;
-  try {
-    const [summary, list] = await Promise.all([
-      downloadStatsApi.summary(projectId, { days: downloadDays.value }),
-      downloadStatsApi.list(projectId, {
-        days: downloadDays.value,
-        page: downloadPage.value,
-        pageSize: downloadPageSize,
-      }),
-    ]);
-    downloadSummary.value = summary;
-    downloadItems.value = list.items;
-    downloadTotal.value = list.total;
-  } finally {
-    downloadLoading.value = false;
-  }
+  const days = downloadDays.value;
+  downloadSummaryError.value = '';
+  await Promise.all([
+    readPanel('download-summary', (id, signal) => downloadStatsApi.summary(id, { days }, { signal, _silent: true }), result => { downloadSummary.value = result; }, downloadSummaryLoading,
+      () => { downloadSummaryError.value = '下载摘要加载失败，请重新选择时间范围或刷新。'; }, () => downloadDays.value === days),
+    loadDownloadItems(),
+  ]);
+}
+async function loadDownloadItems(): Promise<void> {
+  const days = downloadDays.value;
+  await readPagedPanel('downloads', downloadPage, downloadPageSize, downloadTotal, downloadLoading, downloadError,
+    (id, signal, page, pageSize) => downloadStatsApi.list(id, { days, page, pageSize }, { signal, _silent: true }),
+    result => { downloadItems.value = result.items; }, '下载明细加载失败，已知记录仍保留，请重试。', () => downloadDays.value === days);
+}
+async function changeDownloadPage(page: number): Promise<void> { downloadPage.value = validPage(page); await loadDownloadItems(); }
+async function changeDownloadPageSize(size: number): Promise<void> { downloadPageSize.value = validPageSize(size); downloadPage.value = 1; await loadDownloadItems(); }
+async function changeDownloadDays(): Promise<void> {
+  downloadPage.value = 1; downloadItems.value = []; downloadTotal.value = 0; downloadSummary.value = null;
+  await loadDownloadStats();
 }
 function formatTime(value?: string | null): string {
   return value ? new Date(value).toLocaleString() : '-';
@@ -607,71 +769,54 @@ function formatDomains(value: string[] | undefined): string {
 }
 
 async function loadDetail(): Promise<void> {
-  const [projectResult, statsResult, cdnResult, fileResult] = await Promise.all([
-    projectApi.get(projectId),
-    projectApi.stats(projectId),
-    cdnApi.list(projectId),
-    fileApi.list({ projectId, page: 1, pageSize: 8 }),
+  await Promise.all([
+    readPanel('project', (id, signal) => projectApi.get(id, { signal }), result => {
+      project.value = result;
+      if (result.canManage) {
+        void readPanel('secrets', (id, signal) => projectApi.listSecrets(id, { signal }), result => { secrets.value = result; });
+        void loadCredentials();
+        void loadLifecycle();
+      }
+    }),
+    readPanel('stats', (id, signal) => projectApi.stats(id, { signal }), result => { stats.value = result; }),
+    readPanel('storage', (id, signal) => cdnApi.list(id, { signal }), result => {
+      cdnConfigs.value = result.filter(config => config.enabled);
+      if (!migrateForm.sourceCdnConfigId) migrateForm.sourceCdnConfigId = cdnConfigs.value[0]?.id || '';
+      if (!migrateForm.targetCdnConfigId) migrateForm.targetCdnConfigId = cdnConfigs.value[1]?.id || '';
+    }),
+    loadFiles(),
+    loadHotspots(),
+    loadDownloadStats(),
+    loadReplicas(),
   ]);
-  project.value = projectResult;
-  stats.value = statsResult;
-  cdnConfigs.value = cdnResult;
-  files.value = fileResult.items;
-  void loadHotspots();
-  void loadDownloadStats();
-  void loadActiveCloudUsage(cdnResult);
-  if (projectResult.canManage) {
-    const secretResult = await projectApi.listSecrets(projectId);
-    secrets.value = secretResult;
-    await Promise.all([loadCredentials(), loadLifecycle()]);
-    if (!migrateForm.sourceCdnConfigId && cdnConfigs.value[0]) {
-      migrateForm.sourceCdnConfigId = cdnConfigs.value[0].id;
-    }
-    if (!migrateForm.targetCdnConfigId && cdnConfigs.value[1]) {
-      migrateForm.targetCdnConfigId = cdnConfigs.value[1].id;
-    }
-  }
 }
 
-async function loadActiveCloudUsage(list: CdnConfig[]): Promise<void> {
-  const active = list.find((item) => item.active && (item.provider === 'QINIU' || item.provider === 'UPYUN'));
-  if (!active) {
-    activeCloudUsage.value = null;
-    return;
-  }
-  try {
-    activeCloudUsage.value = await cdnApi.usage(active.id, projectId);
-  } catch {
-    activeCloudUsage.value = null;
-  }
+async function loadCloudUsage(configId: string): Promise<void> {
+  if (!projectStorages.value.some(storage => storage.id === configId && storage.provider !== 'LOCAL')) return;
+  const busy = { get value() { return cloudUsageLoading.value[configId] || false; }, set value(value: boolean) { cloudUsageLoading.value[configId] = value; } };
+  cloudUsageErrors.value[configId] = '';
+  await readPanel(`usage:${configId}`, (id, signal) => cdnApi.usage(configId, id, { signal, _silent: true }), result => {
+    if (result.configId === configId) cloudUsages.value[configId] = result;
+  }, busy, () => { cloudUsageErrors.value[configId] = '用量读取失败；未知用量保持未知。'; });
 }
 
 async function loadHotspots(): Promise<void> {
-  hotspotsLoading.value = true;
-  try {
-    hotspots.value = await projectApi.hotspots(projectId, { days: hotspotDays.value, limit: 15 });
-  } catch {
-    hotspots.value = { days: hotspotDays.value, byReferer: [], byFile: [] };
-  } finally {
-    hotspotsLoading.value = false;
-  }
+  const days = hotspotDays.value;
+  await readPanel('hotspots', (id, signal) => projectApi.hotspots(id, { days, limit: 15 }, { signal }), result => { hotspots.value = result; }, hotspotsLoading);
 }
 
 async function loadLifecycle(): Promise<void> {
-  lifecycleLoading.value = true;
-  try {
-    lifecyclePolicies.value = (await http.get(`/projects/${projectId}/lifecycle-policies`)) as typeof lifecyclePolicies.value;
-  } finally {
-    lifecycleLoading.value = false;
-  }
+  await readPanel('lifecycle', (id, signal) => http.get<unknown, typeof lifecyclePolicies.value>(`/projects/${id}/lifecycle-policies`, { signal }), result => { lifecyclePolicies.value = result; }, lifecycleLoading);
 }
 
 async function openCreateLifecycle(): Promise<void> {
+  const context = captureContext();
   const { value: name } = await ElMessageBox.prompt('策略名称', '新建生命周期策略', {
     confirmButtonText: '下一步',
     cancelButtonText: '取消',
     inputValue: '默认 90 天回收',
   });
+  if (!context.current()) return;
   const { value: ttlText } = await ElMessageBox.prompt('TTL 天数', '新建生命周期策略', {
     confirmButtonText: '创建',
     cancelButtonText: '取消',
@@ -679,31 +824,40 @@ async function openCreateLifecycle(): Promise<void> {
     inputPattern: /^[1-9]\d*$/,
     inputErrorMessage: '请输入正整数天数',
   });
-  await http.post(`/projects/${projectId}/lifecycle-policies`, {
+  if (!context.current()) return;
+  await http.post(`/projects/${context.id}/lifecycle-policies`, {
     name,
     ttlDays: Number(ttlText),
     action: 'RECYCLE',
     enabled: true,
   });
+  if (!context.current()) return;
   ElMessage.success('策略已创建。');
   await loadLifecycle();
 }
 
 async function runLifecycle(policyId: string): Promise<void> {
-  const result = (await http.post(`/projects/${projectId}/lifecycle-policies/${policyId}/run`)) as {
+  const context = captureContext();
+  const result = (await http.post(`/projects/${context.id}/lifecycle-policies/${policyId}/run`)) as {
     affected?: number;
   };
+  if (!context.current()) return;
   ElMessage.success(`已处理 ${result.affected ?? 0} 个文件。`);
 }
 
 async function removeLifecycle(policyId: string): Promise<void> {
+  const context = captureContext();
   await ElMessageBox.confirm('删除该生命周期策略？', '删除策略', { type: 'warning' });
-  await http.delete(`/projects/${projectId}/lifecycle-policies/${policyId}`);
+  if (!context.current()) return;
+  await http.delete(`/projects/${context.id}/lifecycle-policies/${policyId}`);
+  if (!context.current()) return;
   ElMessage.success('已删除。');
   await loadLifecycle();
 }
 
 async function startMigrate(): Promise<void> {
+  const context = captureContext();
+  const payload = { ...migrateForm };
   if (!migrateForm.sourceCdnConfigId || !migrateForm.targetCdnConfigId) {
     ElMessage.warning('请选择源与目标存储配置。');
     return;
@@ -713,25 +867,23 @@ async function startMigrate(): Promise<void> {
     confirmButtonText: '开始',
     cancelButtonText: '取消',
   });
+  if (!context.current()) return;
   migrateLoading.value = true;
   try {
-    const result = (await http.post(`/projects/${projectId}/storage/migrate`, migrateForm)) as { taskId?: string };
+    const result = (await http.post(`/projects/${context.id}/storage/migrate`, payload)) as { taskId?: string };
+    if (!context.current()) return;
     ElMessage.success(result.taskId ? `迁移任务已创建：${result.taskId}` : '迁移任务已创建。');
   } finally {
-    migrateLoading.value = false;
+    if (context.current()) migrateLoading.value = false;
   }
 }
 
 async function loadCredentials(): Promise<void> {
-  credentialsLoading.value = true;
-  try {
-    uploadCredentials.value = await uploadCredentialApi.list(projectId);
-  } finally {
-    credentialsLoading.value = false;
-  }
+  await readPanel('credentials', (id, signal) => uploadCredentialApi.list(id, { signal }), result => { uploadCredentials.value = result; }, credentialsLoading);
 }
 
 async function openCreateCredential(): Promise<void> {
+  const context = captureContext();
   const { value } = await ElMessageBox.prompt('凭证名称', '新建上传凭证', {
     confirmButtonText: '创建',
     cancelButtonText: '取消',
@@ -739,10 +891,12 @@ async function openCreateCredential(): Promise<void> {
     inputPattern: /^.{1,128}$/,
     inputErrorMessage: '名称不能为空。',
   });
-  const result = await uploadCredentialApi.create(projectId, {
+  if (!context.current()) return;
+  const result = await uploadCredentialApi.create(context.id, {
     name: value,
     expiresInSeconds: 7 * 24 * 60 * 60,
   });
+  if (!context.current()) return;
   latestCredentialToken.value = result.token;
   credentialTokenVisible.value = true;
   ElMessage.success('上传凭证已创建。');
@@ -750,28 +904,35 @@ async function openCreateCredential(): Promise<void> {
 }
 
 async function revokeCredential(credentialId: string): Promise<void> {
+  const context = captureContext();
   await ElMessageBox.confirm('吊销后使用该 Token 的客户端将无法继续上传。', '吊销凭证', {
     type: 'warning',
     confirmButtonText: '吊销',
     cancelButtonText: '取消',
   });
-  await uploadCredentialApi.revoke(projectId, credentialId);
+  if (!context.current()) return;
+  await uploadCredentialApi.revoke(context.id, credentialId);
+  if (!context.current()) return;
   ElMessage.success('凭证已吊销。');
   await loadCredentials();
 }
 
 async function exportProject(): Promise<void> {
+  const context = captureContext();
+  const name = project.value?.name || 'project';
   await ElMessageBox.confirm('导出内容只包含项目元数据和文件记录，不包含对象存储中的真实文件内容。', '导出项目', {
     type: 'warning',
     confirmButtonText: '继续导出',
     cancelButtonText: '取消',
   });
-  const payload = await projectApi.export(projectId);
+  if (!context.current()) return;
+  const payload = await projectApi.export(context.id);
   const blob = new globalThis.Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  saveBlob(blob, `${project.value?.name || 'project'}-export.json`);
+  saveBlob(blob, `${name}-export.json`);
 }
 
 async function importProject(event: Event): Promise<void> {
+  const context = captureContext();
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   input.value = '';
@@ -785,8 +946,10 @@ async function importProject(event: Event): Promise<void> {
     confirmButtonText: '继续导入',
     cancelButtonText: '取消',
   });
+  if (!context.current()) return;
   const payload = JSON.parse(await file.text()) as Record<string, unknown>;
   const result = await projectApi.import(payload);
+  if (!context.current()) return;
   latestSecret.value = result.appSecret;
   secretDialogVisible.value = true;
   ElMessage.success(`项目已导入，文件记录 ${result.fileRecordsImported} 条。`);
@@ -794,6 +957,7 @@ async function importProject(event: Event): Promise<void> {
 }
 
 async function createSecret(): Promise<void> {
+  const context = captureContext();
   const { value } = await ElMessageBox.prompt('密钥名称', '新增项目密钥', {
     confirmButtonText: '创建',
     cancelButtonText: '取消',
@@ -801,32 +965,98 @@ async function createSecret(): Promise<void> {
     inputPattern: /^.{2,128}$/,
     inputErrorMessage: '名称长度需要在 2 到 128 个字符之间。',
   });
-  const result = await projectApi.createSecret(projectId, { name: value });
+  if (!context.current()) return;
+  const result = await projectApi.createSecret(context.id, { name: value });
+  if (!context.current()) return;
   latestSecret.value = result.appSecret;
   secretDialogVisible.value = true;
-  secrets.value = await projectApi.listSecrets(projectId);
-  stats.value = await projectApi.stats(projectId);
+  await loadDetail();
 }
 
 async function disableSecret(secretId: string): Promise<void> {
+  const context = captureContext();
   await ElMessageBox.confirm('停用后使用该 AppSecret 的脚本会立即签名失败。', '停用密钥', {
     type: 'warning',
     confirmButtonText: '停用',
     cancelButtonText: '取消',
   });
-  await projectApi.disableSecret(projectId, secretId);
+  if (!context.current()) return;
+  await projectApi.disableSecret(context.id, secretId);
+  if (!context.current()) return;
   ElMessage.success('项目密钥已停用。');
-  secrets.value = await projectApi.listSecrets(projectId);
-  stats.value = await projectApi.stats(projectId);
+  await loadDetail();
 }
 
-onMounted(loadDetail);
+watch(projectId, () => {
+  contextGeneration++;
+  panelReads.forEach(controller => controller.abort());
+  panelReads.clear();
+  project.value = null;
+  stats.value = null;
+  cdnConfigs.value = [];
+  files.value = [];
+  filesPage.value = 1;
+  filesPageSize.value = 20;
+  filesTotal.value = 0;
+  filesLoading.value = false;
+  filesError.value = '';
+  detailFile.value = null;
+  detailsVisible.value = false;
+  secrets.value = [];
+  cloudUsages.value = {};
+  cloudUsageLoading.value = {};
+  cloudUsageErrors.value = {};
+  hotspots.value = null;
+  downloadSummary.value = null;
+  downloadItems.value = [];
+  downloadTotal.value = 0;
+  downloadPage.value = 1;
+  downloadPageSize.value = 20;
+  downloadLoading.value = false;
+  downloadError.value = '';
+  downloadSummaryLoading.value = false;
+  downloadSummaryError.value = '';
+  uploadCredentials.value = [];
+  lifecyclePolicies.value = [];
+  replicas.value = null;
+  replicaPage.value = 1;
+  replicaPageSize.value = 20;
+  replicaTotal.value = 0;
+  replicasLoading.value = false;
+  replicasError.value = '';
+  replicaAction.value = '';
+  replicaCursors.sync = null;
+  replicaCursors.inspect = null;
+  replicaResult.value = '';
+  migrateLoading.value = false;
+  migrateForm.sourceCdnConfigId = '';
+  migrateForm.targetCdnConfigId = '';
+  migrateForm.deleteSource = false;
+  secretDialogVisible.value = false;
+  latestSecret.value = '';
+  credentialTokenVisible.value = false;
+  latestCredentialToken.value = '';
+  ElMessageBox.close();
+  void loadDetail();
+}, { immediate: true, flush: 'sync' });
+onBeforeUnmount(() => {
+  contextGeneration++;
+  panelReads.forEach(controller => controller.abort());
+  panelReads.clear();
+  ElMessageBox.close();
+});
 </script>
 
 <style scoped>
 .hidden-input {
   display: none;
 }
+
+.storage-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.storage-tags :deep(.el-tag) { height: auto; white-space: normal; line-height: 1.6; }
+.panel-pagination { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.panel-pagination :deep(.el-pagination__sizes), .panel-pagination :deep(.el-pagination__jump) { margin-left: 0; }
+@media (max-width: 600px) { .section-head { align-items: flex-start; flex-wrap: wrap; } .section-head > .toolbar { flex-wrap: wrap; } }
 
 .small-value {
   font-size: 17px;

@@ -9,6 +9,8 @@ export const BACKUP_MODELS = [
   'user',
   'project',
   'cdnConfig',
+  'projectStorageBinding',
+  'storageReplica',
   'managedFolder',
   'managedFile',
   'fileDerivative',
@@ -53,6 +55,8 @@ export const REPLACE_DELETE_ORDER: readonly BackupModelName[] = [
   'managedFolder',
   'uploadCredential',
   'projectSecret',
+  'storageReplica',
+  'projectStorageBinding',
   'project',
   'cdnConfig',
 ];
@@ -71,7 +75,7 @@ export const BACKUP_SCOPES = {
   storage: {
     label: '存储配置',
     description: '本地 / 七牛 / 又拍云 / OSS / S3 存储配置（密钥为加密密文）',
-    models: ['cdnConfig'],
+    models: ['cdnConfig', 'projectStorageBinding', 'storageReplica'],
   },
   shares: {
     label: '分享与公开库',

@@ -205,6 +205,8 @@ export class TasksService {
         })
       : [];
     const migrationRetry = task.type === 'STORAGE_MIGRATION';
+    const replicaRetry = task.type === 'STORAGE_REPLICA_SYNC';
+    const scheduledRetry = migrationRetry || replicaRetry;
     const retryDetail: Prisma.InputJsonValue = migrationRetry
       ? {
           ...originalDetail,
@@ -219,20 +221,24 @@ export class TasksService {
           failed: 0,
           failures: [],
         } as Prisma.InputJsonObject
-      : { retriedFromTaskId: task.id, originalDetail: task.detail };
+      : replicaRetry
+        ? { ...originalDetail, cursor: String(originalDetail.cursor ?? ''), retriedFromTaskId: task.id }
+        : { retriedFromTaskId: task.id, originalDetail: task.detail };
     const retried = await this.prisma.task.create({
       data: {
         projectId: task.projectId,
         type: task.type,
         title: `${task.title}（重试）`,
-        status: migrationRetry ? 'RUNNING' : 'COMPLETED',
-        progress: migrationRetry ? 0 : 100,
+        status: scheduledRetry ? 'RUNNING' : 'COMPLETED',
+        progress: scheduledRetry ? 0 : 100,
+        leaseOwner: null,
+        leaseUntil: null,
         detail: retryDetail,
-        result: migrationRetry ? undefined : {
+        result: scheduledRetry ? undefined : {
           retryNotice: '该任务已重新登记；涉及外部副作用的任务请在对应功能页重新执行。',
           originalError: task.error,
         },
-        finishedAt: migrationRetry ? null : new Date(),
+        finishedAt: scheduledRetry ? null : new Date(),
       },
       include: { project: { select: { id: true, name: true } } },
     });

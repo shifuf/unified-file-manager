@@ -1,6 +1,6 @@
 {
   "name": "unified-file-manager",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "private": true,
   "license": "MIT",
   "description": "Multi-project unified file management platform.",
@@ -24,7 +24,22 @@
     "package:deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-deploy.ps1",
     "package:deploy:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-deploy.ps1 -SkipBuild",
     "backup:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/backup-full.ps1",
-    "test": "npm --workspace apps/api test"
+    "test": "npm run test:regression",
+    "test:regression": "node --test tests/regression/*.test.cjs",
+    "test:acceptance:browser": "node tests/acceptance/browser.cjs",
+    "test:acceptance:share-ui": "node tests/acceptance/public-share-ui.cjs",
+    "test:acceptance:verify": "node tests/acceptance/verify-retained.cjs",
+    "test:acceptance:files": "node tests/acceptance/upload-download-share.mjs",
+    "test:acceptance:lifecycle": "node tests/acceptance/lifecycle.mjs",
+    "test:acceptance:cloud": "node tests/acceptance/real-cloud.cjs",
+    "test:acceptance:sessions": "node tests/acceptance/auth-sessions-real.cjs",
+    "test:acceptance:storage-ui": "node --test tests/acceptance/global-storage-ui.cjs",
+    "test:acceptance:storage-real": "node tests/acceptance/global-storage-real.cjs",
+    "test:acceptance:verify-all": "node tests/acceptance/verify-all-retained.cjs",
+    "test:acceptance:replicas": "node tests/acceptance/replicated-storage-real.cjs",
+    "test:acceptance:replica-browser": "node tests/acceptance/replica-browser-real.cjs",
+    "test:acceptance:replica-followup": "node tests/acceptance/replica-followup-real.cjs",
+    "test:acceptance:replica-video": "node tests/acceptance/replica-video-real.cjs"
   },
   "engines": {
     "node": ">=20.11.0",

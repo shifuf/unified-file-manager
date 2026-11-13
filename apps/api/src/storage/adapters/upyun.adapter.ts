@@ -1,6 +1,8 @@
 import { createHmac } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
 
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { CdnProvider } from '@prisma/client';
 
 import type {
@@ -8,6 +10,9 @@ import type {
   StorageAdapter,
   StorageUsageSnapshot,
   StorageUploadParams,
+  StorageUploadFileParams,
+  StorageDownloadTarget,
+  StorageByteRange,
   StoredObject,
 } from '../storage.types';
 import {
@@ -38,6 +43,22 @@ export class UpyunAdapter implements StorageAdapter {
     return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
   }
 
+  async uploadFile(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject> {
+    const endpoint = withScheme(configText(config, 'endpoint', DEFAULT_UPYUN_ENDPOINT));
+    const bucket = configText(config, 'bucket');
+    const credentials = Buffer.from(`${configText(config, 'operator')}:${configText(config, 'password')}`, 'utf8').toString('base64');
+    const body = createReadStream(params.path);
+    try {
+      const init = { method: 'PUT', headers: { Authorization: `Basic ${credentials}`, Date: rfc1123Date(),
+        'Content-Type': params.mimeType, 'Content-Length': String(params.size) }, body: body as unknown as BodyInit,
+        duplex: 'half', signal: AbortSignal.timeout(10 * 60_000) };
+      const response = await fetch(`${endpoint.replace(/\/+$/, '')}/${encodeURIComponent(bucket)}/${encodeKeyPath(params.key)}`, init);
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`又拍云流式上传失败：${response.status}`); }
+      await response.body?.cancel();
+      return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
+    } finally { body.destroy(); }
+  }
+
   async remove(config: RuntimeCdnConfig, key: string): Promise<void> {
     const response = await this.request(config, 'DELETE', key);
     if (!response.ok && response.status !== 404) {
@@ -58,6 +79,24 @@ export class UpyunAdapter implements StorageAdapter {
     const signature = createHmac('sha1', tokenSecret).update(content).digest('base64url');
 
     return `${objectUrl}?_upt=${expires}_${signature}`;
+  }
+
+  /** Origin reads avoid stale CDN 404s immediately after an object is uploaded. */
+  async getDownloadTarget(config: RuntimeCdnConfig, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget> {
+    const headers: Record<string, string> = range ? { Range: `bytes=${range.start ?? 0}-${range.end ?? ''}` } : {};
+    const response = await this.request(config, 'GET', key, undefined, headers);
+    if (!response.ok || !response.body) {
+      await response.body?.cancel();
+      if (response.status === 404) throw new NotFoundException('又拍云源站对象不存在。');
+      throw new Error(`又拍云源站读取失败：${response.status}`);
+    }
+    const rawLength = response.headers.get('content-length');
+    const length = rawLength === null ? Number.NaN : Number(rawLength);
+    return {
+      type: 'stream', stream: Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]),
+      contentType: response.headers.get('content-type') ?? undefined,
+      contentLength: Number.isFinite(length) ? length : undefined,
+    };
   }
 
   async objectExists(config: RuntimeCdnConfig, key: string): Promise<boolean> {

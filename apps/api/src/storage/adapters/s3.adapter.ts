@@ -1,4 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 
 import { Injectable } from '@nestjs/common';
 import { CdnProvider } from '@prisma/client';
@@ -8,6 +9,7 @@ import type {
   RuntimeCdnConfig,
   StorageAdapter,
   StorageUploadParams,
+  StorageUploadFileParams,
   StoredObject,
 } from '../storage.types';
 import { configFlag, configText, publicUrlFromDomain, withScheme } from '../storage.util';
@@ -39,6 +41,20 @@ export class S3Adapter implements StorageAdapter {
     }
 
     return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
+  }
+
+  async uploadFile(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject> {
+    const target = this.target(config, params.key);
+    const headers = this.signHeaders(config, 'PUT', target, params.checksum, params.mimeType);
+    const body = createReadStream(params.path);
+    try {
+      const init = { method: 'PUT', headers: { ...transportHeaders(headers), 'Content-Length': String(params.size) },
+        body: body as unknown as BodyInit, duplex: 'half', signal: AbortSignal.timeout(10 * 60_000) };
+      const response = await fetch(`${target.origin}${target.canonicalUri}`, init);
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`S3 流式上传失败：${response.status}`); }
+      await response.body?.cancel();
+      return { storageKey: params.key, publicUrl: publicUrlFromDomain(config, params.key) };
+    } finally { body.destroy(); }
   }
 
   async remove(config: RuntimeCdnConfig, key: string): Promise<void> {

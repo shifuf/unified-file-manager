@@ -1,9 +1,9 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 
 import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { AuditAction, UserRole } from '@prisma/client';
+import { AuditAction, Prisma, UserRole } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 
 import { AuditService } from '../audit/audit.service';
@@ -11,7 +11,7 @@ import { PASSWORD_SALT_ROUNDS } from '../common/constants';
 import type { RequestUser } from '../common/types/request-user.type';
 import { decryptText, encryptText } from '../common/utils/crypto.util';
 import { InMemoryAttemptLimiter } from '../common/utils/in-memory-attempt-limiter';
-import { getAppCryptoKey } from '../common/utils/security-config.util';
+import { getAppCryptoKey, getJwtSecret } from '../common/utils/security-config.util';
 import { buildTotpUri, generateTotpSecret, verifyTotpCode } from '../common/utils/totp.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChangePasswordDto } from './dto/change-password.dto';
@@ -34,6 +34,10 @@ interface LoginSuccess {
 interface LoginTotpChallenge {
   requiresTotp: true;
 }
+
+type SessionUser = Omit<LoginSuccess['user'], 'mustChangePassword'> & { mustChangePassword?: boolean };
+
+const REFRESH_GRACE_MS = 5000;
 
 @Injectable()
 export class AuthService {
@@ -96,21 +100,13 @@ export class AuthService {
       action: AuditAction.LOGIN,
       actorId: user.id,
       ip: meta.ip,
-      userAgent: meta.userAgent,
+      userAgent: this.deviceUserAgent(meta.userAgent) ?? undefined,
     });
 
     return this.issueSession(user, meta);
   }
 
-  /**
-   * Exchange a valid (non-revoked, unexpired) refresh token for a fresh access
-   * token, rotating the refresh token.
-   *
-   * Multi-tab grace: if the presented token was already rotated but still has a
-   * live replacement (replacedById points at a non-revoked, unexpired token),
-   * issue one more session instead of revoking the whole family. True reuse of a
-   * fully-dead rotated token still revokes all live sessions (theft detection).
-   */
+  /** Rotate one device row; concurrent tabs share its replacement for five seconds. */
   async refresh(
     refreshToken: string | undefined,
     meta: { ip?: string; userAgent?: string },
@@ -120,55 +116,55 @@ export class AuthService {
     }
 
     const tokenHash = this.hashToken(refreshToken);
-    const existing = await this.prisma.refreshToken.findUnique({ where: { tokenHash } });
-
-    if (!existing) {
+    const candidate =
+      (await this.prisma.refreshToken.findUnique({ where: { tokenHash } })) ??
+      (await this.prisma.refreshToken.findFirst({
+        where: { replacedById: { startsWith: 'rotate:', endsWith: `:${tokenHash}` } },
+      }));
+    if (!candidate) {
       throw new UnauthorizedException('刷新令牌无效，请重新登录。');
     }
-
-    if (existing.revokedAt) {
-      // Grace path for concurrent multi-tab refresh races.
-      if (existing.replacedById) {
-        const replacement = await this.prisma.refreshToken.findUnique({
-          where: { tokenHash: existing.replacedById },
-        });
-        if (
-          replacement &&
-          !replacement.revokedAt &&
-          replacement.expiresAt.getTime() > Date.now() &&
-          replacement.userId === existing.userId
-        ) {
-          const user = await this.prisma.user.findUnique({ where: { id: existing.userId } });
-          if (user && user.enabled) {
-            // Issue a fresh session; do not revoke the still-valid replacement.
-            return this.issueSession(user, meta);
-          }
-        }
+    return this.prisma.$transaction(async (tx) => {
+      // Serialize device creation and rotation across API instances, without a schema change.
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM \`User\` WHERE id = ${candidate.userId} FOR UPDATE`);
+      const existing = await tx.refreshToken.findUnique({ where: { id: candidate.id } });
+      const user = await tx.user.findUnique({ where: { id: candidate.userId } });
+      const now = Date.now();
+      if (
+        !existing || existing.revokedAt || existing.expiresAt.getTime() <= now ||
+        !user?.enabled || user.role !== UserRole.SUPER_ADMIN ||
+        existing.ip !== (meta.ip ?? null) || existing.userAgent !== this.deviceUserAgent(meta.userAgent)
+      ) {
+        throw new UnauthorizedException('刷新令牌已失效，请重新登录。');
       }
 
-      await this.prisma.refreshToken.updateMany({
-        where: { userId: existing.userId, revokedAt: null },
-        data: { revokedAt: new Date() },
+      if (existing.tokenHash !== tokenHash) {
+        const replacement = this.rotationGraceToken(refreshToken, existing, now);
+        if (!replacement) {
+          throw new UnauthorizedException('刷新令牌已失效，请重新登录。');
+        }
+        // Reissue only the current credentials; never revive the presented old token.
+        return this.sessionResponse(user, replacement);
+      }
+
+      const replacement = this.rotatedRefreshToken(refreshToken, existing.id, now);
+      const changed = await tx.refreshToken.updateMany({
+        where: { id: existing.id, tokenHash, revokedAt: null, expiresAt: { gt: new Date(now) } },
+        data: {
+          tokenHash: this.hashToken(replacement),
+          expiresAt: new Date(now + this.refreshTtlMs()),
+          replacedById: `rotate:${now}:${tokenHash}`,
+        },
       });
-      throw new UnauthorizedException('刷新令牌已失效，请重新登录。');
-    }
-
-    if (existing.expiresAt.getTime() <= Date.now()) {
-      throw new UnauthorizedException('刷新令牌已过期，请重新登录。');
-    }
-
-    const user = await this.prisma.user.findUnique({ where: { id: existing.userId } });
-    if (!user || !user.enabled) {
-      throw new UnauthorizedException('登录状态无效，请重新登录。');
-    }
-
-    const session = await this.issueSession(user, meta);
-    await this.prisma.refreshToken.update({
-      where: { id: existing.id },
-      data: { revokedAt: new Date(), replacedById: this.hashToken(session.refreshToken) },
+      if (changed.count !== 1) {
+        throw new UnauthorizedException('刷新令牌已失效，请重新登录。');
+      }
+      await tx.refreshToken.updateMany({
+        where: { ...this.deviceWhere(user.id, meta), id: { not: existing.id }, revokedAt: null },
+        data: { revokedAt: new Date(now) },
+      });
+      return this.sessionResponse(user, replacement);
     });
-
-    return session;
   }
 
   async getProfile(userId: string) {
@@ -191,10 +187,31 @@ export class AuthService {
 
   async revokeRefreshToken(refreshToken?: string): Promise<{ success: boolean }> {
     if (refreshToken) {
-      await this.prisma.refreshToken.updateMany({
-        where: { tokenHash: this.hashToken(refreshToken), revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
+      const tokenHash = this.hashToken(refreshToken);
+      const candidate =
+        (await this.prisma.refreshToken.findUnique({ where: { tokenHash } })) ??
+        (await this.prisma.refreshToken.findFirst({
+          where: { replacedById: { startsWith: 'rotate:', endsWith: `:${tokenHash}` } },
+        }));
+      if (candidate) {
+        await this.prisma.$transaction(async (tx) => {
+          await tx.$queryRaw(Prisma.sql`SELECT id FROM \`User\` WHERE id = ${candidate.userId} FOR UPDATE`);
+          const row = await tx.refreshToken.findUnique({ where: { id: candidate.id } });
+          const now = new Date(Date.now());
+          if (!row || row.revokedAt || row.expiresAt <= now) return;
+          if (row.tokenHash !== tokenHash && !this.rotationGraceToken(refreshToken, row, now.getTime())) return;
+          const changed = await tx.refreshToken.updateMany({
+            where: { id: row.id, tokenHash: row.tokenHash, revokedAt: null },
+            data: { revokedAt: now },
+          });
+          if (changed.count === 1) {
+            await tx.refreshToken.updateMany({
+              where: { userId: row.userId, ip: row.ip, userAgent: row.userAgent, id: { not: row.id }, revokedAt: null },
+              data: { revokedAt: now },
+            });
+          }
+        });
+      }
     }
 
     return { success: true };
@@ -358,31 +375,75 @@ export class AuthService {
   }
 
   private async issueSession(
-    user: {
-      id: string;
-      username: string;
-      displayName: string;
-      role: string;
-      totpEnabled: boolean;
-      mustChangePassword?: boolean;
-    },
+    user: SessionUser,
     meta: { ip?: string; userAgent?: string },
   ): Promise<LoginSuccess> {
-    const accessToken = await this.jwtService.signAsync({
-      sub: user.id,
-      username: user.username,
-      role: user.role,
-    });
     const refreshToken = randomBytes(48).toString('base64url');
-    await this.prisma.refreshToken.create({
-      data: {
-        userId: user.id,
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM \`User\` WHERE id = ${user.id} FOR UPDATE`);
+      const now = new Date(Date.now());
+      const device = this.deviceWhere(user.id, meta);
+      const existing = await tx.refreshToken.findFirst({
+        where: { ...device, revokedAt: null, expiresAt: { gt: now } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      });
+      const data = {
         tokenHash: this.hashToken(refreshToken),
-        expiresAt: new Date(Date.now() + this.refreshTtlMs()),
-        userAgent: meta.userAgent?.slice(0, 255),
-        ip: meta.ip,
-      },
+        expiresAt: new Date(now.getTime() + this.refreshTtlMs()),
+        replacedById: null,
+      };
+      if (existing) {
+        const changed = await tx.refreshToken.updateMany({
+          where: { id: existing.id, tokenHash: existing.tokenHash, revokedAt: null, expiresAt: { gt: now } },
+          data,
+        });
+        if (changed.count !== 1) throw new UnauthorizedException('登录状态刚刚变更，请重试。');
+        await tx.refreshToken.updateMany({
+          where: { ...device, id: { not: existing.id }, revokedAt: null },
+          data: { revokedAt: now },
+        });
+      } else {
+        await tx.refreshToken.create({ data: { ...device, ...data } });
+      }
+      return this.sessionResponse(user, refreshToken);
     });
+  }
+
+  private deviceUserAgent(userAgent?: string): string | null {
+    if (!userAgent) return null;
+    if (userAgent.length <= 255 && !userAgent.includes(' [ufm-ua-sha256:')) return userAgent;
+    // The existing column is 255 chars: keep a readable prefix and fingerprint the full UA.
+    const suffix = ` [ufm-ua-sha256:${this.hashToken(userAgent)}]`;
+    return userAgent.slice(0, 255 - suffix.length) + suffix;
+  }
+
+  private deviceWhere(userId: string, meta: { ip?: string; userAgent?: string }) {
+    return { userId, ip: meta.ip ?? null, userAgent: this.deviceUserAgent(meta.userAgent) };
+  }
+
+  private rotatedRefreshToken(previous: string, sessionId: string, rotatedAt: number): string {
+    return createHmac('sha384', getJwtSecret(this.configService))
+      .update(`ufm-device-refresh\n${sessionId}\n${rotatedAt}\n${previous}`)
+      .digest('base64url');
+  }
+
+  private rotationGraceToken(
+    previous: string,
+    row: { id: string; tokenHash: string; replacedById: string | null },
+    now: number,
+  ): string | null {
+    const rotation = /^rotate:(\d+):([a-f0-9]{64})$/.exec(row.replacedById ?? '');
+    const rotatedAt = rotation ? Number(rotation[1]) : NaN;
+    if (
+      !rotation || rotation[2] !== this.hashToken(previous) || !Number.isSafeInteger(rotatedAt) ||
+      now < rotatedAt || now - rotatedAt > REFRESH_GRACE_MS
+    ) return null;
+    const replacement = this.rotatedRefreshToken(previous, row.id, rotatedAt);
+    return this.hashToken(replacement) === row.tokenHash ? replacement : null;
+  }
+
+  private async sessionResponse(user: SessionUser, refreshToken: string): Promise<LoginSuccess> {
+    const accessToken = await this.jwtService.signAsync({ sub: user.id, username: user.username, role: user.role });
 
     return {
       requiresTotp: false,
@@ -408,28 +469,37 @@ export class AuthService {
         expiresAt: { gt: new Date() },
       },
       orderBy: { createdAt: 'desc' },
-      take: 50,
     });
-    return rows.map((row) => ({
-      id: row.id,
-      ip: row.ip,
-      userAgent: row.userAgent,
-      createdAt: row.createdAt,
-      expiresAt: row.expiresAt,
-      current: currentHash ? row.tokenHash === currentHash : false,
-    }));
+    const devices = new Map<string, (typeof rows)[number]>();
+    for (const row of rows) {
+      const key = JSON.stringify([row.ip, row.userAgent]);
+      if (!devices.has(key) || row.tokenHash === currentHash) devices.set(key, row);
+    }
+    return [...devices.values()]
+      .sort((a, b) => Number(b.tokenHash === currentHash) - Number(a.tokenHash === currentHash) || b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, 50)
+      .map((row) => ({
+        id: row.id,
+        ip: row.ip,
+        userAgent: row.userAgent,
+        createdAt: row.createdAt,
+        expiresAt: row.expiresAt,
+        current: currentHash ? row.tokenHash === currentHash : false,
+      }));
   }
 
   async revokeSession(user: RequestUser, sessionId: string): Promise<{ success: boolean }> {
-    const row = await this.prisma.refreshToken.findFirst({
-      where: { id: sessionId, userId: user.id, revokedAt: null },
-    });
-    if (!row) {
-      throw new BadRequestException('会话不存在或已失效。');
-    }
-    await this.prisma.refreshToken.update({
-      where: { id: sessionId },
-      data: { revokedAt: new Date() },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM \`User\` WHERE id = ${user.id} FOR UPDATE`);
+      const row = await tx.refreshToken.findFirst({
+        where: { id: sessionId, userId: user.id, revokedAt: null },
+      });
+      if (!row) throw new BadRequestException('会话不存在或已失效。');
+      // A displayed legacy device can represent several rows; revoke that device as a group.
+      await tx.refreshToken.updateMany({
+        where: { userId: user.id, ip: row.ip, userAgent: row.userAgent, revokedAt: null },
+        data: { revokedAt: new Date(Date.now()) },
+      });
     });
     await this.auditService.write({
       action: AuditAction.SESSION_REVOKE,

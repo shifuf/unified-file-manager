@@ -2,6 +2,8 @@
 
 多项目统一文件管理平台：NestJS + Prisma + MySQL 后端，Vue 3 + Element Plus 管理控制台，可插拔存储（本地 / 七牛 / 又拍云 / 阿里云 OSS / S3），开放 API（AppID + HMAC v2）。
 
+当前发布：**v0.2.1**。变更见 [更新记录](CHANGELOG.md)，自动化回归及真实云验收见 [测试说明](tests/acceptance/README.md)。
+
 **账号模型：单一超级管理员**（`.env` 中 `ADMIN_USERNAME` / `ADMIN_PASSWORD`）。业务系统通过各项目的 AppID 与签名密钥对接，不提供多租户成员控制台。
 
 ---
