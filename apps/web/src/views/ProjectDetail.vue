@@ -16,6 +16,32 @@
       </div>
     </div>
 
+    <section v-if="project?.canManage" class="surface">
+      <div class="surface-body">
+        <div class="section-head">
+          <div class="section-title">目录管理</div>
+          <div class="toolbar">
+            <el-button size="small" :loading="directoriesLoading" @click="loadDirectories">刷新目录</el-button>
+            <el-button size="small" type="primary" @click="createDirectory()">新建目录</el-button>
+          </div>
+        </div>
+        <p class="muted">支持创建多级目录。目录有文件时请先删除文件；有子目录时请先删除子目录。删除空目录后，回收站文件仍可恢复。</p>
+        <el-alert v-if="directoriesError" :title="directoriesError" type="warning" :closable="false" />
+        <el-tree v-loading="directoriesLoading" :data="projectFolders" node-key="path" :props="{ label: 'name', children: 'children' }" :expand-on-click-node="false" empty-text="暂无目录，可新建目录后上传文件。">
+          <template #default="{ data }">
+            <div class="directory-node">
+              <span>{{ data.name }} <span class="muted">{{ data.fileCount }} 个文件</span></span>
+              <span>
+                <el-button link size="small" type="primary" @click.stop="openDirectory(data.path)">管理文件</el-button>
+                <el-button link size="small" type="primary" @click.stop="createDirectory(data.path)">新建子目录</el-button>
+                <el-button link size="small" type="danger" @click.stop="removeDirectory(data.path)">删除目录</el-button>
+              </span>
+            </div>
+          </template>
+        </el-tree>
+      </div>
+    </section>
+
     <section class="metric-grid">
       <div class="metric">
         <div class="metric-label">AppID</div>
@@ -125,6 +151,7 @@
           <el-table-column label="来源" width="110">
             <template #default="{ row }">{{ sourceLabel(row.source) }}</template>
           </el-table-column>
+          <el-table-column prop="message" label="实际下载存储／切换原因" min-width="300"><template #default="{ row }">{{ row.message || '历史记录未记录下载存储' }}</template></el-table-column>
           <el-table-column label="流量" width="110">
             <template #default="{ row }">{{ formatSize(row.bytes) }}</template>
           </el-table-column>
@@ -225,7 +252,7 @@
           </el-tag>
           <span v-if="!projectStorages.length" class="muted">暂无配置关系</span>
         </div>
-        <div class="metric-sub">配置关系；文件的实际副本请查看文件详情。</div>
+        <div class="metric-sub">优先下载：{{ preferredProjectStorage ? `${preferredProjectStorage.name}（${storageProviderLabel(preferredProjectStorage.provider)}）` : '暂无启用存储' }}。云端按优先级依次尝试，本地兜底。</div>
       </div>
       <div class="metric">
         <div class="metric-label">分享链接</div>
@@ -512,6 +539,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { http } from '@/api/http';
 import { cdnApi, downloadStatsApi, fileApi, projectApi, replicaApi, uploadCredentialApi } from '@/api/modules';
 import FileStorageDetails from '@/components/FileStorageDetails.vue';
+import { storageProviderLabel } from '@/utils/storage-replica-view';
 import type {
   CdnConfig,
   DownloadStatsSummary,
@@ -623,8 +651,69 @@ async function runReplicaAction(action: 'sync' | 'inspect' | 'retry'): Promise<v
   finally { if (context.current()) replicaAction.value = ''; }
 }
 const project = ref<Project | null>(null);
+const projectFolders = ref<Array<{ name: string; path: string; fileCount: number; children: unknown[] }>>([]);
+const directoriesLoading = ref(false);
+const directoriesError = ref('');
+
+async function loadDirectories(): Promise<void> {
+  directoriesError.value = '';
+  await readPanel('directories', (id, signal) => fileApi.listFolderTree(id, { signal, _silent: true }), result => {
+    projectFolders.value = result;
+  }, directoriesLoading, () => { directoriesError.value = '目录加载失败，请刷新重试。'; });
+}
+
+function openDirectory(folderPath: string): void {
+  void router.push({ path: '/files', query: { projectId: projectId.value, folderPath } });
+}
+
+async function createDirectory(parentPath = ''): Promise<void> {
+  if (!project.value?.canManage) return;
+  const context = captureContext();
+  let value: string;
+  try {
+    ({ value } = await ElMessageBox.prompt(`在 ${parentPath || '根目录'} 下创建目录（可包含多级，如 contracts/2026）`, '新建目录', {
+      confirmButtonText: '创建', cancelButtonText: '取消', inputPattern: /^[^\\:*?"<>|]+$/, inputErrorMessage: '目录名不能包含 \\ : * ? " < > |',
+    }));
+  } catch { return; }
+  if (!context.current()) return;
+  const name = String(value ?? '').trim().replace(/^\/+|\/+$/g, '');
+  if (!name) { ElMessage.warning('目录名不能为空。'); return; }
+  await fileApi.createFolder(context.id, [parentPath, name].filter(Boolean).join('/'));
+  if (!context.current()) return;
+  ElMessage.success('目录已创建。');
+  await loadDirectories();
+}
+
+async function removeDirectory(folderPath: string): Promise<void> {
+  if (!project.value?.canManage || !folderPath) return;
+  const context = captureContext();
+  type Node = { path: string; fileCount: number; children: unknown[] };
+  const find = (nodes: Node[]): Node | undefined => {
+    for (const node of nodes) {
+      if (node.path === folderPath) return node;
+      const child = find(node.children as Node[]);
+      if (child) return child;
+    }
+    return undefined;
+  };
+  const node = find(projectFolders.value);
+  const hasFiles = (item: Node): boolean => item.fileCount > 0 || (item.children as Node[]).some(hasFiles);
+  if (node && hasFiles(node)) { ElMessage.warning('目录中存在文件，请先删除目录及子目录中的文件。'); return; }
+  if (node?.children.length) { ElMessage.warning('目录中存在子目录，请先删除子目录。'); return; }
+  try {
+    await ElMessageBox.confirm(`确认删除目录 ${folderPath}？仅允许删除空目录；有文件时请先删除文件，有子目录时请先删除子目录。回收站文件仍可恢复。`, '删除空目录', {
+      type: 'warning', confirmButtonText: '删除目录', cancelButtonText: '取消',
+    });
+  } catch { return; }
+  if (!context.current()) return;
+  await fileApi.removeFolder(context.id, folderPath);
+  if (!context.current()) return;
+  ElMessage.success('空目录已删除。');
+  await loadDirectories();
+}
 const stats = ref<ProjectStats | null>(null);
 const projectStorages = computed(() => [...(project.value?.storages || [])].sort((a, b) => Number(a.provider === 'LOCAL') - Number(b.provider === 'LOCAL') || a.priority - b.priority || a.id.localeCompare(b.id)));
+const preferredProjectStorage = computed(() => projectStorages.value.find(storage => storage.enabled));
 const cloudUsages = ref<Record<string, StorageUsageResult>>({});
 const cloudUsageLoading = ref<Record<string, boolean>>({});
 const cloudUsageErrors = ref<Record<string, string>>({});
@@ -708,6 +797,7 @@ const downloadItems = ref<
     originalName: string | null;
     bytes: number;
     source: string;
+    message: string | null;
     success: boolean;
     ip: string | null;
     createdAt: string;
@@ -773,6 +863,7 @@ async function loadDetail(): Promise<void> {
     readPanel('project', (id, signal) => projectApi.get(id, { signal }), result => {
       project.value = result;
       if (result.canManage) {
+        void loadDirectories();
         void readPanel('secrets', (id, signal) => projectApi.listSecrets(id, { signal }), result => { secrets.value = result; });
         void loadCredentials();
         void loadLifecycle();
@@ -992,6 +1083,9 @@ watch(projectId, () => {
   panelReads.forEach(controller => controller.abort());
   panelReads.clear();
   project.value = null;
+  projectFolders.value = [];
+  directoriesLoading.value = false;
+  directoriesError.value = '';
   stats.value = null;
   cdnConfigs.value = [];
   files.value = [];
@@ -1048,6 +1142,15 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.directory-node {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex: 1;
+  min-width: 0;
+}
+
 .hidden-input {
   display: none;
 }

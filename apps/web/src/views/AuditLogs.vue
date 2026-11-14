@@ -55,12 +55,22 @@
             </template>
           </el-table-column>
           <el-table-column label="操作人" min-width="150">
-            <template #default="{ row }">{{ row.actor?.displayName || row.actor?.username || '开放接口' }}</template>
+            <template #default="{ row }">{{ row.actor?.displayName || row.actor?.username || row.detail?.actor || auditDownloadChannel(row.detail) || '开放接口' }}</template>
           </el-table-column>
           <el-table-column label="项目" min-width="170">
             <template #default="{ row }">{{ row.project?.name || '-' }}</template>
           </el-table-column>
           <el-table-column prop="ip" label="IP" min-width="130" />
+          <el-table-column label="下载来源" min-width="320">
+            <template #default="{ row }">
+              <template v-if="isDownloadAudit(row.action)">
+                <div v-if="auditDownloadChannel(row.detail)" class="muted">{{ auditDownloadChannel(row.detail) }}</div>
+                <DownloadStorageInfo v-if="auditDownloadSource(row.detail)" :source="auditDownloadSource(row.detail)" />
+                <span v-else class="muted">未记录下载来源</span>
+              </template>
+              <span v-else class="muted">—</span>
+            </template>
+          </el-table-column>
           <el-table-column label="详情" min-width="260" show-overflow-tooltip>
             <template #default="{ row }">
               <span class="mono">{{ formatValue(row.detail || {}) }}</span>
@@ -97,7 +107,7 @@
         </div>
         <div class="detail-row">
           <span class="muted">操作人</span>
-          <span>{{ selectedLog.actor?.displayName || selectedLog.actor?.username || '开放接口' }}</span>
+          <span>{{ selectedLog.actor?.displayName || selectedLog.actor?.username || selectedLog.detail?.actor || auditDownloadChannel(selectedLog.detail) || '开放接口' }}</span>
         </div>
         <div class="detail-row">
           <span class="muted">项目</span>
@@ -114,6 +124,12 @@
         <div class="detail-row">
           <span class="muted">时间</span>
           <span>{{ formatTime(selectedLog.createdAt) }}</span>
+        </div>
+        <div v-if="isDownloadAudit(selectedLog.action)" class="detail-row">
+          <span class="muted">下载来源</span>
+          <span v-if="auditDownloadChannel(selectedLog.detail)">{{ auditDownloadChannel(selectedLog.detail) }}</span>
+          <DownloadStorageInfo v-if="auditDownloadSource(selectedLog.detail)" :source="auditDownloadSource(selectedLog.detail)" />
+          <span v-else class="muted">未记录下载来源</span>
         </div>
         <pre class="detail-json">{{ formatJson(selectedLog.detail || {}) }}</pre>
       </div>
@@ -150,6 +166,8 @@ import { onMounted, reactive, ref } from 'vue';
 import { projectApi, settingsApi } from '@/api/modules';
 import type { AuditAction, AuditLog, PageResult, Project } from '@/types';
 import { saveBlob } from '@/utils/io';
+import DownloadStorageInfo from '@/components/DownloadStorageInfo.vue';
+import { auditDownloadChannel, auditDownloadSource, isDownloadAudit } from '@/utils/audit-download-view';
 
 type TagType = 'primary' | 'success' | 'info' | 'warning' | 'danger';
 

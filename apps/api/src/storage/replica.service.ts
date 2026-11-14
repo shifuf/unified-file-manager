@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CdnProvider, type CdnConfig, type Prisma } from '@prisma/client';
 import { createHash } from 'node:crypto';
@@ -12,9 +12,10 @@ import { pipeline } from 'node:stream/promises';
 import { PrismaService } from '../prisma/prisma.service';
 import { decryptText } from './crypto.util';
 import { StorageAdapterRegistry } from './storage-registry.service';
-import { isAnyStorageUsageAtThreshold, resolveUsageValue } from './storage-policy.util';
+import { storageIdentity } from './download-source.util';
+import { StorageLimitError, StorageLimitsService, type ReadReservation, type UploadReservation } from './storage-limits.service';
 import type { StorageFileInput, StorageUploadResult } from './storage.service';
-import type { RuntimeCdnConfig, StorageByteRange, StorageDownloadTarget, StorageObjectFingerprint, StorageUploadFileParams, StorageUsageSnapshot } from './storage.types';
+import type { DownloadStorageSource, RuntimeCdnConfig, StorageByteRange, StorageDownloadTarget, StorageObjectFingerprint, StorageUploadFileParams } from './storage.types';
 
 type ReplicaRow = {
   id: string; projectId: string; configId: string; storageKey: string; size: bigint;
@@ -41,12 +42,13 @@ const BUFFER_LIMIT = 32 * 1024 * 1024;
 @Injectable()
 export class ReplicaService {
   private readonly logger = new Logger(ReplicaService.name);
-  private readonly quotaCache = new Map<string, { revision: string; value: boolean | null; expiresAt: number }>();
+  private readonly limits: StorageLimitsService;
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly registry: StorageAdapterRegistry,
-  ) {}
+    @Optional() limits?: StorageLimitsService,
+  ) { this.limits = limits ?? new StorageLimitsService(prisma, registry, configService); }
 
   private table(client: unknown = this.prisma): ReplicaDelegate {
     const table = (client as { storageReplica?: ReplicaDelegate }).storageReplica;
@@ -79,8 +81,8 @@ export class ReplicaService {
     }
   }
 
-  async verifyLocalObject(config: RuntimeCdnConfig, storageKey: string, size: bigint, checksum: string): Promise<void> {
-    const object = await this.readVerified(config, storageKey, size, checksum);
+  async verifyLocalObject(config: RuntimeCdnConfig, storageKey: string, size: bigint, checksum: string, reservation?: ReadReservation): Promise<void> {
+    const object = await this.readVerified(config, storageKey, size, checksum, reservation);
     await object.cleanup();
   }
 
@@ -125,34 +127,47 @@ export class ReplicaService {
   async getDownloadTargetForKey(file: StorageFileInput, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget> {
     const storageKey = normalizeKey(key);
     const rows = await this.table().findMany({ where: { projectId: file.projectId, storageKey }, include: { config: true } });
-    const ready = await this.readableRows(rows.filter(r => r.status === 'READY'), false, file.projectId);
-    for (const row of ready) {
-      try {
-        const object = await this.readVerified(this.runtime(row.config!), storageKey, row.size, row.checksum);
-        return verifiedTarget(object, range, file.mimeType);
-      } catch (error) {
-        await this.markUnreadable(row, error);
+    const attempts: DownloadStorageSource['attempts'] = [];
+    const allowed = await this.boundCloudIds(file.projectId);
+    // Order all states together: a pending cloud may already contain valid
+    // bytes and must be tried before a ready local safety copy.
+    const ordered = rows.filter(row => row.config).sort((a, b) =>
+      Number(a.config!.provider === CdnProvider.LOCAL) - Number(b.config!.provider === CdnProvider.LOCAL)
+      || a.config!.priority - b.config!.priority || a.configId.localeCompare(b.configId));
+    for (const row of ordered) {
+      const config = row.config!;
+      let skipped: string | undefined;
+      if (config.provider !== CdnProvider.LOCAL) {
+        if (!config.enabled) skipped = '存储已停用。';
+        else if (!allowed.has(row.configId)) skipped = '存储未绑定当前项目。';
       }
-    }
-    // Backfill inserts PENDING rows before copying. Those rows must not hide
-    // valid original bytes during the indexing window; verify before recovery.
-    const pendingSources = await this.readableRows(rows.filter(r => r.status !== 'READY' && r.status !== 'SKIPPED'), true, file.projectId);
-    for (const row of pendingSources) {
+      if (row.status === 'SKIPPED') skipped = skipped || '该副本已跳过同步。';
+      if (skipped) { attempts.push({ ...storageIdentity(config), outcome: 'SKIPPED', reason: skipped }); continue; }
       try {
-        const object = await this.readVerified(this.runtime(row.config!), storageKey, row.size, row.checksum);
-        await this.recoverRead(file, this.runtime(row.config!), storageKey, object);
-        return verifiedTarget(object, range, file.mimeType);
-      } catch { /* try the next actual source */ }
+        const object = await this.readVerified(this.runtime(config), storageKey, row.size, row.checksum);
+        if (row.status !== 'READY') await this.recoverRead(file, this.runtime(config), storageKey, object);
+        attempts.push({ ...storageIdentity(config), outcome: 'SELECTED' });
+        return { ...verifiedTarget(object, range, file.mimeType), storageSource: {
+          strategy: 'CLOUD_PRIORITY', selected: storageIdentity(config), attempts,
+        } };
+      } catch (error) {
+        attempts.push({ ...storageIdentity(config), outcome: error instanceof StorageLimitError ? 'SKIPPED' : 'FAILED', reason: safeError(error) });
+        // A failed status update must not prevent the next cloud/local read.
+        if (row.status === 'READY') await this.markUnreadable(row, error).catch(() => undefined);
+      }
     }
     // Unindexed versions/derivatives use their original location, with only the
     // current object's metadata applied to the current key.
     if (rows.length === 0 && file.cdnConfig && (file.cdnConfig.provider === CdnProvider.LOCAL ||
-      (file.cdnConfig.enabled && (await this.boundCloudIds(file.projectId)).has(file.cdnConfig.id) && await this.configAtThreshold(file.cdnConfig) !== true))) {
+      (file.cdnConfig.enabled && (await this.boundCloudIds(file.projectId)).has(file.cdnConfig.id)))) {
       try {
         const current = storageKey === normalizeKey(file.storageKey);
         const object = await this.readVerified(this.runtime(file.cdnConfig), storageKey, current ? file.size : undefined, current ? file.checksum : undefined);
         await this.recoverRead(file, this.runtime(file.cdnConfig), storageKey, object);
-        return verifiedTarget(object, range, file.mimeType);
+        const selected = storageIdentity(file.cdnConfig);
+        return { ...verifiedTarget(object, range, file.mimeType), storageSource: {
+          strategy: 'CLOUD_PRIORITY', selected, attempts: [...attempts, { ...selected, outcome: 'SELECTED' }],
+        } };
       } catch { /* continue to an explicit unavailable-object response */ }
     }
     throw new NotFoundException('文件存储副本均不可读取，文件可能缺失或损坏。');
@@ -160,16 +175,29 @@ export class ReplicaService {
 
   private async recoverRead(file: StorageFileInput, source: RuntimeCdnConfig, key: string, object: VerifiedObject): Promise<void> {
     try {
-      const local = source.provider === CdnProvider.LOCAL ? source : await this.getLocalStorage(file.projectId);
-      if (local.id !== source.id) {
-        await this.uploadDisk(local, key, object, file.mimeType, file.originalName);
-        await this.verifyLocalObject(local, key, BigInt(object.size), object.checksum);
+      if (source.provider === CdnProvider.LOCAL) {
+        await this.recordLocalAndEnqueue(file.projectId, source.id, key, BigInt(object.size), object.checksum);
+        return;
       }
-      await this.recordLocalAndEnqueue(file.projectId, local.id, key, BigInt(object.size), object.checksum);
+      // The response already has verified cloud bytes. Schedule any missing
+      // safety copy without reading LOCAL on the cloud download request.
+      const local = await this.getLocalStorage(file.projectId);
+      await this.table().upsert({
+        where: { projectId_storageKey_configId: { projectId: file.projectId, storageKey: key, configId: source.id } },
+        create: { projectId: file.projectId, storageKey: key, configId: source.id,
+          size: BigInt(object.size), checksum: object.checksum, status: 'READY', verifiedAt: new Date() },
+        update: { checksum: object.checksum, status: 'READY', verifiedAt: new Date(), lastError: null },
+      });
+      const clouds = await this.prisma.cdnConfig.findMany({
+        where: { enabled: true, provider: { not: CdnProvider.LOCAL }, projectId: null, projectBindings: { some: { projectId: file.projectId } } },
+      });
+      await this.table().createMany({ data: [local.id, ...clouds.map(config => config.id)]
+        .filter(id => id !== source.id).map(configId => ({ projectId: file.projectId, storageKey: key, configId,
+          size: BigInt(object.size), checksum: object.checksum, status: 'PENDING' })), skipDuplicates: true });
     } catch {
       // Verified original bytes remain downloadable if a queue/checkpoint write
       // fails. A subsequent worker or read retries the local safety copy.
-      this.logger.warn('旧对象补齐本地副本失败，将在后续同步或读取时重试。');
+      this.logger.warn('旧对象补齐本地副本排队失败，将在后续同步或读取时重试。');
     }
   }
 
@@ -181,32 +209,15 @@ export class ReplicaService {
   private async readableRows(rows: ReplicaRow[], localFirst = false, projectId?: string): Promise<ReplicaRow[]> {
     const allowed = projectId ? await this.boundCloudIds(projectId) : null;
     const eligible = rows.filter(r => r.config && (r.config.provider === CdnProvider.LOCAL || (r.config.enabled && (!allowed || allowed.has(r.configId)))));
-    const states = await Promise.all(eligible.map(async row => ({ row, exhausted: await this.configAtThreshold(row.config!) })));
-    return states.filter(s => s.exhausted !== true).map(s => s.row).sort((a, b) => {
+    return eligible.sort((a, b) => {
       const al = a.config!.provider === CdnProvider.LOCAL, bl = b.config!.provider === CdnProvider.LOCAL;
       if (al !== bl) return al === localFirst ? -1 : 1;
       return (a.config!.priority - b.config!.priority) || a.configId.localeCompare(b.configId);
     });
   }
 
-  private async configAtThreshold(config: CdnConfig): Promise<boolean | null> {
-    if (config.provider === CdnProvider.LOCAL) return false;
-    const revision = JSON.stringify([config.updatedAt?.getTime(), config.storageQuotaBytes?.toString(), config.manualStorageUsedBytes?.toString(),
-      config.trafficQuotaBytes?.toString(), config.manualTrafficUsedBytes?.toString(), config.failoverThresholdPercent]);
-    const cached = this.quotaCache.get(config.id);
-    if (cached?.revision === revision && cached.expiresAt > Date.now()) return cached.value;
-    let usage: StorageUsageSnapshot = {};
-    try { usage = await this.registry.adapter(config.provider).getUsage?.(this.runtime(config)) ?? {}; } catch { /* unknown usage is not zero */ }
-    const value = isAnyStorageUsageAtThreshold({ thresholdPercent: config.failoverThresholdPercent,
-      storageUsedBytes: resolveUsageValue(usage.storageUsedBytes, config.manualStorageUsedBytes).value,
-      storageQuotaBytes: resolveUsageValue(usage.storageQuotaBytes, config.storageQuotaBytes).value,
-      trafficUsedBytes: resolveUsageValue(usage.trafficUsedBytes, config.manualTrafficUsedBytes).value,
-      trafficQuotaBytes: resolveUsageValue(usage.trafficQuotaBytes, config.trafficQuotaBytes).value });
-    this.quotaCache.set(config.id, { revision, value, expiresAt: Date.now() + 30_000 });
-    return value;
-  }
-
   private async markUnreadable(row: ReplicaRow, error: unknown): Promise<void> {
+    if (error instanceof StorageLimitError) return;
     await this.table().updateMany({ where: { id: row.id }, data: {
       status: error instanceof NotFoundException ? 'MISSING' : 'FAILED', verifiedAt: null,
       lastError: safeError(error), nextAttemptAt: new Date(Date.now() + 30_000),
@@ -243,8 +254,8 @@ export class ReplicaService {
       heartbeat.unref?.();
       let source: VerifiedObject | undefined;
       let corrupt: StorageObjectFingerprint | undefined;
+      let uploadReservation: UploadReservation | undefined;
       try {
-        if (await this.configAtThreshold(row.config) === true) throw new Error('存储已达到空间或流量阈值，等待用量恢复后重试。');
         // Only a known digest can identify a previously uploaded target. Legacy
         // objects first derive their digest from the original/local source.
         if (row.checksum) {
@@ -269,16 +280,18 @@ export class ReplicaService {
               checksum: source.checksum, mimeType: 'application/octet-stream', originalName: row.storageKey.split('/').pop() || 'object' }, corrupt);
             if (normalizeKey(stored.storageKey) !== normalizeKey(row.storageKey)) throw new Error('复制目标返回了不同的不可变 key。');
           } else {
-            await this.uploadDisk(this.runtime(row.config), row.storageKey, source, 'application/octet-stream', row.storageKey.split('/').pop() || 'object');
+            uploadReservation = await this.uploadDisk(this.runtime(row.config), row.storageKey, source, 'application/octet-stream', row.storageKey.split('/').pop() || 'object');
           }
-          const verified = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, source.checksum);
+          const verified = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, source.checksum, uploadReservation?.verification);
           await verified.cleanup();
+          if (uploadReservation) await this.limits.finishUpload(uploadReservation, 'PRESENT');
         }
         const updated = await this.table().updateMany({ where: { id: row.id, leaseOwner: owner, leaseUntil: { gt: new Date() } }, data: {
           status: 'READY', checksum: source.checksum, verifiedAt: new Date(), lastError: null, leaseOwner: null, leaseUntil: null,
         } });
         if (updated.count === 1) summary.ready++;
       } catch (error) {
+        if (uploadReservation) await this.limits.reconcileFailedUpload(uploadReservation, this.runtime(row.config), row.storageKey);
         const attempts = row.attempts + 1;
         const delay = Math.min(6 * 3600_000, 30_000 * 2 ** Math.min(10, attempts - 1));
         await this.table().updateMany({ where: { id: row.id, leaseOwner: owner }, data: {
@@ -334,35 +347,67 @@ export class ReplicaService {
     return { queued: created.count + retried.count };
   }
 
-  private async readVerified(config: RuntimeCdnConfig, key: string, size?: bigint | number, checksum?: string | null): Promise<VerifiedObject> {
-    const adapter = this.registry.adapter(config.provider);
-    let target: StorageDownloadTarget;
-    if (adapter.getDownloadTarget) target = await adapter.getDownloadTarget(config, key);
-    else {
-      const url = await adapter.getDownloadUrl(config, key, 600);
-      let response: Response;
-      try { response = await fetch(url, { signal: AbortSignal.timeout(120_000) }); }
-      catch { throw new Error('远程存储连接失败。'); }
-      if (!response.ok || !response.body) {
-        await response.body?.cancel();
-        if (response.status === 404) throw new NotFoundException('远程对象不存在。');
-        throw new Error(`远程存储返回不可读取状态 ${response.status}。`);
+  async readVerified(config: RuntimeCdnConfig, key: string, size?: bigint | number, checksum?: string | null, reservation?: ReadReservation): Promise<VerifiedObject> {
+    const ticket = reservation ?? await this.limits.reserveRead(config, size);
+    try {
+      const adapter = this.registry.adapter(config.provider);
+      let target: StorageDownloadTarget;
+      const range = ticket.bytes !== null && ticket.bytes > 0n ? { start: 0, end: Number(ticket.bytes - 1n) } : undefined;
+      // Adapter streams do not expose Content-Range totals. Read their full object
+      // so an unknown-size range cannot silently certify a truncated prefix.
+      if (adapter.getDownloadTarget) target = await adapter.getDownloadTarget(config, key);
+      else {
+        const url = await adapter.getDownloadUrl(config, key, 600);
+        let response: Response;
+        try { response = await fetch(url, { signal: AbortSignal.timeout(120_000),
+          headers: range ? { Range: `bytes=0-${range.end}` } : undefined }); }
+        catch { throw new Error('远程存储连接失败。'); }
+        if (!response.ok || !response.body) {
+          await response.body?.cancel();
+          if (response.status === 404) throw new NotFoundException('远程对象不存在。');
+          throw new Error(`远程存储返回不可读取状态 ${response.status}。`);
+        }
+        const total = response.headers.get('content-range')?.match(/\/(\d+)$/)?.[1];
+        if (size !== undefined && total && BigInt(total) !== BigInt(size)) {
+          await response.body.cancel();
+          throw new Error('对象大小与记录不一致。');
+        }
+        if (ticket.bytes !== null && total && BigInt(total) > ticket.bytes) {
+          await response.body.cancel();
+          throw new StorageLimitError('云存储流量额度不足以读取完整对象。');
+        }
+        const length = response.headers.get('content-length');
+        target = { type: 'stream', stream: Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]),
+          contentLength: length === null ? undefined : Number(length) };
       }
-      target = { type: 'stream', stream: Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]) };
-    }
-    if (!target.stream || target.type !== 'stream') throw new Error('存储适配器未提供可验证的文件流。');
-    return spoolVerifiedStream(target.stream, size, checksum);
+      if (!target.stream || target.type !== 'stream') throw new Error('存储适配器未提供可验证的文件流。');
+      if (target.contentLength !== undefined && Number.isSafeInteger(target.contentLength) && target.contentLength >= 0) {
+        if (size !== undefined && BigInt(target.contentLength) !== BigInt(size)) {
+          target.stream.destroy(); throw new Error('对象大小与记录不一致。');
+        }
+        if (ticket.bytes !== null && BigInt(target.contentLength) > ticket.bytes) {
+          target.stream.destroy(); throw new StorageLimitError('云存储流量额度不足以读取完整对象。');
+        }
+      }
+      return await this.limits.consumeRead(ticket, target.stream, stream => spoolVerifiedStream(stream, size, checksum));
+    } finally { await this.limits.settleRead(ticket, 0n); }
   }
 
-  private async uploadDisk(config: RuntimeCdnConfig, key: string, object: VerifiedObject, mimeType: string, originalName: string): Promise<void> {
+  private async uploadDisk(config: RuntimeCdnConfig, key: string, object: VerifiedObject, mimeType: string, originalName: string): Promise<UploadReservation> {
     const adapter = this.registry.adapter(config.provider);
-    const params: StorageUploadFileParams = { key, path: object.path, size: object.size, checksum: object.checksum, mimeType, originalName };
-    const stored = adapter.uploadFile
-      ? await adapter.uploadFile(config, params)
-      : object.size <= BUFFER_LIMIT
-        ? await adapter.upload(config, { key, buffer: await readFile(object.path), mimeType, originalName })
-        : (() => { throw new Error('存储适配器未支持流式复制，超过 32MiB 的对象已保留本地等待重试。'); })();
-    if (normalizeKey(stored.storageKey) !== normalizeKey(key)) throw new Error('复制目标返回了不同的不可变 key。');
+    if (!adapter.uploadFile && object.size > BUFFER_LIMIT) throw new Error('存储适配器未支持流式复制，超过 32MiB 的对象已保留本地等待重试。');
+    const reservation = await this.limits.reserveUpload(config, object.size, key);
+    try {
+      const params: StorageUploadFileParams = { key, path: object.path, size: object.size, checksum: object.checksum, mimeType, originalName };
+      const stored = adapter.uploadFile
+        ? await adapter.uploadFile(config, params)
+        : await adapter.upload(config, { key, buffer: await readFile(object.path), mimeType, originalName });
+      if (normalizeKey(stored.storageKey) !== normalizeKey(key)) throw new Error('复制目标返回了不同的不可变 key。');
+      return reservation;
+    } catch (error) {
+      await this.limits.reconcileFailedUpload(reservation, config, key);
+      throw error;
+    }
   }
 
   async copyToConfig(file: StorageFileInput, targetConfigId: string): Promise<StorageUploadResult> {
@@ -370,15 +415,20 @@ export class ReplicaService {
     if (!target) throw new NotFoundException('目标存储配置不存在。');
     const downloaded = await this.getDownloadTargetForKey(file, file.storageKey);
     const object = await spoolVerifiedStream(downloaded.stream!, file.size, file.checksum);
+    let reservation: UploadReservation | undefined;
     try {
-      await this.uploadDisk(this.runtime(target), file.storageKey, object, file.mimeType, file.originalName);
-      const verified = await this.readVerified(this.runtime(target), file.storageKey, BigInt(object.size), object.checksum);
+      reservation = await this.uploadDisk(this.runtime(target), file.storageKey, object, file.mimeType, file.originalName);
+      const verified = await this.readVerified(this.runtime(target), file.storageKey, BigInt(object.size), object.checksum, reservation.verification);
       await verified.cleanup();
+      await this.limits.finishUpload(reservation, 'PRESENT');
       await this.table().upsert({ where: { projectId_storageKey_configId: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id } },
         create: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id, size: BigInt(object.size), checksum: object.checksum, status: 'READY', verifiedAt: new Date() },
         update: { status: 'READY', checksum: object.checksum, verifiedAt: new Date(), lastError: null },
       });
       return { cdnConfigId: target.id, storageKey: file.storageKey, publicUrl: null };
+    } catch (error) {
+      if (reservation) await this.limits.reconcileFailedUpload(reservation, this.runtime(target), file.storageKey);
+      throw error;
     } finally { await object.cleanup(); }
   }
 
@@ -592,6 +642,7 @@ export function verifiedTarget(object: VerifiedObject, range?: StorageByteRange,
 }
 function normalizeKey(key: string): string { return key.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/{2,}/g, '/'); }
 function safeError(error: unknown): string {
+  if (error instanceof StorageLimitError) return error.message;
   if (error instanceof NotFoundException) return '存储对象不存在或没有可验证的源副本。';
   const message = error instanceof Error ? error.message : '存储复制失败。';
   // Provider errors can contain credentials or signed URLs. Only our fixed

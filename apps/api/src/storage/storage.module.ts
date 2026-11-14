@@ -12,6 +12,7 @@ import { ReplicaController } from './replica.controller';
 import { FileReplicaController } from './file-replica.controller';
 import { FileReplicaService } from './file-replica.service';
 import { ReplicaWorker } from './replica.worker';
+import { StorageLimitsService } from './storage-limits.service';
 import { ProjectAccessService } from '../projects/project-access.service';
 
 @Module({
@@ -23,12 +24,13 @@ import { ProjectAccessService } from '../projects/project-access.service';
     S3Adapter,
     StorageAdapterRegistry,
     StorageService,
+    StorageLimitsService,
     UpyunAdapter,
     ReplicaService,
     FileReplicaService,
     ReplicaWorker,
     ProjectAccessService,
   ],
-  exports: [StorageAdapterRegistry, StorageService, ReplicaService],
+  exports: [StorageAdapterRegistry, StorageService, ReplicaService, StorageLimitsService],
 })
 export class StorageModule {}

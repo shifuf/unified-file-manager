@@ -47,8 +47,12 @@ import { DownloadSource } from '@prisma/client';
 
 import { AccessStatsService } from './access-stats.service';
 import { DownloadStatsService } from './download-stats.service';
+import { writeDownloadStorageHeader } from '../storage/download-source.util';
+import type { StorageDownloadTarget } from '../storage/storage.types';
 import { BatchDownloadDto } from './dto/batch-download.dto';
 import { CreateFolderDto } from './dto/create-folder.dto';
+import { ListFoldersDto } from './dto/list-folders.dto';
+import { RemoveFolderDto } from './dto/remove-folder.dto';
 import { BatchFileOperationDto } from './dto/batch-file-operation.dto';
 import { BatchCopyFileDto, BatchMoveFileDto } from './dto/batch-move-file.dto';
 import { CopyFileDto } from './dto/copy-file.dto';
@@ -178,9 +182,10 @@ export class FilesController {
   @Get('projects/:projectId/files/folders')
   listFolders(
     @Param('projectId') projectId: string,
+    @Query() query: ListFoldersDto,
     @CurrentUser() user: RequestUser,
-  ): ReturnType<FilesService['listFolders']> {
-    return this.filesService.listFolders(projectId, user);
+  ): ReturnType<FolderManagerService['listForUser']> {
+    return this.folderManagerService.listForUser(projectId, user, query.status);
   }
 
   @Get('projects/:projectId/files/search')
@@ -200,9 +205,10 @@ export class FilesController {
   @Get('projects/:projectId/files/folder-tree')
   listFolderTree(
     @Param('projectId') projectId: string,
+    @Query() query: ListFoldersDto,
     @CurrentUser() user: RequestUser,
-  ): ReturnType<FilesService['listFolderTree']> {
-    return this.filesService.listFolderTree(projectId, user);
+  ): ReturnType<FolderManagerService['listTreeForUser']> {
+    return this.folderManagerService.listTreeForUser(projectId, user, query.status);
   }
 
   @Post('projects/:projectId/files/folders')
@@ -212,6 +218,15 @@ export class FilesController {
     @CurrentUser() user: RequestUser,
   ): ReturnType<FolderManagerService['createForUser']> {
     return this.folderManagerService.createForUser(projectId, dto.folderPath, user);
+  }
+
+  @Delete('projects/:projectId/files/folders')
+  removeEmptyFolder(
+    @Param('projectId') projectId: string,
+    @Body() dto: RemoveFolderDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<FolderManagerService['removeEmptyForUser']> {
+    return this.folderManagerService.removeEmptyForUser(projectId, dto.folderPath, user);
   }
 
   @Post('projects/:projectId/files/migrate-local')
@@ -252,6 +267,7 @@ export class FilesController {
           ? parsed.end - parsed.start + 1
           : size,
       source: DownloadSource.ADMIN,
+      storageSource: target.storageSource,
       actorId: user.id,
       ip: getClientIp(request),
       userAgent: request.get('user-agent') ?? null,
@@ -290,13 +306,14 @@ export class FilesController {
     for (const file of files) {
       try {
         const target = await this.resolveArchiveTarget(file.id, user);
-        archive.append(target, { name: this.buildArchiveEntryName(file, usedNames) });
+        archive.append(target.stream!, { name: this.buildArchiveEntryName(file, usedNames) });
         this.downloadStatsService.record({
           projectId: file.projectId,
           fileId: file.id,
           originalName: file.originalName,
           bytes: Number(file.size),
           source: DownloadSource.BATCH,
+          storageSource: target.storageSource,
           actorId: user.id,
           ip: getClientIp(request),
           userAgent: request.get('user-agent') ?? null,
@@ -483,6 +500,7 @@ export class FilesController {
       : null = null,
   ): Promise<void> {
     // Cloud redirect cannot honor API-side Range; only redirect when full body requested.
+    writeDownloadStorageHeader(response, target.storageSource);
     if (target.type === 'redirect' && target.url && !range) {
       response.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
       response.redirect(target.url);
@@ -520,11 +538,11 @@ export class FilesController {
   private async resolveArchiveTarget(
     fileId: string,
     user: RequestUser,
-  ): Promise<Readable> {
+  ): Promise<StorageDownloadTarget> {
     const { target } = await this.filesService.getDownloadTarget(fileId, user);
 
     if (target.type === 'stream' && target.stream) {
-      return target.stream;
+      return target;
     }
 
     if (!target.url) {
@@ -536,7 +554,7 @@ export class FilesController {
       throw new BadRequestException(`远程存储返回 ${remoteResponse.status}`);
     }
 
-    return Readable.fromWeb(remoteResponse.body as unknown as NodeReadableStream);
+    return { ...target, type: 'stream', stream: Readable.fromWeb(remoteResponse.body as unknown as NodeReadableStream) };
   }
 
   private formatArchiveFailures(failures: ArchiveFailure[]): string {
@@ -780,12 +798,15 @@ export class PublicFilesController {
       origin: request.get('origin'),
     });
 
-    this.downloadStatsService.record({
+    const recordPublicDownload = (storageSource: StorageDownloadTarget['storageSource'], bytes: number, range?: { start: number; end: number }) => this.downloadStatsService.record({
       projectId: file.projectId,
       fileId: file.id,
       originalName: file.originalName,
-      bytes: Number(file.size) || 0,
+      bytes,
       source: DownloadSource.PUBLIC,
+      storageSource,
+      rangeStart: range?.start ?? null,
+      rangeEnd: range?.end ?? null,
       ip: getClientIp(request),
       userAgent: request.get('user-agent') ?? null,
       referer: request.get('referer') ?? null,
@@ -831,6 +852,8 @@ export class PublicFilesController {
             thumb.storageKey,
           );
           if (thumbTarget.type === 'redirect' && thumbTarget.url && !thumbTarget.stream) {
+            writeDownloadStorageHeader(response, thumbTarget.storageSource);
+            recordPublicDownload(thumbTarget.storageSource, thumb.size);
             // Signed CDN URL — do not cache 302 (token expires).
             response.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
             response.redirect(thumbTarget.url);
@@ -842,6 +865,8 @@ export class PublicFilesController {
             stream = await this.fetchRemoteStream(thumbTarget.url);
           }
           if (stream) {
+            writeDownloadStorageHeader(response, thumbTarget.storageSource);
+            recordPublicDownload(thumbTarget.storageSource, thumb.size);
             response.setHeader('Content-Type', thumb.mimeType || 'image/webp');
             response.setHeader(
               'Content-Disposition',
@@ -874,7 +899,9 @@ export class PublicFilesController {
       // Target may have been built without preferRedirect if env is off; leave as-is.
     }
 
+    writeDownloadStorageHeader(response, activeTarget.storageSource);
     if (activeTarget.type === 'redirect' && activeTarget.url && !rangeOpts && !shouldTransform) {
+      recordPublicDownload(activeTarget.storageSource, fileSize);
       // Signed CDN Location expires in minutes. Never cache the 302/ETag-304 path —
       // browsers would reuse a stale ?e=&token= and CDN returns "token out of date".
       response.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
@@ -894,6 +921,7 @@ export class PublicFilesController {
     }
 
     if (shouldTransform) {
+      recordPublicDownload(activeTarget.storageSource, fileSize);
       const transformedType = resolveTransformedContentType(transformOptions) ?? file.mimeType;
       response.setHeader('Content-Type', transformedType);
       response.setHeader(
@@ -926,6 +954,7 @@ export class PublicFilesController {
     }
 
     this.applyOriginalCacheHeaders(response, file, etag, accessMode);
+    recordPublicDownload(activeTarget.storageSource, parsedRange && typeof parsedRange === 'object' ? parsedRange.length : fileSize, rangeOpts);
     applyRangeHeaders(
       response,
       file.mimeType,
@@ -1205,7 +1234,7 @@ export class PublicSharesController {
     disposition: 'attachment' | 'inline' = 'attachment',
   ): Promise<void> {
     const head = request.method === 'HEAD';
-    const { file, target, watermarkText, range, unsatisfiable } = await this.filesService.getShareDownloadTarget(token, password, {
+    const { file, shareId, target, watermarkText, range, unsatisfiable } = await this.filesService.getShareDownloadTarget(token, password, {
       ip: getClientIp(request),
       ticket, expires: expires === undefined ? undefined : Number(expires),
       head, rangeHeader: getRequestRangeHeader(request),
@@ -1224,6 +1253,8 @@ export class PublicSharesController {
       originalName: file.originalName,
       bytes: range?.length ?? Number(file.size),
       source: DownloadSource.SHARE,
+      shareId,
+      storageSource: target.storageSource,
       ip: getClientIp(request),
       userAgent: request.get('user-agent') ?? null,
       rangeStart: range?.start ?? null,
@@ -1265,6 +1296,7 @@ export class PublicSharesController {
       range?: { start: number; end: number; size: number; length: number } | null;
     } = {},
   ): Promise<void> {
+    writeDownloadStorageHeader(response, target.storageSource);
     if (!target.stream) {
       response.status(404).send('File stream not found.');
       return;

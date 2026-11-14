@@ -11,6 +11,7 @@ import { FilesService } from '../files/files.service';
 import { FolderManagerService } from '../files/folder-manager.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
+import type { DownloadStorageSource } from '../storage/storage.types';
 import type { WebdavAccount } from './webdav-account.service';
 import { davBaseName, parentDavPath } from './webdav.utils';
 
@@ -19,6 +20,7 @@ export type DavReadResult = {
   stream?: Readable;
   redirectUrl?: string;
   size: number;
+  storageSource?: DownloadStorageSource;
 };
 
 /**
@@ -52,6 +54,7 @@ export class WebdavFileService {
       stream: target.type === 'stream' ? target.stream : undefined,
       redirectUrl: target.type === 'redirect' ? target.url : undefined,
       size: Number(file.size),
+      storageSource: target.storageSource,
     };
   }
   /** PUT: write the body into the project's active storage and register metadata. */

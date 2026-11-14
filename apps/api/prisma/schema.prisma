@@ -219,6 +219,13 @@ model CdnConfig {
   manualStorageUsedBytes BigInt?
   trafficQuotaBytes BigInt?
   manualTrafficUsedBytes BigInt?
+  storageLimitEnabled Boolean @default(true)
+  trafficLimitEnabled Boolean @default(false)
+  trafficQuotaMode String @default("FIXED") @db.VarChar(16)
+  trafficPeriodKey String? @db.VarChar(7)
+  quotaRevision Int @default(0)
+  trackedStorageBytes BigInt @default(0)
+  storageBaselineBytes BigInt?
   failoverThresholdPercent Float @default(90)
   autoFailover   Boolean       @default(false)
   manualUsageUpdatedAt DateTime?
@@ -228,10 +235,27 @@ model CdnConfig {
   activeProjects Project[]     @relation("ProjectActiveStorageConfig")
   projectBindings ProjectStorageBinding[]
   storageReplicas StorageReplica[]
+  spaceReservations StorageSpaceReservation[]
   files          ManagedFile[]
 
   @@index([projectId, active])
   @@index([enabled, provider])
+}
+
+model StorageSpaceReservation {
+  id String @id @default(cuid())
+  configId String
+  keyHash String @db.Char(64)
+  storageKey String @db.VarChar(512)
+  size BigInt
+  quotaRevision Int
+  owner String? @db.VarChar(64)
+  leaseUntil DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  config CdnConfig @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  @@unique([configId, keyHash])
 }
 
 model ProjectStorageBinding {

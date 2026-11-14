@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CdnProvider, type CdnConfig } from '@prisma/client';
 import { Readable } from 'node:stream';
@@ -7,8 +7,10 @@ import { createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { decryptText, getSigningSecret, hmacSha256Base64Url } from './crypto.util';
 import { StorageAdapterRegistry } from './storage-registry.service';
-import { ReplicaService, spoolVerifiedStream, verifiedTarget } from './replica.service';
-import { isAnyStorageUsageAtThreshold, resolveUsageValue, selectFailoverStorage } from './storage-policy.util';
+import { storageIdentity } from './download-source.util';
+import { ReplicaService, verifiedTarget } from './replica.service';
+import { selectFailoverStorage } from './storage-policy.util';
+import { StorageLimitsService } from './storage-limits.service';
 import type {
   DirectUploadCredential,
   RuntimeCdnConfig,
@@ -46,17 +48,18 @@ const DEFAULT_URL_TTL_SECONDS = 3600;
 @Injectable()
 export class StorageService {
   private readonly logger = new Logger(StorageService.name);
-  private readonly thresholdCache = new Map<string, { revision: string; value: boolean | null; expiresAt: number }>();
+  private readonly limits: StorageLimitsService;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly registry: StorageAdapterRegistry,
     @Optional() private readonly replicas?: ReplicaService,
-  ) {}
+    @Optional() limits?: StorageLimitsService,
+  ) { this.limits = limits ?? new StorageLimitsService(prisma, registry, configService); }
 
   async upload(projectId: string, params: StorageUploadParams): Promise<StorageUploadResult> {
-    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry);
+    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
     const config = await replicas.getLocalStorage(projectId);
     const storageKey = normalizeStorageKey(params.key);
     const checksum = createHash('sha256').update(params.buffer).digest('hex');
@@ -86,7 +89,7 @@ export class StorageService {
 
   async materializeUploadedObject(projectId: string, configId: string, key: string, size: bigint | number | undefined,
     checksum: string | null | undefined, mimeType: string, originalName: string): Promise<StorageUploadResult> {
-    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry);
+    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
     return replicas.materializeUploadedObject(projectId, configId, key, size, checksum, mimeType, originalName);
   }
 
@@ -102,27 +105,21 @@ export class StorageService {
   async getDownloadTargetForKey(
     file: StorageFileInput,
     key: string,
-    expiresSeconds = DEFAULT_URL_TTL_SECONDS,
+    _expiresSeconds = DEFAULT_URL_TTL_SECONDS,
     range?: { start?: number; end?: number },
     _options: StorageTargetOptions = {},
   ): Promise<StorageDownloadTarget> {
     if (this.replicas) return this.replicas.getDownloadTargetForKey(file, key, range);
     const config = this.runtimeConfigForFile(file);
-    const adapter = this.registry.adapter(config.provider);
     const storageKey = normalizeStorageKey(key);
+    const selected = storageIdentity(config);
+    const storageSource = { strategy: 'CLOUD_PRIORITY' as const, selected,
+      attempts: [{ ...selected, outcome: 'SELECTED' as const }] };
 
-    if (config.provider === CdnProvider.LOCAL) {
-      const target = await adapter.getDownloadTarget?.(config, storageKey);
-      if (!target?.stream) throw new NotFoundException('存储对象不可读取。');
-      const current = storageKey === normalizeStorageKey(file.storageKey);
-      return verifiedTarget(await spoolVerifiedStream(target.stream, current ? file.size : undefined, current ? file.checksum : undefined), range, file.mimeType);
-    }
-
-    const url = await adapter.getDownloadUrl(config, storageKey, expiresSeconds);
-
-    const target = await this.streamRemote(url);
     const current = storageKey === normalizeStorageKey(file.storageKey);
-    return verifiedTarget(await spoolVerifiedStream(target.stream!, current ? file.size : undefined, current ? file.checksum : undefined), range, file.mimeType);
+    const reader = new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
+    const object = await reader.readVerified(config, storageKey, current ? file.size : undefined, current ? file.checksum : undefined);
+    return { ...verifiedTarget(object, range, file.mimeType), storageSource };
   }
 
   /** Copy an object into a selected config without removing the source object. */
@@ -159,15 +156,28 @@ export class StorageService {
   async uploadToConfig(configId: string, params: StorageUploadParams): Promise<StorageUploadResult> {
     const config = await this.findConfigById(configId);
     const storageKey = normalizeStorageKey(params.key);
-    const result = await this.registry
-      .adapter(config.provider)
-      .upload(config, { ...params, key: storageKey });
+    const reservation = await this.limits.reserveUpload(config, params.buffer.length, storageKey);
+    try {
+      const result = await this.registry
+        .adapter(config.provider)
+        .upload(config, { ...params, key: storageKey });
 
-    return {
-      cdnConfigId: config.id,
-      storageKey: result.storageKey,
-      publicUrl: result.publicUrl ?? null,
-    };
+      if (config.provider !== CdnProvider.LOCAL) {
+        const reader = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
+        const checksum = createHash('sha256').update(params.buffer).digest('hex');
+        await reader.verifyLocalObject(config, storageKey, BigInt(params.buffer.length), checksum, reservation.verification);
+      }
+      await this.limits.finishUpload(reservation, 'PRESENT');
+
+      return {
+        cdnConfigId: config.id,
+        storageKey: result.storageKey,
+        publicUrl: result.publicUrl ?? null,
+      };
+    } catch (error) {
+      await this.limits.reconcileFailedUpload(reservation, config, storageKey);
+      throw error;
+    } finally { await this.limits.settleRead(reservation.verification, 0n); }
   }
 
   async getActiveStorage(projectId: string): Promise<RuntimeCdnConfig> {
@@ -223,33 +233,7 @@ export class StorageService {
   }
 
   private async configAtFailoverThreshold(config: CdnConfig): Promise<boolean | null> {
-    const revision = JSON.stringify([
-      config.updatedAt?.getTime(), config.storageQuotaBytes?.toString(), config.manualStorageUsedBytes?.toString(),
-      config.trafficQuotaBytes?.toString(), config.manualTrafficUsedBytes?.toString(), config.failoverThresholdPercent,
-    ]);
-    const cached = this.thresholdCache.get(config.id);
-    if (cached?.revision === revision && cached.expiresAt > Date.now()) return cached.value;
-    const runtime = this.runtimeConfig(config);
-    let snapshot: { storageUsedBytes?: number | null; storageQuotaBytes?: number | null; trafficUsedBytes?: number | null; trafficQuotaBytes?: number | null } = {};
-    try {
-      const adapter = this.registry.adapter(config.provider);
-      if (adapter.getUsage) snapshot = await adapter.getUsage(runtime);
-    } catch {
-      this.logger.warn(`获取存储用量失败 config=${config.id}。`);
-    }
-    const storageUsed = resolveUsageValue(snapshot.storageUsedBytes, config.manualStorageUsedBytes);
-    const storageQuota = resolveUsageValue(snapshot.storageQuotaBytes, config.storageQuotaBytes);
-    const trafficUsed = resolveUsageValue(snapshot.trafficUsedBytes, config.manualTrafficUsedBytes);
-    const trafficQuota = resolveUsageValue(snapshot.trafficQuotaBytes, config.trafficQuotaBytes);
-    const value = isAnyStorageUsageAtThreshold({
-      thresholdPercent: config.failoverThresholdPercent,
-      storageUsedBytes: storageUsed.value,
-      storageQuotaBytes: storageQuota.value,
-      trafficUsedBytes: trafficUsed.value,
-      trafficQuotaBytes: trafficQuota.value,
-    });
-    this.thresholdCache.set(config.id, { revision, value, expiresAt: Date.now() + 30_000 });
-    return value;
+    return this.limits.uploadBlocked(config);
   }
 
   async objectExists(projectId: string, key: string, cdnConfigId?: string | null): Promise<boolean> {
@@ -286,18 +270,13 @@ export class StorageService {
     }
 
     const buffer = await readStreamToBuffer(source.stream);
-    const stored = await this.registry.adapter(config.provider).upload(config, {
+    return this.uploadToConfig(config.id, {
       key: normalizeStorageKey(file.storageKey),
       buffer,
       mimeType: file.mimeType,
       originalName: file.originalName,
     });
 
-    return {
-      cdnConfigId: config.id,
-      storageKey: stored.storageKey,
-      publicUrl: stored.publicUrl ?? null,
-    };
   }
 
   buildPublicAccessUrl(fileId: string): string {
@@ -388,43 +367,6 @@ export class StorageService {
     return this.runtimeConfig(config);
   }
 
-
-  /** Proxy a signed remote URL, optionally honoring a single byte range. */
-  private async streamRemote(
-    url: string,
-    range?: { start?: number; end?: number },
-  ): Promise<StorageDownloadTarget> {
-    const start = range?.start;
-    const end = range?.end;
-    const headers =
-      start === undefined
-        ? undefined
-        : { Range: `bytes=${start}-${end === undefined ? '' : end}` };
-
-    let response: Response;
-    try {
-      response = await fetch(url, { headers, signal: AbortSignal.timeout(60_000) });
-    } catch {
-      this.logger.warn('远程存储读取失败。');
-      throw new NotFoundException('远程存储连接失败，文件不可读取。');
-    }
-
-    if (!response.ok || !response.body) {
-      this.logger.warn(`远程存储返回 ${response.status}，无法转发文件流。`);
-      await response.body?.cancel();
-      throw new NotFoundException('远程存储对象不可读取。');
-    }
-
-    const rawLength = response.headers.get('content-length');
-    const contentLength = rawLength === null ? Number.NaN : Number(rawLength);
-
-    return {
-      type: 'stream',
-      stream: Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0]),
-      contentType: response.headers.get('content-type') ?? undefined,
-      contentLength: Number.isFinite(contentLength) ? contentLength : undefined,
-    };
-  }
 
 }
 

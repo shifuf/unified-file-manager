@@ -10,6 +10,8 @@ declare module 'axios' {
     _retried?: boolean;
     /** Suppress the automatic error toast for this request. */
     _silent?: boolean;
+    /** Retain headers for downloads that display their actual storage source. */
+    _withResponse?: boolean;
   }
 }
 
@@ -52,7 +54,7 @@ http.interceptors.request.use((config) => {
 });
 
 http.interceptors.response.use(
-  (response) => response.data,
+  (response) => response.config._withResponse ? response : response.data,
   async (error: AxiosError<{ message?: string | string[] } | Blob>) => {
     const original = error.config;
     if (axios.isCancel(error) || original?.signal?.aborted) {

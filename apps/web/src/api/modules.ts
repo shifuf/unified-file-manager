@@ -1,5 +1,6 @@
 import type {
   DownloadStatsSummary,
+  DownloadStorageSource,
   AuditAction,
   AuditLog,
   CdnConfig,
@@ -25,7 +26,7 @@ import type {
 } from '@/types';
 
 import { http } from './http';
-import type { AxiosRequestConfig } from 'axios';
+import type { AxiosRequestConfig, AxiosResponse } from 'axios';
 import { reactive } from 'vue';
 
 type ReadOptions = Pick<AxiosRequestConfig, 'signal' | '_silent'>;
@@ -158,6 +159,7 @@ export const downloadStatsApi = {
           ip: string | null;
           userAgent: string | null;
           referer: string | null;
+          message: string | null;
           createdAt: string;
         }>;
         total: number;
@@ -270,13 +272,13 @@ export const cdnApi = {
     const url = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
     return http.get<unknown, CdnConfig[]>(url, options);
   },
-  create(payload: { provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }, projectId?: string) {
+  create(payload: { provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageLimitEnabled?: boolean; trafficLimitEnabled?: boolean; trafficQuotaMode?: 'MONTHLY' | 'FIXED'; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }, projectId?: string) {
     const url = projectId ? `/projects/${projectId}/storage-configs` : '/storage-configs';
     return http.post<unknown, CdnConfig>(url, payload);
   },
   update(
     configId: string,
-    payload: Partial<{ provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }>,
+    payload: Partial<{ provider: CdnProvider; name: string; config: Record<string, unknown>; priority?: number; failoverThresholdPercent?: number; autoFailover?: boolean; storageLimitEnabled?: boolean; trafficLimitEnabled?: boolean; trafficQuotaMode?: 'MONTHLY' | 'FIXED'; storageQuotaBytes?: number | null; manualStorageUsedBytes?: number | null; trafficQuotaBytes?: number | null; manualTrafficUsedBytes?: number | null; }>,
     projectId?: string,
   ) {
     const url = projectId ? `/projects/${projectId}/storage-configs/${configId}` : `/storage-configs/${configId}`;
@@ -534,20 +536,34 @@ export const fileApi = {
       timeout: 0,
     });
   },
+  async downloadWithSource(fileId: string): Promise<{ blob: Blob; source: DownloadStorageSource | null }> {
+    const response = await http.get<unknown, AxiosResponse<Blob>>(`/files/${fileId}/download`, {
+      responseType: 'blob', timeout: 0, _withResponse: true,
+    });
+    let source: DownloadStorageSource | null = null;
+    try {
+      const raw = response.headers['x-ufm-download-storage'];
+      if (typeof raw === 'string') source = JSON.parse(decodeURIComponent(raw)) as DownloadStorageSource;
+    } catch { /* Download remains usable if an older server/proxy omits metadata. */ }
+    return { blob: response.data, source };
+  },
   migrateLocalFiles(projectId: string) {
     return http.post<unknown, LocalFileMigrationSummary>(`/projects/${projectId}/files/migrate-local`);
   },
-  listFolders(projectId: string, options: ReadOptions = {}) {
-    return http.get<unknown, string[]>(`/projects/${projectId}/files/folders`, options);
+  listFolders(projectId: string, options: ReadOptions = {}, status: 'ACTIVE' | 'RECYCLED' = 'ACTIVE') {
+    return http.get<unknown, string[]>(`/projects/${projectId}/files/folders`, { ...options, params: { status } });
   },
   createFolder(projectId: string, folderPath: string) {
     return http.post<unknown, { folderPath: string }>(`/projects/${projectId}/files/folders`, { folderPath });
   },
-  listFolderTree(projectId: string, options: ReadOptions = {}) {
+  removeFolder(projectId: string, folderPath: string) {
+    return http.delete<unknown, { success: boolean }>(`/projects/${projectId}/files/folders`, { data: { folderPath } });
+  },
+  listFolderTree(projectId: string, options: ReadOptions = {}, status: 'ACTIVE' | 'RECYCLED' = 'ACTIVE') {
     return http.get<
       unknown,
       Array<{ name: string; path: string; fileCount: number; children: unknown[] }>
-    >(`/projects/${projectId}/files/folder-tree`, options);
+    >(`/projects/${projectId}/files/folder-tree`, { ...options, params: { status } });
   },
   createShare(
     fileId: string,
@@ -1142,6 +1158,9 @@ export const taskApi = {
   },
   remove(taskId: string) {
     return http.delete<unknown, { success: boolean }>(`/tasks/${taskId}`);
+  },
+  batchRemove(taskIds: string[]) {
+    return http.post<unknown, { success: boolean; deleted: number }>('/tasks/batch-delete', { taskIds });
   },
 };
 

@@ -1,4 +1,5 @@
 import type { Prisma } from '@prisma/client';
+import type { DownloadStorageSource } from '../storage/storage.types';
 
 export type DownloadStatInput = {
   projectId: string;
@@ -15,6 +16,7 @@ export type DownloadStatInput = {
   rangeEnd?: number | null;
   success?: boolean;
   message?: string | null;
+  storageSource?: DownloadStorageSource;
 };
 
 export type DownloadSourceValue =
@@ -46,6 +48,7 @@ export type DownloadRecordView = {
   userAgent: string | null;
   referer: string | null;
   createdAt: Date;
+  message: string | null;
 };
 
 export type DownloadHourlyBucket = {

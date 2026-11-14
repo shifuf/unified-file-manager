@@ -1,10 +1,11 @@
-import { Controller, Delete, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { RequestUser } from '../common/types/request-user.type';
 import { ListTasksDto } from './dto/list-tasks.dto';
+import { BatchDeleteTasksDto } from './dto/batch-delete-tasks.dto';
 import { TasksService } from './tasks.service';
 
 @ApiTags('任务中心')
@@ -20,6 +21,14 @@ export class TasksController {
     @CurrentUser() user: RequestUser,
   ): ReturnType<TasksService['list']> {
     return this.tasksService.list(query, user);
+  }
+
+  @Post('batch-delete')
+  batchRemove(
+    @Body() dto: BatchDeleteTasksDto,
+    @CurrentUser() user: RequestUser,
+  ): ReturnType<TasksService['batchRemove']> {
+    return this.tasksService.batchRemove(dto.taskIds, user);
   }
 
   @Get(':taskId')

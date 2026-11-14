@@ -32,3 +32,9 @@ tmp-*.log
 # 会话生成的文档草稿与本地测试，不上传 GitHub
 docs/
 apps/api/test/
+
+# 测试与验收文件仅保留本地
+/tests/
+**/*.test.cjs
+**/*.test.ts
+**/*.spec.ts

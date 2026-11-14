@@ -1630,13 +1630,6 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       throw new NotFoundException('文件不可下载。');
     }
 
-    await this.auditService.write({
-      action: AuditAction.FILE_DOWNLOAD,
-      actorId: user.id,
-      projectId: file.projectId,
-      detail: { fileId },
-    });
-
     return {
       file,
       size: Number(file.size),
@@ -1659,12 +1652,6 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     if (!file) {
       throw new NotFoundException('文件不存在。');
     }
-
-    await this.auditService.write({
-      action: AuditAction.FILE_DOWNLOAD,
-      projectId,
-      detail: { fileId, source: 'open-api' },
-    });
 
     return {
       file,
@@ -2792,7 +2779,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('带水印的图片分享不支持范围下载。');
     }
     const result = {
-      file: share.file, watermarkText: share.watermarkText,
+      file: share.file, shareId: share.id, watermarkText: share.watermarkText,
       range: parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
       unsatisfiable: parsedRange === 'unsatisfiable',
     };
@@ -2814,12 +2801,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
           kind: 'file-share',
         });
         }
-        const counted = await consumeShareDownload(this.prisma, share, 'file', session?.id);
-        if (counted) await this.auditService.write({
-        action: AuditAction.FILE_SHARE_DOWNLOAD,
-        projectId: share.file.projectId,
-        detail: { fileId: share.fileId, shareId: share.id },
-        });
+        await consumeShareDownload(this.prisma, share, 'file', session?.id);
       }
     } catch (error) {
       target.stream?.destroy();

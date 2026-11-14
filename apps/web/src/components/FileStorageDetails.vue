@@ -10,12 +10,17 @@
         <el-descriptions-item label="SHA256"><span class="checksum">{{ currentFile.checksum || '尚无摘要' }}</span></el-descriptions-item>
         <el-descriptions-item label="文件直链"><div class="direct-link"><el-input :model-value="directUrl" readonly /><el-button :disabled="!directUrl" @click="copyLink">复制</el-button></div></el-descriptions-item>
       </el-descriptions>
-      <div class="section-head"><div><strong>存储副本</strong><p class="muted">当前版本的原文件；本地先保存，云存储在后台同步。状态为最近一次记录。</p></div><el-button :loading="loading" @click="refresh">刷新状态</el-button></div>
+      <el-alert v-if="snapshot" :title="preferredDownloadLabel(snapshot.items)" type="info" :closable="false" show-icon>
+        <p>下载顺序：{{ downloadOrderLabel(snapshot.items) || '暂无启用存储' }}</p>
+        <p>按云存储优先级依次读取；云端失败、达到配额阈值或没有可用云副本时才使用本地。下方状态表示副本同步情况，实际来源以本次下载结果为准。</p>
+      </el-alert>
+      <div class="section-head"><div><strong>存储副本</strong><p class="muted">当前版本的原文件；上传先保存本地安全副本，云存储在后台同步。状态为最近一次记录。</p></div><el-button :loading="loading" @click="refresh">刷新状态</el-button></div>
       <el-checkbox-group v-model="selected">
         <el-table :data="snapshot?.items || []" row-key="configId" empty-text="暂无副本信息">
           <el-table-column v-if="snapshot?.canManage && currentFile?.status === 'ACTIVE'" label="选择" width="64"><template #default="{ row }"><el-checkbox :value="row.configId" :disabled="!canSyncReplica(row) || syncing" :aria-label="`同步到${row.configName}`" /></template></el-table-column>
           <el-table-column label="存储" min-width="160"><template #default="{ row }"><strong>{{ row.configName }}</strong><div class="muted">{{ row.provider }} · {{ row.desired ? '当前目标' : '已有位置' }}</div></template></el-table-column>
           <el-table-column label="状态" min-width="145"><template #default="{ row }"><el-tag :type="replicaTagType(row)">{{ replicaLabel(row) }}</el-tag></template></el-table-column>
+          <el-table-column label="下载用途" min-width="125"><template #default="{ row }">{{ !row.enabled || (!row.assigned && !row.desired) ? '不参与下载' : row.provider === 'LOCAL' ? '本地兜底' : `云端优先级 ${row.priority}` }}</template></el-table-column>
           <el-table-column label="最近校验" min-width="170"><template #default="{ row }">{{ row.verifiedAt ? new Date(row.verifiedAt).toLocaleString() : '尚未校验' }}</template></el-table-column>
           <el-table-column prop="lastError" label="失败原因" min-width="170" show-overflow-tooltip />
         </el-table>
@@ -32,7 +37,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import { fileStorageApi } from '@/api/file-storage';
 import type { FileReplicaDetail, ManagedFile } from '@/types';
-import { canSyncReplica, hasPendingReplicas, replicaLabel, replicaSnapshotMatches, replicaTagType, shouldAcceptReplicaSnapshot } from '@/utils/storage-replica-view';
+import { canSyncReplica, downloadOrderLabel, preferredDownloadLabel, hasPendingReplicas, replicaLabel, replicaSnapshotMatches, replicaTagType, shouldAcceptReplicaSnapshot } from '@/utils/storage-replica-view';
 import { copyText } from '@/utils/io';
 
 const props = defineProps<{ modelValue: boolean; file: ManagedFile | null }>();

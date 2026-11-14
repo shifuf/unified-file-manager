@@ -32,6 +32,7 @@ import { CreateShareLinkDto } from './dto/create-share-link.dto';
 import { DownloadSource } from '@prisma/client';
 
 import { DownloadStatsService } from './download-stats.service';
+import { writeDownloadStorageHeader } from '../storage/download-source.util';
 import { FolderShareService } from './folder-share.service';
 
 @ApiTags('目录分享')
@@ -164,7 +165,7 @@ export class PublicFolderSharesController {
   private async downloadFile(token: string, fileId: string, password: string | undefined, ticket: string | undefined, expires: string | undefined, request: Request, response: Response): Promise<void> {
     const clientIp = getClientIp(request);
     const head = request.method === 'HEAD';
-    const { file, target, range, unsatisfiable } = await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
+    const { file, shareId, target, range, unsatisfiable } = await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
       ip: clientIp, head, rangeHeader: getRequestRangeHeader(request),
       ticket, expires: expires === undefined ? undefined : Number(expires),
     });
@@ -189,11 +190,14 @@ export class PublicFolderSharesController {
       originalName: file.originalName,
       bytes: range?.length ?? size,
       source: DownloadSource.FOLDER_SHARE,
+      shareId,
+      storageSource: target.storageSource,
       ip: clientIp,
       userAgent: request.get('user-agent') ?? null,
       rangeStart: range?.start ?? null,
       rangeEnd: range?.end ?? null,
     });
+    writeDownloadStorageHeader(response, target.storageSource);
     applyRangeHeaders(
       response,
       file.mimeType,

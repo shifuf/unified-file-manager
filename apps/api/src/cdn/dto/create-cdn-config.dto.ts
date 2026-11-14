@@ -1,7 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { CdnProvider } from '@prisma/client';
 import { Type } from 'class-transformer';
-import { IsBoolean, IsEnum, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsBoolean, IsEnum, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 
 export class CreateCdnConfigDto {
   @ApiProperty({ enum: CdnProvider, example: CdnProvider.ALIYUN })
@@ -51,31 +51,50 @@ export class CreateCdnConfigDto {
   @IsBoolean()
   autoFailover?: boolean;
 
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  storageLimitEnabled?: boolean;
+
+  @ApiPropertyOptional({ default: false })
+  @IsOptional()
+  @IsBoolean()
+  trafficLimitEnabled?: boolean;
+
+  @ApiPropertyOptional({ enum: ['MONTHLY', 'FIXED'], default: 'FIXED' })
+  @IsOptional()
+  @IsIn(['MONTHLY', 'FIXED'])
+  trafficQuotaMode?: 'MONTHLY' | 'FIXED';
+
   @ApiPropertyOptional({ example: 107374182400 })
   @IsOptional()
   @Type(() => Number)
-  @IsNumber()
+  @IsInt()
+  @Max(Number.MAX_SAFE_INTEGER)
   @Min(0)
   storageQuotaBytes?: number | null;
 
   @ApiPropertyOptional({ example: 53687091200 })
   @IsOptional()
   @Type(() => Number)
-  @IsNumber()
+  @IsInt()
+  @Max(Number.MAX_SAFE_INTEGER)
   @Min(0)
   manualStorageUsedBytes?: number | null;
 
   @ApiPropertyOptional({ example: 1073741824000 })
   @IsOptional()
   @Type(() => Number)
-  @IsNumber()
+  @IsInt()
+  @Max(Number.MAX_SAFE_INTEGER)
   @Min(0)
   trafficQuotaBytes?: number | null;
 
   @ApiPropertyOptional({ example: 536870912000 })
   @IsOptional()
   @Type(() => Number)
-  @IsNumber()
+  @IsInt()
+  @Max(Number.MAX_SAFE_INTEGER)
   @Min(0)
   manualTrafficUsedBytes?: number | null;
 }

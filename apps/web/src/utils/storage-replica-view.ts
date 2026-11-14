@@ -1,5 +1,22 @@
 import type { FileReplicaDetail, FileStorageLocation, ManagedFile } from '../types';
 
+export function storageProviderLabel(provider: string): string {
+  return ({ LOCAL: '本地存储', QINIU: '七牛云', UPYUN: '又拍云', ALIYUN: '阿里云 OSS', S3: 'S3' } as Record<string, string>)[provider] || provider;
+}
+export function downloadLocations(locations: FileStorageLocation[] | null): FileStorageLocation[] {
+  return (locations || []).filter(item => item.enabled && (item.desired || item.assigned))
+    .slice().sort((a, b) => Number(a.provider === 'LOCAL') - Number(b.provider === 'LOCAL') || a.priority - b.priority || a.configId.localeCompare(b.configId));
+}
+export function preferredDownloadLabel(locations: FileStorageLocation[] | null): string {
+  if (!locations) return '下载优先存储待确认';
+  const first = downloadLocations(locations)[0];
+  if (!first) return '暂无启用的下载存储';
+  return `${first.provider === 'LOCAL' ? '下载存储' : '优先下载'}：${first.configName}（${storageProviderLabel(first.provider)}）`;
+}
+export function downloadOrderLabel(locations: FileStorageLocation[] | null): string {
+  return downloadLocations(locations).map(item => `${item.configName}${item.provider === 'LOCAL' ? '（兜底）' : ''}`).join(' → ');
+}
+
 const labels: Record<FileStorageLocation['status'], string> = {
   READY: '已上传', PENDING: '等待同步', SYNCING: '同步中', FAILED: '失败',
   MISSING: '缺失', SKIPPED: '已跳过', NOT_SYNCED: '未同步', UNVERIFIED: '待校验',

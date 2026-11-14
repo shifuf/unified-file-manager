@@ -43,7 +43,7 @@
           v-if="!isRecycleBin && canManageSelectedProject"
           :icon="FolderAdd"
           :disabled="!selectedProjectId"
-          @click="createFolder"
+          @click="createFolder()"
         >
           新建文件夹
         </el-button>
@@ -132,6 +132,8 @@
                   <el-button link type="primary" size="small" @click.stop>⋯</el-button>
                   <template #dropdown>
                     <el-dropdown-menu>
+                      <el-dropdown-item command="create-child">新建子目录</el-dropdown-item>
+                      <el-dropdown-item command="delete-folder">删除空目录</el-dropdown-item>
                       <el-dropdown-item command="public-on">设为公开（继承）</el-dropdown-item>
                       <el-dropdown-item command="public-off">取消公开策略</el-dropdown-item>
                       <el-dropdown-item command="batch-public">批量公开现有文件</el-dropdown-item>
@@ -143,6 +145,7 @@
               </span>
             </template>
           </el-tree>
+          <p v-if="canManageSelectedProject" class="muted">目录有文件时请先删除文件；有子目录时请先删除子目录。</p>
         </aside>
 
         <div class="files-main">
@@ -335,6 +338,15 @@
             <el-table-column label="操作" width="95"><template #default="{ row }"><el-button link type="primary" @click="openStorageDetails(row)">详情</el-button></template></el-table-column>
           </el-table>
           <el-pagination v-model:current-page="uploadResultPage" :page-size="20" :total="uploadResults.files.length" layout="total, prev, pager, next" @current-change="loadUploadResultStorage" />
+        </section>
+
+        <section v-if="downloadResults.length" class="upload-results download-results">
+          <div class="toolbar"><strong>本次页面下载记录</strong><span class="muted">云存储按优先级依次尝试，失败或无可用云副本时使用本地。</span></div>
+          <el-table :data="downloadResults" size="small">
+            <el-table-column prop="name" label="文件名" min-width="180" show-overflow-tooltip />
+            <el-table-column label="实际下载平台／切换详情" min-width="340"><template #default="{ row }"><DownloadStorageInfo :source="row.source" /></template></el-table-column>
+            <el-table-column prop="time" label="时间" width="180" />
+          </el-table>
         </section>
 
         <el-table
@@ -757,11 +769,12 @@ import { useRoute, useRouter } from 'vue-router';
 import { http } from '@/api/http';
 import { fileStorageApi } from '@/api/file-storage';
 import FileStorageDetails from '@/components/FileStorageDetails.vue';
+import DownloadStorageInfo from '@/components/DownloadStorageInfo.vue';
 import StorageLocationTags from '@/components/StorageLocationTags.vue';
 import { uploadResults, retainUploadedFiles } from '@/stores/upload-results';
 import { hasPendingReplicas, localReplicaResult, replicaSnapshotMatches, shouldAcceptReplicaSnapshot } from '@/utils/storage-replica-view';
 import { cancelUploadQueue, fileApi, folderPublicApi, pauseUploadQueue, projectApi, resumeUploadQueue, settingsApi, uploadCredentialApi, uploadQueueState, waitForUploadQueue } from '@/api/modules';
-import type { CdnProvider, FileCategory, FileReplicaDetail, FileStatus, ManagedFile, PageResult, Project, ShareLink, ShareStatus } from '@/types';
+import type { CdnProvider, DownloadStorageSource, FileCategory, FileReplicaDetail, FileStatus, ManagedFile, PageResult, Project, ShareLink, ShareStatus } from '@/types';
 import { copyText, saveBlob } from '@/utils/io';
 
 type FileListParams = Parameters<typeof fileApi.list>[0];
@@ -840,6 +853,7 @@ const folderBreadcrumbs = computed(() => {
 });
 const selectedRows = ref<ManagedFile[]>([]);
 const downloadingIds = ref<Set<string>>(new Set());
+const downloadResults = ref<Array<{ name: string; source: DownloadStorageSource | null; time: string }>>([]);
 const fileInputRef = ref<HTMLInputElement>();
 const folderInputRef = ref<HTMLInputElement>();
 const previewVisible = ref(false);
@@ -960,7 +974,7 @@ const filters = reactive<{
   category: '',
   status: route.name === 'recycle-bin' ? 'RECYCLED' : 'ACTIVE',
   tag: '',
-  folderPath: '',
+  folderPath: readRouteFolderPath(),
   extension: '',
   cdnProvider: '',
   duplicateOnly: false,
@@ -1115,6 +1129,11 @@ function readRouteProjectId(): string {
   return Array.isArray(value) ? String(value[0] || '') : String(value || '');
 }
 
+function readRouteFolderPath(): string {
+  const value = route.query.folderPath;
+  return Array.isArray(value) ? String(value[0] || '') : String(value || '');
+}
+
 async function reloadFirstPage(): Promise<void> {
   pageResult.page = 1;
   await reload();
@@ -1123,7 +1142,7 @@ async function reloadFirstPage(): Promise<void> {
 async function handleProjectFilterChange(): Promise<void> {
   filters.folderPath = '';
   pageResult.page = 1;
-  const query = { ...route.query, projectId: selectedProjectId.value || undefined };
+  const query = { ...route.query, projectId: selectedProjectId.value || undefined, folderPath: undefined };
   if (readRouteProjectId() !== selectedProjectId.value) await router.push({ path: route.path, query });
   else await reload();
 }
@@ -1193,6 +1212,14 @@ async function handleFolderCommand(command: string, path: string): Promise<void>
   }
   const projectId = selectedProjectId.value;
   const folderPath = path || '';
+  if (command === 'create-child') {
+    await createFolder(folderPath);
+    return;
+  }
+  if (command === 'delete-folder') {
+    await removeFolder(folderPath);
+    return;
+  }
   if (command === 'public-on') {
     await folderPublicApi.upsert(projectId, { folderPath, isPublic: true });
     ElMessage.success('已设置文件夹公开策略（路径继承）。');
@@ -1657,30 +1684,64 @@ async function runQueuedUpload<T>(transfer: () => Promise<T>): Promise<T> {
   }
 }
 
-async function createFolder(): Promise<void> {
+async function createFolder(parentPath = filters.folderPath): Promise<void> {
   if (!selectedProjectId.value || !canManageSelectedProject.value) {
     return;
   }
   const current = captureProjectContext();
   const projectId = selectedProjectId.value;
 
-  const { value } = await ElMessageBox.prompt('请输入目录路径（可包含多级，如 contracts/2026）', '新建文件夹', {
-    confirmButtonText: '创建',
-    cancelButtonText: '取消',
-    inputPattern: /^[^\\:*?"<>|]+$/,
-    inputErrorMessage: '目录名不能包含 \\ : * ? " < > |',
-  });
+  let value: string;
+  try {
+    ({ value } = await ElMessageBox.prompt(`在 ${parentPath || '根目录'} 下创建目录（可包含多级，如 contracts/2026）`, '新建文件夹', {
+      confirmButtonText: '创建',
+      cancelButtonText: '取消',
+      inputPattern: /^[^\\:*?"<>|]+$/,
+      inputErrorMessage: '目录名不能包含 \\ : * ? " < > |',
+    }));
+  } catch { return; }
   if (!current()) return;
 
-  const folderPath = String(value ?? '').trim().replace(/^\/+|\/+$/g, '');
-  if (!folderPath) {
+  const name = String(value ?? '').trim().replace(/^\/+|\/+$/g, '');
+  if (!name) {
     ElMessage.warning('目录名不能为空。');
     return;
   }
 
+  const folderPath = [parentPath, name].filter(Boolean).join('/');
   await fileApi.createFolder(projectId, folderPath);
   if (!current()) return;
   ElMessage.success('目录已创建。');
+  await reload();
+}
+
+async function removeFolder(folderPath: string): Promise<void> {
+  if (!selectedProjectId.value || !canManageSelectedProject.value || !folderPath) return;
+  const current = captureProjectContext();
+  const projectId = selectedProjectId.value;
+  type Node = { path: string; fileCount: number; children: unknown[] };
+  const find = (nodes: Node[]): Node | undefined => {
+    for (const node of nodes) {
+      if (node.path === folderPath) return node;
+      const child = find(node.children as Node[]);
+      if (child) return child;
+    }
+    return undefined;
+  };
+  const node = find(folderTree.value);
+  const hasFiles = (item: Node): boolean => item.fileCount > 0 || (item.children as Node[]).some(hasFiles);
+  if (node && hasFiles(node)) { ElMessage.warning('目录中存在文件，请先删除目录及子目录中的文件。'); return; }
+  if (node?.children.length) { ElMessage.warning('目录中存在子目录，请先删除子目录。'); return; }
+  try {
+    await ElMessageBox.confirm(`确认删除目录 ${folderPath}？仅允许删除空目录；有文件时请先删除文件，有子目录时请先删除子目录。回收站文件仍可恢复。`, '删除空目录', {
+      type: 'warning', confirmButtonText: '删除目录', cancelButtonText: '取消',
+    });
+  } catch { return; }
+  if (!current()) return;
+  await fileApi.removeFolder(projectId, folderPath);
+  if (!current()) return;
+  if (filters.folderPath === folderPath || filters.folderPath.startsWith(`${folderPath}/`)) filters.folderPath = folderPath.split('/').slice(0, -1).join('/');
+  ElMessage.success('空目录已删除。');
   await reload();
 }
 function openPreview(file: ManagedFile): void {
@@ -2105,8 +2166,10 @@ async function disableShare(shareId: string): Promise<void> {
 async function download(file: ManagedFile): Promise<void> {
   downloadingIds.value = new Set([...downloadingIds.value, file.id]);
   try {
-    const blob = await fileApi.download(file.id);
+    const { blob, source } = await fileApi.downloadWithSource(file.id);
     saveBlob(blob, file.originalName);
+    downloadResults.value = [{ name: file.originalName, source, time: new Date().toLocaleString() }, ...downloadResults.value].slice(0, 20);
+    if (source) ElMessage.success(`下载来源：${source.selected.configName}${source.selected.provider === 'LOCAL' ? '（本地兜底）' : ''}`);
   } finally {
     const nextIds = new Set(downloadingIds.value);
     nextIds.delete(file.id);
@@ -2279,7 +2342,7 @@ watch(selectedProjectId, () => {
 }, { flush: 'sync' });
 
 watch(
-  () => [route.name, route.query.projectId],
+  () => [route.name, route.query.projectId, route.query.folderPath],
   async () => {
     const id = readRouteProjectId();
     if (selectedProjectId.value !== id) selectedProjectId.value = id;
@@ -2287,6 +2350,7 @@ watch(
     filters.status = isRecycleBin.value
       ? 'RECYCLED'
       : 'ACTIVE';
+    filters.folderPath = readRouteFolderPath();
     pageResult.page = 1;
     await reload();
   },

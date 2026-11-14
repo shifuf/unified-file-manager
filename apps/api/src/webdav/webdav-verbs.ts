@@ -4,6 +4,8 @@ import { Readable } from 'node:stream';
 import { getClientIp } from '../common/utils/client-ip.util';
 import { parseByteRange } from '../common/utils/http-range.util';
 import type { DownloadStatsService } from '../files/download-stats.service';
+import { writeDownloadStorageHeader } from '../storage/download-source.util';
+import type { DownloadStorageSource } from '../storage/storage.types';
 import type { WebdavFileService } from './webdav-file.service';
 import type { WebdavTreeService } from './webdav-tree.service';
 import type { WebdavAccount } from './webdav-account.service';
@@ -86,6 +88,7 @@ async function handleGet(
 
   const range = parsed && typeof parsed === 'object' ? { start: parsed.start, end: parsed.end } : undefined;
   const result = await deps.fileService.readFile(account, davPath, range);
+  writeDownloadStorageHeader(response, result.storageSource);
 
   // HEAD never needs the body, so answer straight from metadata.
   if (!withBody) {
@@ -93,6 +96,7 @@ async function handleGet(
       fileId: result.file.id,
       originalName: result.file.originalName,
       bytes: range ? range.end - range.start + 1 : size,
+      storageSource: result.storageSource,
       range,
     });
     writeFileHeaders(response, result.file.mimeType, result.file.updatedAt, size, range);
@@ -106,6 +110,7 @@ async function handleGet(
       fileId: result.file.id,
       originalName: result.file.originalName,
       bytes: size,
+      storageSource: result.storageSource,
       range: undefined,
     });
     response.redirect(result.redirectUrl);
@@ -148,6 +153,7 @@ async function handleGet(
     fileId: result.file.id,
     originalName: result.file.originalName,
     bytes: length,
+    storageSource: result.storageSource,
     range,
   });
 
@@ -195,6 +201,7 @@ function recordDownload(
     originalName: string;
     bytes: number;
     range?: { start: number; end: number };
+    storageSource?: DownloadStorageSource;
   },
 ): void {
   deps.statsService.record({
@@ -203,6 +210,7 @@ function recordDownload(
     originalName: input.originalName,
     bytes: Math.max(0, input.bytes),
     source: 'WEBDAV',
+    storageSource: input.storageSource,
     actorId: `webdav:${account.username}`,
     ip: getClientIp(request),
     userAgent: request.get('user-agent') ?? null,

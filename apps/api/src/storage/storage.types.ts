@@ -46,6 +46,15 @@ export type StorageDownloadTarget = {
   contentLength?: number;
   verified?: boolean;
   checksum?: string;
+  storageSource?: DownloadStorageSource;
+};
+
+export type DownloadStorageIdentity = { configId: string; configName: string; provider: CdnProvider };
+export type DownloadStorageSource = {
+  strategy: 'CLOUD_PRIORITY';
+  selected: DownloadStorageIdentity;
+  attempts: Array<DownloadStorageIdentity & { outcome: 'SELECTED' | 'FAILED' | 'SKIPPED'; reason?: string }>;
+  omittedAttempts?: number;
 };
 
 export type StorageByteRange = {

@@ -5,7 +5,10 @@
         <h1 class="page-title">任务中心</h1>
         <p class="page-subtitle">查看批量文件操作、迁移、导入等后台任务记录。</p>
       </div>
-      <el-button :icon="Refresh" @click="reload">刷新</el-button>
+      <div class="toolbar">
+        <el-button :icon="Delete" type="danger" plain :disabled="!selectedTasks.length || loading" :loading="deleting" @click="removeSelectedTasks">批量删除{{ selectedTasks.length ? `（${selectedTasks.length}）` : '' }}</el-button>
+        <el-button :icon="Refresh" :disabled="deleting" @click="reload">刷新</el-button>
+      </div>
     </div>
 
     <section class="surface">
@@ -17,20 +20,19 @@
             clearable
             placeholder="项目"
             style="width: 260px"
-            @change="reload"
+            @change="searchTasks"
           >
             <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
-          <el-select v-model="filters.status" clearable placeholder="状态" style="width: 140px" @change="reload">
-            <el-option label="完成" value="COMPLETED" />
-            <el-option label="失败" value="FAILED" />
-            <el-option label="运行中" value="RUNNING" />
-            <el-option label="已暂停" value="PAUSED" />
+          <el-select v-model="filters.status" clearable placeholder="状态" style="width: 140px" @change="searchTasks">
+            <el-option v-for="option in taskStatusOptions" :key="option.value" :label="option.label" :value="option.value" />
           </el-select>
-          <el-input v-model="filters.type" clearable placeholder="任务类型" style="width: 180px" @keyup.enter="reload" />
+          <el-input v-model="filters.type" clearable placeholder="任务类型" style="width: 180px" @keyup.enter="searchTasks" @clear="searchTasks" />
+          <span class="muted">仅可勾选已完成、失败或已取消的任务，删除只清理任务记录。</span>
         </div>
 
-        <el-table v-loading="loading" :data="pageResult.items" row-key="id" class="data-table">
+        <el-table ref="taskTable" v-loading="loading || deleting" :data="pageResult.items" row-key="id" class="data-table" @selection-change="handleSelectionChange">
+          <el-table-column type="selection" width="48" :selectable="canDeleteTask" />
           <el-table-column prop="title" label="任务" min-width="200" />
           <el-table-column label="项目" min-width="160">
             <template #default="{ row }">{{ row.project?.name || '-' }}</template>
@@ -38,7 +40,7 @@
           <el-table-column prop="type" label="类型" min-width="180" />
           <el-table-column label="状态" width="110">
             <template #default="{ row }">
-              <el-tag :type="taskTagType(row.status)">{{ row.status }}</el-tag>
+              <el-tag :type="taskTagType(row.status)">{{ taskStatusLabel(row.status) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="进度" width="150">
@@ -57,7 +59,7 @@
               <el-button v-if="row.type === 'STORAGE_MIGRATION' && row.status === 'PAUSED'" link type="success" @click="resumeTask(row)">继续</el-button>
               <el-button v-if="['RUNNING', 'PAUSED'].includes(row.status)" link type="danger" @click="cancelTask(row)">取消</el-button>
               <el-button v-if="row.status === 'FAILED'" link type="primary" @click="retryTask(row)">重试</el-button>
-              <el-button v-if="!['RUNNING', 'PAUSED'].includes(row.status)" link type="danger" @click="removeTask(row)">删除</el-button>
+              <el-button v-if="canDeleteTask(row)" link type="danger" :disabled="deleting" @click="removeTask(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -91,7 +93,7 @@
         </div>
         <div class="detail-row">
           <span class="muted">状态</span>
-          <el-tag :type="taskTagType(selectedTask.status)">{{ selectedTask.status }}</el-tag>
+          <el-tag :type="taskTagType(selectedTask.status)">{{ taskStatusLabel(selectedTask.status) }}</el-tag>
         </div>
         <div class="detail-row">
           <span class="muted">错误</span>
@@ -113,17 +115,22 @@
 </template>
 
 <script setup lang="ts">
-import { Refresh } from '@element-plus/icons-vue';
-import { ElMessage, ElMessageBox } from 'element-plus';
+import { Delete, Refresh } from '@element-plus/icons-vue';
+import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { projectApi, taskApi } from '@/api/modules';
 import type { PageResult, Project, TaskItem } from '@/types';
+import { canDeleteTask, taskStatusLabel, taskStatusOptions, taskTagType } from '@/utils/task-view';
 
 const route = useRoute();
 const router = useRouter();
 const loading = ref(false);
+const deleting = ref(false);
+const taskTable = ref<TableInstance>();
+const selectedTasks = ref<TaskItem[]>([]);
+let reloadVersion = 0;
 const detailVisible = ref(false);
 const selectedTask = ref<TaskItem | null>(null);
 const projects = ref<Project[]>([]);
@@ -141,19 +148,6 @@ const pageResult = reactive<PageResult<TaskItem>>({
 
 function formatTime(value: string): string {
   return new Date(value).toLocaleString();
-}
-
-function taskTagType(status: string): 'success' | 'warning' | 'danger' | 'info' {
-  if (status === 'COMPLETED') {
-    return 'success';
-  }
-  if (status === 'FAILED') {
-    return 'danger';
-  }
-  if (status === 'RUNNING') {
-    return 'warning';
-  }
-  return 'info';
 }
 
 function formatJson(value: unknown): string {
@@ -195,20 +189,53 @@ async function retryTask(task: TaskItem): Promise<void> {
 }
 
 async function removeTask(task: TaskItem): Promise<void> {
-  await ElMessageBox.confirm('删除后任务记录无法恢复。', '删除任务', {
-    type: 'warning',
-    confirmButtonText: '删除',
-    cancelButtonText: '取消',
-  });
-  await taskApi.remove(task.id);
-  ElMessage.success('任务已删除。');
+  await deleteTasks([task]);
+}
+
+function handleSelectionChange(tasks: TaskItem[]): void {
+  selectedTasks.value = tasks.filter(canDeleteTask);
+}
+
+async function removeSelectedTasks(): Promise<void> {
+  await deleteTasks(selectedTasks.value.slice());
+}
+
+async function deleteTasks(tasks: TaskItem[]): Promise<void> {
+  if (deleting.value || loading.value || !tasks.length || tasks.some(task => !canDeleteTask(task))) return;
+  deleting.value = true;
+  try {
+    try {
+      await ElMessageBox.confirm(`确认删除选中的 ${tasks.length} 条任务记录？不会删除对应文件，删除后记录无法恢复。`, '删除任务记录', {
+        type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消',
+      });
+    } catch (error) {
+      if (error === 'cancel' || error === 'close') return;
+      throw error;
+    }
+    const result = await taskApi.batchRemove(tasks.map(task => task.id));
+    if (selectedTask.value && tasks.some(task => task.id === selectedTask.value?.id)) {
+      detailVisible.value = false;
+      selectedTask.value = null;
+    }
+    ElMessage.success(`已删除 ${result.deleted} 条任务记录。`);
+    await reload();
+  } finally {
+    deleting.value = false;
+  }
+}
+
+async function searchTasks(): Promise<void> {
+  pageResult.page = 1;
   await reload();
 }
 
 async function reload(): Promise<void> {
+  const version = ++reloadVersion;
   const query = filters.projectId ? { projectId: filters.projectId } : {};
   void router.replace({ path: '/tasks', query });
   loading.value = true;
+  selectedTasks.value = [];
+  taskTable.value?.clearSelection();
   try {
     const result = await taskApi.list({
       projectId: filters.projectId,
@@ -217,12 +244,18 @@ async function reload(): Promise<void> {
       page: pageResult.page,
       pageSize: pageResult.pageSize,
     });
+    if (version !== reloadVersion) return;
     pageResult.items = result.items;
     pageResult.total = result.total;
     pageResult.page = result.page;
     pageResult.pageSize = result.pageSize;
+    const lastPage = Math.max(1, Math.ceil(result.total / result.pageSize));
+    if (pageResult.page > lastPage) {
+      pageResult.page = lastPage;
+      await reload();
+    }
   } finally {
-    loading.value = false;
+    if (version === reloadVersion) loading.value = false;
   }
 }
 

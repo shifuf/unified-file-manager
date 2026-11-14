@@ -19,6 +19,7 @@ import { QiniuAdapter } from '../storage/adapters/qiniu.adapter';
 import { S3Adapter } from '../storage/adapters/s3.adapter';
 import { UpyunAdapter } from '../storage/adapters/upyun.adapter';
 import { ReplicaService } from '../storage/replica.service';
+import { StorageLimitsService } from '../storage/storage-limits.service';
 import type { RuntimeCdnConfig, StorageAdapter, StorageUsageSnapshot } from '../storage/storage.types';
 import { CreateCdnConfigDto } from './dto/create-cdn-config.dto';
 import { UpdateCdnConfigDto } from './dto/update-cdn-config.dto';
@@ -75,6 +76,7 @@ type StorageUsageResponse = {
   policy?: { priority: number; failoverThresholdPercent: number; autoFailover: boolean; manualUsageUpdatedAt: string | null };
   checkedAt: string;
   message?: string;
+  limits?: ReturnType<StorageLimitsService['describe']>;
 };
 
 @Injectable()
@@ -91,6 +93,7 @@ export class CdnService {
     private readonly s3Adapter: S3Adapter,
     private readonly upyunAdapter: UpyunAdapter,
     @Optional() private readonly replicaService?: ReplicaService,
+    @Optional() private readonly storageLimits?: StorageLimitsService,
   ) {}
 
   async list(user: RequestUser): Promise<Record<string, unknown>[]> {
@@ -163,8 +166,8 @@ export class CdnService {
   async update(configId: string, dto: UpdateCdnConfigDto, user: RequestUser): Promise<Record<string, unknown>> {
     await this.assertCanManageStorage(user, true);
     const existing = await this.findConfig(configId);
-    const mergedConfig = dto.config
-      ? this.mergeConfigPreservingSecrets(this.revealConfig(existing.config), dto.config)
+    const mergedConfig = dto.config || (dto.provider && dto.provider !== existing.provider)
+      ? this.mergeConfigPreservingSecrets(this.revealConfig(existing.config), dto.config ?? {})
       : undefined;
 
     if (mergedConfig) {
@@ -173,15 +176,25 @@ export class CdnService {
       await this.assertConfigHealthy(provider, dto.name ?? existing.name, mergedConfig, user);
     }
 
-    const config = await this.prisma.cdnConfig.update({
+    const save = async (db: Prisma.TransactionClient, current: CdnConfig) => {
+      if (dto.manualStorageUsedBytes !== undefined) await db.storageSpaceReservation.deleteMany({ where: { configId } });
+      return db.cdnConfig.update({
       where: { id: configId },
-      data: {
-        provider: dto.provider,
-        name: dto.name,
+      data: { provider: dto.provider, name: dto.name,
         config: mergedConfig ? this.secureConfig(mergedConfig) : undefined,
-        ...this.storagePolicyData(dto),
-      },
-    });
+        ...this.storagePolicyData(dto, current) },
+      });
+    };
+    const quotaKeys = ['storageLimitEnabled', 'trafficLimitEnabled', 'trafficQuotaMode', 'storageQuotaBytes',
+      'manualStorageUsedBytes', 'trafficQuotaBytes', 'manualTrafficUsedBytes', 'failoverThresholdPercent'] as const;
+    const config = quotaKeys.some(key => dto[key] !== undefined)
+      ? await this.prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM CdnConfig WHERE id = ${configId} FOR UPDATE`;
+        const current = await tx.cdnConfig.findFirst({ where: { id: configId, enabled: true } });
+        if (!current) throw new NotFoundException('存储配置不存在或已停用。');
+        return save(tx, current);
+      })
+      : await save(this.prisma, existing);
     this.usageCache.delete(configId);
 
     await this.auditService.write({
@@ -589,8 +602,33 @@ export class CdnService {
     return String(value ?? '').trim().replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase();
   }
 
-  private storagePolicyData(dto: CreateCdnConfigDto | UpdateCdnConfigDto): Pick<Prisma.CdnConfigUncheckedCreateInput, 'priority' | 'storageQuotaBytes' | 'manualStorageUsedBytes' | 'trafficQuotaBytes' | 'manualTrafficUsedBytes' | 'failoverThresholdPercent' | 'autoFailover' | 'manualUsageUpdatedAt'> {
-    const data: Pick<Prisma.CdnConfigUncheckedCreateInput, 'priority' | 'storageQuotaBytes' | 'manualStorageUsedBytes' | 'trafficQuotaBytes' | 'manualTrafficUsedBytes' | 'failoverThresholdPercent' | 'autoFailover' | 'manualUsageUpdatedAt'> = {};
+  private storagePolicyData(dto: CreateCdnConfigDto | UpdateCdnConfigDto, current?: CdnConfig) {
+    const data: Partial<Pick<CdnConfig, 'priority' | 'storageQuotaBytes' | 'manualStorageUsedBytes' | 'trafficQuotaBytes' |
+      'manualTrafficUsedBytes' | 'failoverThresholdPercent' | 'autoFailover' | 'manualUsageUpdatedAt' |
+      'storageLimitEnabled' | 'trafficLimitEnabled' | 'trafficQuotaMode' | 'trafficPeriodKey' | 'quotaRevision' | 'trackedStorageBytes' | 'storageBaselineBytes'>> = {};
+    const quotaKeys = ['storageLimitEnabled', 'trafficLimitEnabled', 'trafficQuotaMode', 'storageQuotaBytes',
+      'manualStorageUsedBytes', 'trafficQuotaBytes', 'manualTrafficUsedBytes', 'failoverThresholdPercent'] as const;
+    if (current && !quotaKeys.some(key => dto[key] !== undefined)) {
+      return { ...(dto.priority === undefined ? {} : { priority: dto.priority }),
+        ...(dto.autoFailover === undefined ? {} : { autoFailover: dto.autoFailover }) };
+    }
+    for (const key of ['storageQuotaBytes', 'manualStorageUsedBytes', 'trafficQuotaBytes', 'manualTrafficUsedBytes'] as const) {
+      const value = dto[key];
+      if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new BadRequestException('额度和已用字节数必须为非负安全整数。');
+      }
+    }
+    for (const key of ['storageLimitEnabled', 'trafficLimitEnabled'] as const) {
+      if (dto[key] !== undefined && typeof dto[key] !== 'boolean') throw new BadRequestException('限额开关必须为布尔值。');
+      if (dto[key] !== undefined) data[key] = dto[key];
+    }
+    if (dto.trafficQuotaMode !== undefined) {
+      if (!['MONTHLY', 'FIXED'].includes(dto.trafficQuotaMode)) throw new BadRequestException('请选择每月或固定流量额度。');
+      data.trafficQuotaMode = dto.trafficQuotaMode;
+    }
+    const enabled = dto.trafficLimitEnabled ?? current?.trafficLimitEnabled ?? false;
+    const quota = dto.trafficQuotaBytes !== undefined ? dto.trafficQuotaBytes : current?.trafficQuotaBytes;
+    if (enabled && quota == null) throw new BadRequestException('启用流量限制时必须填写流量额度。');
     if (dto.priority !== undefined) data.priority = dto.priority;
     if (dto.storageQuotaBytes !== undefined) data.storageQuotaBytes = dto.storageQuotaBytes === null ? null : BigInt(dto.storageQuotaBytes);
     if (dto.manualStorageUsedBytes !== undefined) data.manualStorageUsedBytes = dto.manualStorageUsedBytes === null ? null : BigInt(dto.manualStorageUsedBytes);
@@ -599,6 +637,21 @@ export class CdnService {
     if (dto.failoverThresholdPercent !== undefined) data.failoverThresholdPercent = dto.failoverThresholdPercent;
     if (dto.autoFailover !== undefined) data.autoFailover = dto.autoFailover;
     if (dto.manualStorageUsedBytes !== undefined || dto.manualTrafficUsedBytes !== undefined) data.manualUsageUpdatedAt = new Date();
+    if (dto.manualStorageUsedBytes !== undefined) { data.trackedStorageBytes = 0n; data.storageBaselineBytes = null; }
+    const changed = Object.entries(data).some(([key, value]) => !['priority', 'autoFailover'].includes(key) && value !== current?.[key as keyof CdnConfig]);
+    if (changed && current) data.quotaRevision = (current.quotaRevision ?? 0) + 1;
+    const mode = dto.trafficQuotaMode ?? current?.trafficQuotaMode ?? 'FIXED';
+    const period = this.storageLimits?.currentPeriodKey() ?? new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 7);
+    const modeChanged = dto.trafficQuotaMode !== undefined && dto.trafficQuotaMode !== current?.trafficQuotaMode;
+    const monthlyReset = enabled && mode === 'MONTHLY' && current?.trafficPeriodKey !== period;
+    if (modeChanged || monthlyReset || dto.manualTrafficUsedBytes !== undefined || !current) {
+      data.trafficPeriodKey = mode === 'MONTHLY' ? period : null;
+      if (dto.manualTrafficUsedBytes === undefined && current) {
+        data.manualTrafficUsedBytes = monthlyReset && current.trafficQuotaMode === 'MONTHLY' ? 0n
+          : BigInt(this.storageLimits?.describe(current).trafficUsedBytes ?? current.manualTrafficUsedBytes ?? 0n);
+      }
+      if (current) data.quotaRevision = (current.quotaRevision ?? 0) + 1;
+    }
     return data;
   }
 
@@ -684,6 +737,12 @@ export class CdnService {
       failoverThresholdPercent: number;
       autoFailover: boolean;
       manualUsageUpdatedAt: Date | null;
+      storageLimitEnabled?: boolean;
+      trafficLimitEnabled?: boolean;
+      trafficQuotaMode?: string;
+      trafficPeriodKey?: string | null;
+      trackedStorageBytes?: bigint;
+      storageBaselineBytes?: bigint | null;
       createdAt: Date;
       updatedAt: Date;
       projectBindings?: Array<{ project: { id: string; name: string; activeCdnConfigId: string | null } }>;
@@ -703,6 +762,8 @@ export class CdnService {
       manualStorageUsedBytes: config.manualStorageUsedBytes?.toString() ?? null,
       trafficQuotaBytes: config.trafficQuotaBytes?.toString() ?? null,
       manualTrafficUsedBytes: config.manualTrafficUsedBytes?.toString() ?? null,
+      ...this.storageLimits?.describe(config),
+      storageBaselineBytes: config.storageBaselineBytes?.toString() ?? null,
       failoverThresholdPercent: config.failoverThresholdPercent,
       autoFailover: config.autoFailover,
       manualUsageUpdatedAt: config.manualUsageUpdatedAt,
@@ -768,7 +829,7 @@ export class CdnService {
   private async fetchUsage(config: CdnConfig, forceRefresh: boolean): Promise<StorageUsageResponse> {
     const cached = this.usageCache.get(config.id);
     if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
-      return cached.value;
+      return { ...cached.value, limits: this.storageLimits?.describe(config) };
     }
 
     const adapter = this.usageAdapter(config.provider);
@@ -842,6 +903,7 @@ export class CdnService {
     const trafficQuota = resolveUsageValue(reported.trafficQuotaBytes, config.trafficQuotaBytes);
     return {
       ...reported,
+      limits: this.storageLimits?.describe(config),
       storageUsedBytes: storageUsed.value,
       storageQuotaBytes: storageQuota.value,
       trafficUsedBytes: trafficUsed.value,

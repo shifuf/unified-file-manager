@@ -1,0 +1,7 @@
+ALTER TABLE `CdnConfig`
+  ADD COLUMN `storageLimitEnabled` BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN `trafficLimitEnabled` BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN `trafficQuotaMode` VARCHAR(16) NOT NULL DEFAULT 'FIXED',
+  ADD COLUMN `trafficPeriodKey` VARCHAR(7) NULL,
+  ADD COLUMN `quotaRevision` INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN `trackedStorageBytes` BIGINT NOT NULL DEFAULT 0;

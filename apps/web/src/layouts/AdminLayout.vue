@@ -17,7 +17,7 @@
       </el-menu>
     </el-aside>
 
-    <el-container>
+    <el-container class="admin-content">
       <el-header class="admin-header" height="64px">
         <div class="header-left">
           <el-button class="mobile-menu-button" :icon="MenuIcon" circle @click="mobileMenuVisible = true" />
@@ -62,9 +62,10 @@
         </div>
       </el-header>
 
-      <el-main class="admin-main">
+      <el-main ref="mainContent" class="admin-main" @scroll="updateMainScroll">
         <router-view />
       </el-main>
+      <el-button v-show="mainScrollTop > 240" class="back-to-top" type="primary" :icon="Top" aria-label="返回顶部" title="返回顶部" @click="scrollToTop">返回顶部</el-button>
     </el-container>
 
     <el-drawer v-model="mobileMenuVisible" direction="ltr" :with-header="false" size="280px" class="mobile-menu-drawer">
@@ -223,11 +224,12 @@ import {
   Monitor,
   Setting,
   SwitchButton,
+  Top,
   Warning,
 } from '@element-plus/icons-vue';
 import { ElMessage } from 'element-plus';
 import { toDataURL } from 'qrcode';
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { authApi, notificationApi, sessionApi, versionApi, type TotpSetupResult, type VersionCheckResult } from '@/api/modules';
@@ -241,6 +243,17 @@ const versionTooltip = computed(() => versionCheck.value
 
 const route = useRoute();
 const router = useRouter();
+const mainContent = ref<{ $el: globalThis.HTMLElement } | null>(null);
+const mainScrollTop = ref(0);
+function updateMainScroll(event: Event): void { mainScrollTop.value = (event.target as globalThis.HTMLElement).scrollTop; }
+function scrollToTop(): void {
+  mainContent.value?.$el.scrollTo({ top: 0, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+}
+watch(() => route.path, async () => {
+  await nextTick();
+  mainContent.value?.$el.scrollTo({ top: 0, behavior: 'instant' });
+  mainScrollTop.value = 0;
+});
 const authStore = useAuthStore();
 const securityDialogVisible = ref(false);
 const mobileMenuVisible = ref(false);
@@ -476,10 +489,22 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .admin-shell {
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.admin-content {
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .admin-sidebar {
+  flex-shrink: 0;
+  height: 100%;
+  overflow-y: auto;
   border-right: 1px solid var(--color-border);
   background: #ffffff;
 }
@@ -525,6 +550,7 @@ onBeforeUnmount(() => {
 }
 
 .admin-header {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -610,8 +636,14 @@ onBeforeUnmount(() => {
 }
 
 .admin-main {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
   padding: 20px;
 }
+
+.back-to-top { position: fixed; right: 24px; bottom: 24px; z-index: 20; box-shadow: 0 3px 12px #0002; }
 
 .security-panel {
   display: grid;
@@ -693,17 +725,13 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 760px) {
-  .admin-shell {
-    display: block;
-  }
-
   .admin-sidebar {
     display: none;
   }
 
   .admin-header {
     align-items: flex-start;
-    height: auto;
+    height: auto !important;
     padding: 12px;
     flex-direction: column;
   }

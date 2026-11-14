@@ -1,5 +1,5 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
-import { FileStatus } from '@prisma/client';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { FileStatus, Prisma } from '@prisma/client';
 import { mkdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
@@ -9,6 +9,8 @@ import { ProjectAccessService } from '../projects/project-access.service';
 import type { RequestUser } from '../common/types/request-user.type';
 import { StorageAdapterRegistry } from '../storage/storage-registry.service';
 import { StorageService } from '../storage/storage.service';
+
+export type FolderTreeNode = { name: string; path: string; fileCount: number; children: FolderTreeNode[] };
 
 /**
  * Folder creation/deletion shared by the admin API, the open API and WebDAV.
@@ -45,22 +47,19 @@ export class FolderManagerService {
     folderPathRaw: string,
     actorId?: string,
   ): Promise<{ folderPath: string }> {
-    const folderPath = folderPathKey(folderPathRaw);
-    if (!folderPath) {
-      throw new NotFoundException('目录名不能为空。');
-    }
-
-    await this.assertNoFileCollision(projectId, folderPath);
-
-    const created = await this.prisma.managedFolder.findFirst({
-      where: { projectId, path: folderPath },
-      select: { id: true },
-    });
-    if (created) {
-      throw new ConflictException('目录已存在。');
-    }
-
-    await this.persistFolders(projectId, folderPath, actorId);
+    const folderPath = this.validateAdminPath(folderPathRaw);
+    await this.prisma.$transaction(async (tx) => {
+      const created = await tx.managedFolder.findUnique({
+        where: { projectId_path: { projectId, path: folderPath } },
+        select: { id: true },
+      });
+      if (created) throw new ConflictException('目录已存在。');
+      const segments = folderPath.split('/');
+      for (let index = 1; index <= segments.length; index += 1) {
+        await this.assertNoFileCollision(projectId, segments.slice(0, index).join('/'), tx);
+      }
+      await this.persistFolders(projectId, folderPath, actorId, tx);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     await this.materializeLocalFolder(projectId, folderPath);
 
     return { folderPath };
@@ -87,6 +86,89 @@ export class FolderManagerService {
       orderBy: { path: 'asc' },
     });
     return rows.map((row) => row.path);
+  }
+
+  async listForUser(projectId: string, user: RequestUser, status: 'ACTIVE' | 'RECYCLED' = 'ACTIVE'): Promise<string[]> {
+    await this.projectAccessService.assertProjectAccess(user, projectId);
+    return (await this.folderSnapshot(projectId, status)).paths;
+  }
+
+  async listTreeForUser(projectId: string, user: RequestUser, status: 'ACTIVE' | 'RECYCLED' = 'ACTIVE'): Promise<FolderTreeNode[]> {
+    await this.projectAccessService.assertProjectAccess(user, projectId);
+    const { paths, counts } = await this.folderSnapshot(projectId, status);
+    const root: FolderTreeNode[] = [];
+    const index = new Map<string, FolderTreeNode>();
+    for (const path of paths) {
+      const segments = path.split('/');
+      const node: FolderTreeNode = { name: segments[segments.length - 1], path, fileCount: counts.get(path) ?? 0, children: [] };
+      index.set(path, node);
+      const parent = index.get(segments.slice(0, -1).join('/'));
+      if (parent) parent.children.push(node);
+      else root.push(node);
+    }
+    const sort = (nodes: FolderTreeNode[]): void => {
+      nodes.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+      nodes.forEach(node => sort(node.children));
+    };
+    sort(root);
+    return root;
+  }
+
+  /** Admin removal affects the registry only; recovery objects and in-flight uploads keep their bytes. */
+  async removeEmptyForUser(projectId: string, folderPathRaw: string, user: RequestUser): Promise<{ success: boolean }> {
+    await this.projectAccessService.assertProjectAccess(user, projectId, true);
+    const folderPath = this.validateAdminPath(folderPathRaw);
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const folder = await tx.managedFolder.findUnique({
+          where: { projectId_path: { projectId, path: folderPath } },
+          select: { id: true },
+        });
+        const fileCount = await tx.managedFile.count({
+          where: { projectId, status: FileStatus.ACTIVE, OR: [{ folderPath }, { folderPath: { startsWith: `${folderPath}/` } }] },
+        });
+        if (fileCount) throw new ConflictException('目录中存在文件，请先删除目录及子目录中的文件。');
+        const childCount = await tx.managedFolder.count({
+          where: { projectId, path: { startsWith: `${folderPath}/` } },
+        });
+        if (childCount) throw new ConflictException('目录中存在子目录，请先删除子目录。');
+        if (!folder) throw new NotFoundException('目录不存在。');
+        await tx.managedFolder.delete({ where: { id: folder.id } });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if ((error as { code?: string }).code === 'P2034') {
+        throw new ConflictException('目录内容正在变化，请刷新后重试。');
+      }
+      throw error;
+    }
+    return { success: true };
+  }
+
+  private validateAdminPath(raw: string): string {
+    if (typeof raw !== 'string' || !raw.trim() || raw.length > 512) throw new BadRequestException('目录路径无效，不能操作项目根目录。');
+    const input = raw.trim().replace(/\\/g, '/');
+    if (input.startsWith('/') || [...input].some(character => character.charCodeAt(0) < 32) || /[<>:"|?*]/.test(input) || input.split('/').some(segment => segment === '.' || segment === '..')) {
+      throw new BadRequestException('目录路径越界或包含非法字符，已拒绝。');
+    }
+    const path = folderPathKey(input);
+    if (!path) throw new BadRequestException('不能操作项目根目录。');
+    return path;
+  }
+
+  private async folderSnapshot(projectId: string, status: 'ACTIVE' | 'RECYCLED') {
+    if (status !== 'ACTIVE' && status !== 'RECYCLED') throw new BadRequestException('目录文件状态无效。');
+    return this.prisma.$transaction(async (tx) => {
+      const registered = status === 'ACTIVE' ? await tx.managedFolder.findMany({ where: { projectId }, select: { path: true } }) : [];
+      const grouped = await tx.managedFile.groupBy({ by: ['folderPath'], where: { projectId, status }, _count: { _all: true } });
+      const counts = new Map(grouped.map(row => [row.folderPath ?? '', row._count._all]));
+      const paths = new Set<string>();
+      for (const value of [...registered.map(row => row.path), ...grouped.map(row => row.folderPath)]) {
+        if (!value) continue;
+        const segments = folderPathKey(value).split('/').filter(Boolean);
+        for (let length = 1; length <= segments.length; length += 1) paths.add(segments.slice(0, length).join('/'));
+      }
+      return { paths: [...paths].sort(), counts };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
   }
 
   /** Drop a folder and its descendants from the registry (files are untouched). */
@@ -131,11 +213,11 @@ export class FolderManagerService {
     await this.removeLocalFolder(projectId, fromPath);
   }
 
-  private async persistFolders(projectId: string, folderPath: string, actorId?: string): Promise<void> {
+  private async persistFolders(projectId: string, folderPath: string, actorId?: string, client: Prisma.TransactionClient = this.prisma): Promise<void> {
     const segments = folderPath.split('/').filter(Boolean);
     for (let index = 1; index <= segments.length; index += 1) {
       const path = segments.slice(0, index).join('/');
-      await this.prisma.managedFolder.upsert({
+      await client.managedFolder.upsert({
         where: { projectId_path: { projectId, path } },
         update: {},
         create: { projectId, path, createdById: actorId ?? null },
@@ -144,11 +226,11 @@ export class FolderManagerService {
   }
 
   /** Reject a folder that collides with a same-named file in the same directory. */
-  private async assertNoFileCollision(projectId: string, folderPath: string): Promise<void> {
+  private async assertNoFileCollision(projectId: string, folderPath: string, client: Prisma.TransactionClient = this.prisma): Promise<void> {
     const name = folderPath.split('/').filter(Boolean).pop() as string;
     const parent = folderPath.slice(0, folderPath.length - name.length).replace(/\/$/, '');
 
-    const conflict = await this.prisma.managedFile.count({
+    const conflict = await client.managedFile.count({
       where: {
         projectId,
         status: FileStatus.ACTIVE,

@@ -254,22 +254,39 @@ export class TasksService {
   }
 
   async remove(taskId: string, user: RequestUser): Promise<{ success: boolean }> {
-    const task = await this.findTaskForUser(taskId, user, true);
-
-    if (task.status === 'RUNNING') {
-      throw new BadRequestException('运行中的任务不能删除，请先取消。');
-    }
-
-    await this.prisma.task.delete({ where: { id: taskId } });
-
-    await this.auditService.write({
-      action: AuditAction.TASK_DELETE,
-      actorId: user.id,
-      projectId: task.projectId ?? undefined,
-      detail: { taskId, type: task.type },
-    });
-
+    await this.batchRemove([taskId], user);
     return { success: true };
+  }
+
+  async batchRemove(taskIds: string[], user: RequestUser): Promise<{ success: boolean; deleted: number }> {
+    if (user.role !== UserRole.SUPER_ADMIN) throw new NotFoundException('任务不存在。');
+    if (!Array.isArray(taskIds) || !taskIds.length || taskIds.length > 100
+      || taskIds.some(id => typeof id !== 'string' || !id.trim() || id.length > 128)) {
+      throw new BadRequestException('请选择 1 至 100 个有效的任务。');
+    }
+    const ids = [...new Set(taskIds)];
+    const terminal = ['COMPLETED', 'FAILED', 'CANCELED'];
+    return this.prisma.$transaction(async tx => {
+      const tasks = await tx.task.findMany({ where: { id: { in: ids } }, select: { id: true, projectId: true, type: true, status: true } });
+      if (tasks.length !== ids.length) throw new NotFoundException('部分任务不存在，请刷新后重试。');
+      for (const projectId of new Set(tasks.map(task => task.projectId).filter((id): id is string => !!id))) {
+        await this.projectAccessService.assertProjectAccess(user, projectId, true);
+      }
+      if (tasks.some(task => !terminal.includes(task.status))) {
+        throw new BadRequestException('只能删除已完成、失败或已取消的任务；尚未结束的任务请先取消。');
+      }
+      const result = await tx.task.deleteMany({ where: { id: { in: ids }, status: { in: terminal } } });
+      if (result.count !== ids.length) throw new BadRequestException('任务状态已变化，请刷新后重试。');
+      for (const task of tasks) {
+        await tx.auditLog.create({ data: {
+          action: AuditAction.TASK_DELETE,
+          actorId: user.id,
+          projectId: task.projectId,
+          detail: { taskId: task.id, type: task.type, batch: ids.length > 1 },
+        } });
+      }
+      return { success: true, deleted: result.count };
+    });
   }
 
   private asRecord(value: Prisma.JsonValue | null): Record<string, unknown> {

@@ -69,6 +69,9 @@ function Copy-TreeFiltered {
 
   Get-ChildItem -LiteralPath $SourceDir -Force | ForEach-Object {
     $name = $_.Name
+    if ($name -in @('test', 'tests', '__tests__') -or $name -match '\.(test|spec)\.') {
+      return
+    }
     if ($_.PSIsContainer) {
       if ($excludeDirSet.Contains($name)) {
         return

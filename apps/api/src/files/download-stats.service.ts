@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { AuditAction } from '@prisma/client';
 
 import { PrismaService } from '../prisma/prisma.service';
+import { downloadStorageMessage } from '../storage/download-source.util';
+import type { DownloadStorageSource } from '../storage/storage.types';
 import type {
   DownloadRecordView,
   DownloadStatInput,
@@ -28,6 +31,9 @@ export class DownloadStatsService {
 
   /** Fire-and-forget so hot download paths never fail on a stats write. */
   record(input: DownloadStatInput): void {
+    void this.persistAudit(input).catch((error: unknown) => {
+      this.logger.warn(`下载审计写入失败 fileId=${input.fileId ?? '-'}：${error instanceof Error ? error.message : String(error)}`);
+    });
     void this.persist(input).catch((error) => {
       this.logger.warn(
         `下载统计写入失败 fileId=${input.fileId ?? '-'}：${error instanceof Error ? error.message : String(error)}`,
@@ -66,6 +72,7 @@ export class DownloadStatsService {
         userAgent: row.userAgent,
         referer: row.referer,
         createdAt: row.createdAt,
+        message: row.message,
       })),
       total,
       page: safePage,
@@ -177,6 +184,44 @@ export class DownloadStatsService {
     };
   }
 
+  private async persistAudit(input: DownloadStatInput): Promise<void> {
+    // DAV principals have no User row; keep their attribution outside the FK.
+    const dav = input.source === 'WEBDAV';
+    const identity = ({ configId, configName, provider }: DownloadStorageSource['selected']) => ({ configId, configName, provider });
+    const storageSource = input.storageSource ? {
+      strategy: input.storageSource.strategy,
+      selected: identity(input.storageSource.selected),
+      attempts: input.storageSource.attempts.map(({ outcome, reason, ...item }) => ({
+        ...identity(item), outcome, ...(reason ? { reason } : {}),
+      })),
+      ...(input.storageSource.omittedAttempts ? { omittedAttempts: input.storageSource.omittedAttempts } : {}),
+    } : null;
+    await this.prisma.auditLog.create({
+      data: {
+        action: input.source === 'SHARE' ? AuditAction.FILE_SHARE_DOWNLOAD
+          : input.source === 'FOLDER_SHARE' ? AuditAction.FOLDER_SHARE_DOWNLOAD : AuditAction.FILE_DOWNLOAD,
+        projectId: input.projectId,
+        actorId: dav ? null : input.actorId ?? null,
+        ip: input.ip ?? null,
+        userAgent: input.userAgent?.slice(0, 512) ?? null,
+        detail: {
+          fileId: input.fileId ?? null,
+          originalName: input.originalName ?? null,
+          shareId: input.shareId ?? null,
+          downloadSource: input.source,
+          downloadSourceLabel: DOWNLOAD_SOURCE_LABELS[input.source],
+          actor: dav ? input.actorId ?? null : null,
+          bytes: Math.max(0, Math.floor(Number(input.bytes) || 0)),
+          rangeStart: input.rangeStart ?? null,
+          rangeEnd: input.rangeEnd ?? null,
+          success: input.success !== false,
+          message: downloadStorageMessage(input.storageSource) || input.message || null,
+          storageSource,
+        },
+      },
+    });
+  }
+
   private async persist(input: DownloadStatInput): Promise<void> {
     const bytes = Math.max(0, Math.floor(Number(input.bytes) || 0));
     const success = input.success !== false;
@@ -196,7 +241,7 @@ export class DownloadStatsService {
         rangeStart: input.rangeStart == null ? null : BigInt(input.rangeStart),
         rangeEnd: input.rangeEnd == null ? null : BigInt(input.rangeEnd),
         success,
-        message: input.message?.slice(0, 512) ?? null,
+        message: (downloadStorageMessage(input.storageSource) || input.message)?.slice(0, 512) ?? null,
       },
     });
 

@@ -48,7 +48,24 @@
               <span class="config-summary">{{ summarizeConfig(row) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="云用量" min-width="220">
+          <el-table-column label="限额与余额" min-width="255">
+            <template #default="{ row }">
+              <span v-if="row.provider === 'LOCAL'" class="muted">本地兜底</span>
+              <div v-else class="usage-cell">
+                <div>空间限制：{{ row.storageLimitEnabled ? '启用' : '停用' }}<span v-if="row.storageLimitEnabled"> · {{ row.failoverThresholdPercent }}% 暂停上传</span></div>
+                <div v-if="spaceState(row).quota != null">有效空间 {{ formatBytes(spaceState(row).used) }} / {{ formatBytes(spaceState(row).quota) }}</div>
+                <el-tag v-if="spaceState(row).paused" size="small" type="warning">{{ spaceState(row).unknown ? '空间用量未知，暂停上传' : '空间已达阈值，暂停上传' }}</el-tag>
+                <template v-if="row.trafficLimitEnabled">
+                  <div>{{ row.trafficQuotaMode === 'MONTHLY' ? '每月额度' : '固定额度' }}：{{ formatBytes(Number(row.trafficQuotaBytes)) }}</div>
+                  <div>已用 {{ formatBytes(Number(row.trafficUsedBytes)) }} · 剩余 {{ formatBytes(Number(row.trafficRemainingBytes)) }}</div>
+                  <el-tag v-if="row.trafficExhausted" size="small" type="danger">流量不足，暂停上传和下载</el-tag>
+                  <span v-else-if="row.trafficQuotaMode === 'MONTHLY'" class="muted">{{ row.trafficPeriodKey }} · 每月 1 日重置</span>
+                </template>
+                <span v-else class="muted">流量限制：停用</span>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="平台用量 / 空间基准" min-width="220">
             <template #default="{ row }">
               <div v-if="['QINIU', 'UPYUN'].includes(row.provider) || row.storageQuotaBytes != null || row.manualStorageUsedBytes != null || row.trafficQuotaBytes != null || row.manualTrafficUsedBytes != null" class="usage-cell">
                 <template v-if="usageLoadingId === row.id">
@@ -73,7 +90,7 @@
                       :show-text="false"
                       style="margin: 4px 0"
                     />
-                    <div v-if="usageByConfigId[row.id]?.trafficUsedBytes != null || row.manualTrafficUsedBytes != null" class="muted usage-sub">
+                    <div v-if="usageByConfigId[row.id]?.trafficUsedSource === 'provider'" class="muted usage-sub">
                       流量 {{ formatBytes(usageByConfigId[row.id]?.trafficUsedBytes ?? Number(row.manualTrafficUsedBytes)) }}
                       <span v-if="usageByConfigId[row.id]?.trafficQuotaBytes != null || row.trafficQuotaBytes != null">
                         / {{ formatBytes(usageByConfigId[row.id]?.trafficQuotaBytes ?? Number(row.trafficQuotaBytes)) }}
@@ -162,18 +179,23 @@
           </div>
           <div class="config-help">{{ currentHelp.description }}</div>
         </div>
-        <div class="config-section">
-          <div class="config-section-title">用量与自动切换</div>
+        <div v-if="form.provider !== 'LOCAL'" class="config-section">
+          <div class="config-section-title">容量与流量限额</div>
           <div class="config-field-grid">
             <el-form-item label="优先级（数字越小越优先）"><el-input-number v-model="form.priority" :min="0" :max="100000" /></el-form-item>
-            <el-form-item label="切换阈值 (%)"><el-input-number v-model="form.failoverThresholdPercent" :min="1" :max="100" /></el-form-item>
-            <el-form-item label="空间上限 (GiB)"><el-input-number v-model="form.storageQuotaGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
-            <el-form-item label="手动已用空间 (GiB)"><el-input-number v-model="form.manualStorageUsedGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
-            <el-form-item label="流量上限 (GiB)"><el-input-number v-model="form.trafficQuotaGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
-            <el-form-item label="手动已用流量 (GiB)"><el-input-number v-model="form.manualTrafficUsedGiB" :min="0" :precision="2" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="启用空间限制"><el-switch v-model="form.storageLimitEnabled" /></el-form-item>
+            <el-form-item label="暂停上传阈值 (%)"><el-input-number v-model="form.failoverThresholdPercent" :disabled="!form.storageLimitEnabled" :min="1" :max="100" /></el-form-item>
+            <el-form-item label="空间上限 (GiB)"><el-input-number v-model="form.storageQuotaGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="手动已用空间基准 (GiB)"><el-input-number v-model="form.manualStorageUsedGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="启用流量限制"><el-switch v-model="form.trafficLimitEnabled" /></el-form-item>
+            <el-form-item label="流量额度模式"><el-segmented v-model="form.trafficQuotaMode" :options="[{ label: '每月重置', value: 'MONTHLY' }, { label: '固定额度', value: 'FIXED' }]" /></el-form-item>
+            <el-form-item :label="form.trafficQuotaMode === 'MONTHLY' ? '每月流量额度 (GiB)' : '固定流量额度 (GiB)'" :required="form.trafficLimitEnabled"><el-input-number v-model="form.trafficQuotaGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+            <el-form-item label="已用流量校正 (GiB)"><el-input-number v-model="form.manualTrafficUsedGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
           </div>
           <el-checkbox v-model="form.autoFailover">达到阈值后自动切换新上传目标</el-checkbox>
-          <div class="field-help">平台用量优先使用平台回报；查不到时使用这里录入的用量。应用访问统计不等同于 CDN 账单流量。</div>
+          <div class="field-help">空间基准优先使用手动值，未填写时取平台回报，并计入后续上传。达到阈值或空间不足时暂停云上传，文件保存在本地兜底。</div>
+          <div class="field-help">{{ form.trafficQuotaMode === 'MONTHLY' ? '每月 1 日北京时间 00:00 重置已用流量。' : '固定额度不自动重置，可手动调整总额或已用量。' }} 流量不足时暂停该存储上传和下载，自动尝试其他存储或本地。关闭限制停止扣减并保留计数。</div>
+          <div class="field-help">启用后按本系统实际从云端读取的字节扣减，包含下载、同步和完整性校验；分段下载可能先读取整个文件进行校验，不等同于云平台账单。未修改已用量时，保存会保留期间新增的计数。</div>
         </div>
       </el-form>
 
@@ -291,6 +313,7 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import { cdnApi, projectApi } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import type { CdnConfig, CdnProvider, Project, StorageHealthResult, StorageUsageResult } from '@/types';
+import { limitFormValues, storageLimitPayload, storageSpaceView } from '@/utils/storage-limit-form';
 
 const authStore = useAuthStore();
 const loading = ref(false);
@@ -315,6 +338,8 @@ const draftTesting = ref(false);
 const draftTestResult = ref<StorageHealthResult | null>(null);
 /** Fingerprint of the tested payload; any field change invalidates the result. */
 const draftTestedKey = ref('');
+const initialConnectionKey = ref('');
+const initialLimitValues = ref<ReturnType<typeof limitFormValues>>();
 const formRef = ref<FormInstance>();
 const providerOptions = [
   { label: '本地', value: 'LOCAL' },
@@ -402,10 +427,7 @@ const form = reactive({
   configValues: {} as Record<string, string>,
   priority: 100,
   failoverThresholdPercent: 90,
-  storageQuotaGiB: null as number | null,
-  manualStorageUsedGiB: null as number | null,
-  trafficQuotaGiB: null as number | null,
-  manualTrafficUsedGiB: null as number | null,
+  ...limitFormValues({}),
   autoFailover: false,
 });
 const rules: FormRules = {
@@ -417,6 +439,10 @@ const currentHelp = computed(() => providerHelp[form.provider]);
 function providerLabel(provider: CdnProvider): string {
   const option = providerOptions.find((item) => item.value === provider);
   return option?.label || provider;
+}
+
+function spaceState(config: CdnConfig) {
+  return storageSpaceView(config, usageByConfigId.value[config.id]);
 }
 
 function formatTime(value: string): string {
@@ -540,7 +566,9 @@ function openCreateDialog(): void {
   editingConfig.value = null;
   form.provider = 'ALIYUN';
   form.name = '';
-  Object.assign(form, { priority: 100, failoverThresholdPercent: 90, storageQuotaGiB: null, manualStorageUsedGiB: null, trafficQuotaGiB: null, manualTrafficUsedGiB: null, autoFailover: false });
+  Object.assign(form, { priority: 100, failoverThresholdPercent: 90, ...limitFormValues({}), autoFailover: false });
+  initialLimitValues.value = undefined;
+  initialConnectionKey.value = '';
   form.configValues = buildConfigValues(form.provider);
   resetDraftTest();
   dialogVisible.value = true;
@@ -557,13 +585,12 @@ function openEditDialog(config: CdnConfig): void {
   Object.assign(form, {
     priority: config.priority ?? 100,
     failoverThresholdPercent: config.failoverThresholdPercent ?? 90,
-    storageQuotaGiB: config.storageQuotaBytes == null ? null : Number(config.storageQuotaBytes) / 1073741824,
-    manualStorageUsedGiB: config.manualStorageUsedBytes == null ? null : Number(config.manualStorageUsedBytes) / 1073741824,
-    trafficQuotaGiB: config.trafficQuotaBytes == null ? null : Number(config.trafficQuotaBytes) / 1073741824,
-    manualTrafficUsedGiB: config.manualTrafficUsedBytes == null ? null : Number(config.manualTrafficUsedBytes) / 1073741824,
+    ...limitFormValues(config),
     autoFailover: config.autoFailover ?? false,
   });
   form.configValues = buildConfigValues(config.provider, config.config);
+  initialConnectionKey.value = connectionFingerprint.value;
+  initialLimitValues.value = limitFormValues(config);
   resetDraftTest();
   dialogVisible.value = true;
 }
@@ -577,10 +604,12 @@ const draftFingerprint = computed(() =>
   }),
 );
 
+const connectionFingerprint = computed(() => JSON.stringify({ provider: form.provider, config: form.configValues }));
+const connectionUnchanged = computed(() => Boolean(editingConfig.value) && connectionFingerprint.value === initialConnectionKey.value);
 const saveEnabled = computed(
   () =>
-    Boolean(draftTestResult.value?.success) &&
-    draftTestedKey.value === draftFingerprint.value &&
+    (connectionUnchanged.value || (Boolean(draftTestResult.value?.success) &&
+    draftTestedKey.value === draftFingerprint.value)) &&
     !draftTesting.value,
 );
 
@@ -646,22 +675,21 @@ async function submitConfig(): Promise<void> {
 
   submitting.value = true;
   try {
+    if (form.trafficLimitEnabled && form.trafficQuotaGiB == null) {
+      ElMessage.warning('启用流量限制时请填写流量额度。');
+      return;
+    }
+    const policy = { priority: form.priority, failoverThresholdPercent: form.failoverThresholdPercent,
+      autoFailover: form.autoFailover, ...storageLimitPayload(form, initialLimitValues.value) };
     if (editingConfig.value) {
       if (!authStore.isSuperAdmin) {
         return;
       }
 
       await cdnApi.update(editingConfig.value.id, {
-        provider: form.provider,
+        ...(connectionUnchanged.value ? {} : { provider: form.provider, config: parsedConfig }),
         name: form.name,
-        config: parsedConfig,
-        priority: form.priority,
-        failoverThresholdPercent: form.failoverThresholdPercent,
-        autoFailover: form.autoFailover,
-        storageQuotaBytes: form.storageQuotaGiB == null ? null : Math.round(form.storageQuotaGiB * 1073741824),
-        manualStorageUsedBytes: form.manualStorageUsedGiB == null ? null : Math.round(form.manualStorageUsedGiB * 1073741824),
-        trafficQuotaBytes: form.trafficQuotaGiB == null ? null : Math.round(form.trafficQuotaGiB * 1073741824),
-        manualTrafficUsedBytes: form.manualTrafficUsedGiB == null ? null : Math.round(form.manualTrafficUsedGiB * 1073741824),
+        ...policy,
       });
       ElMessage.success('存储配置已更新。');
     } else {
@@ -673,13 +701,7 @@ async function submitConfig(): Promise<void> {
         provider: form.provider,
         name: form.name,
         config: parsedConfig,
-        priority: form.priority,
-        failoverThresholdPercent: form.failoverThresholdPercent,
-        autoFailover: form.autoFailover,
-        storageQuotaBytes: form.storageQuotaGiB == null ? null : Math.round(form.storageQuotaGiB * 1073741824),
-        manualStorageUsedBytes: form.manualStorageUsedGiB == null ? null : Math.round(form.manualStorageUsedGiB * 1073741824),
-        trafficQuotaBytes: form.trafficQuotaGiB == null ? null : Math.round(form.trafficQuotaGiB * 1073741824),
-        manualTrafficUsedBytes: form.manualTrafficUsedGiB == null ? null : Math.round(form.manualTrafficUsedGiB * 1073741824),
+        ...policy,
       });
       ElMessage.success('存储配置已创建。');
     }

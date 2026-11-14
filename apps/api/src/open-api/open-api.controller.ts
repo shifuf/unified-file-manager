@@ -29,6 +29,7 @@ import {
 import { getClientIp } from '../common/utils/client-ip.util';
 import { CreateFolderDto } from '../files/dto/create-folder.dto';
 import { DownloadStatsService } from '../files/download-stats.service';
+import { writeDownloadStorageHeader } from '../storage/download-source.util';
 import { FilesService } from '../files/files.service';
 import { FolderManagerService } from '../files/folder-manager.service';
 import { BatchFileOperationDto } from '../files/dto/batch-file-operation.dto';
@@ -197,10 +198,14 @@ export class OpenApiController {
       originalName: file.originalName,
       bytes: parsed && typeof parsed === 'object' ? parsed.length : size,
       source: DownloadSource.OPEN_API,
+      storageSource: target.storageSource,
+      rangeStart: range?.start ?? null,
+      rangeEnd: range?.end ?? null,
       ip: getClientIp(request),
       userAgent: request.get('user-agent') ?? null,
     });
 
+    writeDownloadStorageHeader(response, target.storageSource);
     if (target.type === 'redirect' && target.url && !range) {
       response.redirect(target.url);
       return;

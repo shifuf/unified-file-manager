@@ -2,6 +2,14 @@
 export type UserRole = 'SUPER_ADMIN';
 export type CdnProvider = 'LOCAL' | 'QINIU' | 'UPYUN' | 'ALIYUN' | 'S3';
 
+export interface DownloadStorageIdentity { configId: string; configName: string; provider: CdnProvider }
+export interface DownloadStorageSource {
+  strategy: 'CLOUD_PRIORITY';
+  selected: DownloadStorageIdentity;
+  attempts: Array<DownloadStorageIdentity & { outcome: 'SELECTED' | 'FAILED' | 'SKIPPED'; reason?: string }>;
+  omittedAttempts?: number;
+}
+
 export type StorageReplicaStatus = 'PENDING' | 'SYNCING' | 'READY' | 'FAILED' | 'MISSING' | 'SKIPPED';
 export interface StorageReplica {
   id: string;
@@ -192,6 +200,15 @@ export interface CdnConfig {
   manualStorageUsedBytes?: string | null;
   trafficQuotaBytes?: string | null;
   manualTrafficUsedBytes?: string | null;
+  storageLimitEnabled?: boolean;
+  trafficLimitEnabled?: boolean;
+  trafficQuotaMode?: 'MONTHLY' | 'FIXED';
+  trafficPeriodKey?: string | null;
+  trafficUsedBytes?: string;
+  trafficRemainingBytes?: string | null;
+  trafficExhausted?: boolean;
+  trackedStorageBytes?: string;
+  storageBaselineBytes?: string | null;
   failoverThresholdPercent?: number;
   autoFailover?: boolean;
   manualUsageUpdatedAt?: string | null;

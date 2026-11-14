@@ -234,7 +234,7 @@ export class FolderShareService {
     const parsedRange = meta.range
       ? parseByteRange(`bytes=${meta.range.start ?? 0}-${meta.range.end ?? size - 1}`, size)
       : parseByteRange(meta.rangeHeader, size);
-    const result = { file, watermarkText: share.watermarkText,
+    const result = { file, shareId: share.id, watermarkText: share.watermarkText,
       range: parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
       unsatisfiable: parsedRange === 'unsatisfiable' };
     if (meta.head || result.unsatisfiable) return { ...result, target: { type: 'stream' as const } };
@@ -245,12 +245,7 @@ export class FolderShareService {
     try {
       if (!meta.allowPreviewOnly) {
         if (!session) await this.assertDownloadRateLimit(share, file, meta.ip);
-        const counted = await consumeShareDownload(this.prisma, share, 'folder', session?.id);
-        if (counted) await this.auditService.write({
-          action: AuditAction.FOLDER_SHARE_DOWNLOAD,
-          projectId: share.projectId,
-          detail: { shareId: share.id, fileId },
-        });
+        await consumeShareDownload(this.prisma, share, 'folder', session?.id);
       }
     } catch (error) { target.stream?.destroy(); throw error; }
     return { ...result, target };
