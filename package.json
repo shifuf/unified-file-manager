@@ -22,7 +22,7 @@
     "build:api": "npm --workspace apps/api run build",
     "build:web": "npm --workspace apps/web run build",
     "build:sdk": "npm --workspace packages/sdk-js run build",
-    "lint": "npm --workspace apps/api run lint && npm --workspace apps/web run lint",
+    "lint": "npm run build:plugin-sdk && npm --workspace apps/api run lint && npm --workspace apps/web run lint",
     "format": "prettier --write .",
     "prisma:generate": "npm --workspace apps/api run prisma:generate",
     "db:migrate": "npm --workspace apps/api run db:migrate",
