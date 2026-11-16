@@ -3,6 +3,7 @@ import { AuditAction, type Prisma } from '@prisma/client';
 
 import { AuditService } from '../audit/audit.service';
 import type { RequestUser } from '../common/types/request-user.type';
+import { InMemoryAttemptLimiter } from '../common/utils/in-memory-attempt-limiter';
 import { PrismaService } from '../prisma/prisma.service';
 
 function normalizeIp(raw?: string | null): string {
@@ -12,10 +13,57 @@ function normalizeIp(raw?: string | null): string {
 
 @Injectable()
 export class ShareIpAbuseService {
+  // All share entry points and the admin unban action must use the same bucket.
+  private readonly downloadRateLimiter = new InMemoryAttemptLimiter({
+    maxAttempts: 5,
+    windowMs: 60 * 1000,
+    lockMs: 10 * 60 * 1000,
+    maxKeys: 20_000,
+  });
+  private readonly pendingIpOperations = new Map<string, Promise<void>>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly auditService: AuditService,
   ) {}
+
+  async assertDownloadAllowed(
+    ipRaw: string | undefined | null,
+    meta?: { shareId?: string | null; originalName?: string | null },
+  ): Promise<boolean> {
+    const ip = normalizeIp(ipRaw);
+    return this.withIpOperation(ip, async () => {
+      await this.assertNotBanned(ip);
+      this.downloadRateLimiter.assertAllowed(
+        ip,
+        '下载过于频繁，已临时限制访问（同一 IP 每分钟最多 5 次）',
+      );
+      const newlyLocked = this.downloadRateLimiter.recordAttempt(ip);
+      await this.recordDownload(ip, meta);
+      if (newlyLocked) {
+        await this.recordRateLimited(ip, { ...meta, autoBanMinutes: 10 });
+      }
+      return newlyLocked;
+    });
+  }
+
+  // Serialize DB writes with resets so an older download cannot re-ban an IP
+  // after the administrator's unban has completed. Different IPs stay independent.
+  private async withIpOperation<T>(ip: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.pendingIpOperations.get(ip);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    this.pendingIpOperations.set(ip, pending);
+    try {
+      await previous;
+      return await operation();
+    } finally {
+      release();
+      if (this.pendingIpOperations.get(ip) === pending) {
+        this.pendingIpOperations.delete(ip);
+      }
+    }
+  }
 
   /**
    * Reject downloads when IP is permanently banned or still inside banUntil.
@@ -229,8 +277,13 @@ export class ShareIpAbuseService {
 
   async unban(ipRaw: string, actor?: RequestUser) {
     const ip = normalizeIp(ipRaw);
+    return this.withIpOperation(ip, () => this.unbanIp(ip, actor));
+  }
+
+  private async unbanIp(ip: string, actor?: RequestUser) {
     const row = await this.prisma.shareIpStat.findUnique({ where: { ip } });
     if (!row) {
+      this.downloadRateLimiter.reset(ip);
       return { success: true, ip };
     }
 
@@ -242,6 +295,7 @@ export class ShareIpAbuseService {
         banReason: null,
       },
     });
+    this.downloadRateLimiter.reset(ip);
 
     await this.auditService.write({
       action: AuditAction.SETTING_UPDATE,

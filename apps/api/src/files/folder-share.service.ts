@@ -10,7 +10,6 @@ import * as bcrypt from 'bcryptjs';
 
 import { AuditService } from '../audit/audit.service';
 import type { RequestUser } from '../common/types/request-user.type';
-import { InMemoryAttemptLimiter } from '../common/utils/in-memory-attempt-limiter';
 import { folderPathKey, isUnderFolder } from '../common/utils/folder-path.util';
 import { isIpAllowed, sanitizeIpAllowlist } from '../common/utils/ip-allowlist.util';
 import { resolvePublicBaseUrl } from '../common/utils/origin.util';
@@ -28,13 +27,6 @@ import { consumeShareDownload, findShareDownloadSession, issueShareDownloadSessi
 
 @Injectable()
 export class FolderShareService {
-  private readonly downloadRateLimiter = new InMemoryAttemptLimiter({
-    maxAttempts: 5,
-    windowMs: 60 * 1000,
-    lockMs: 10 * 60 * 1000,
-    maxKeys: 20_000,
-  });
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly projectAccessService: ProjectAccessService,
@@ -263,23 +255,11 @@ export class FolderShareService {
 
   private async assertDownloadRateLimit(share: { id: string; projectId: string }, file: { id: string; originalName: string }, clientIp?: string) {
       const ip = shareSessionIp(clientIp);
-      await this.shareIpAbuseService.assertNotBanned(ip);
-      const rateKey = `share-dl:${ip}`;
-      this.downloadRateLimiter.assertAllowed(
-        rateKey,
-        '下载过于频繁，已临时限制访问（同一 IP 每分钟最多 5 次）',
-      );
-      const newlyLocked = this.downloadRateLimiter.recordAttempt(rateKey);
-      await this.shareIpAbuseService.recordDownload(ip, {
+      const newlyLocked = await this.shareIpAbuseService.assertDownloadAllowed(ip, {
         shareId: share.id,
         originalName: file.originalName,
       });
       if (newlyLocked) {
-        await this.shareIpAbuseService.recordRateLimited(ip, {
-          shareId: share.id,
-          originalName: file.originalName,
-          autoBanMinutes: 10,
-        });
         this.eventBus.emit(DOMAIN_EVENTS.SHARE_DOWNLOAD_RATE_LIMITED, {
           projectId: share.projectId,
           fileId: file.id,

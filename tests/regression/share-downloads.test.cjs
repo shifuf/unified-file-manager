@@ -12,6 +12,7 @@ const { Readable } = require('node:stream');
 const { FilesService } = require('../../apps/api/src/files/files.service.ts');
 const { PublicSharesController } = require('../../apps/api/src/files/files.controller.ts');
 const { FolderShareService } = require('../../apps/api/src/files/folder-share.service.ts');
+const { ShareIpAbuseService } = require('../../apps/api/src/files/share-ip-abuse.service.ts');
 const { PublicFolderSharesController } = require('../../apps/api/src/files/folder-share.controller.ts');
 const { DownloadStatsService } = require('../../apps/api/src/files/download-stats.service.ts');
 const { LocalStorageAdapter } = require('../../apps/api/src/storage/adapters/local.adapter.ts');
@@ -53,9 +54,15 @@ async function fixture(t, overrides = {}) {
       create: async ({ data }) => { const row = { id: `session-${rows.length}`, consumedAt: null, ...data }; rows.push(row); return row; },
       updateMany: async ({ where, data }) => { let count = 0; for (const row of rows.filter(row => matches(row, where))) { count++; for (const [key, value] of Object.entries(data)) row[key] = value && typeof value === 'object' && 'increment' in value ? row[key] + value.increment : value; } return { count }; },
       update: async ({ where, data }) => { await table(rows).updateMany({ where, data }); return rows.find(row => matches(row, where)); },
+      upsert: async ({ where, create, update }) => {
+        const existing = rows.find(row => matches(row, where));
+        if (existing) return table(rows).update({ where, data: update });
+        return table(rows).create({ data: { downloadCount: 0, rateLimitCount: 0, permanentBan: false, banUntil: null, banReason: null, notes: null, lastDownloadAt: null, lastRateLimitedAt: null, lastShareId: null, lastFileName: null, createdAt: new Date(), updatedAt: new Date(), ...create } });
+      },
     };
   }
-  const db = { shareLink: table([share]), folderShareLink: table([folder]), managedFile: table([file]), shareDownloadSession: table(sessions) };
+  const ipStats = [];
+  const db = { shareLink: table([share]), folderShareLink: table([folder]), managedFile: table([file]), shareDownloadSession: table(sessions), shareIpStat: table(ipStats) };
   let lock = Promise.resolve();
   db.$transaction = async callback => {
     if (Array.isArray(callback)) return Promise.all(callback);
@@ -68,7 +75,7 @@ async function fixture(t, overrides = {}) {
   const storage = { getDownloadTarget: async (current, _ttl, range) => { reads++; return adapter.getDownloadTarget(current.cdnConfig, current.storageKey, range); }, signShareAccess: () => 'legacy-ticket', verifyShareAccess: () => true };
   const audit = { write: async () => {} }, config = { get: key => key === 'PUBLIC_URL' ? 'https://files.example.test' : undefined };
   const settings = { getSharePageBrand: async () => ({}) }, access = { assertProjectAccess: async () => {} }, event = { emit: () => {} };
-  const abuse = { assertNotBanned: async () => {}, recordDownload: async () => {}, recordRateLimited: async () => {} };
+  const abuse = new ShareIpAbuseService(db, audit);
   const makeFiles = () => new FilesService(audit, config, event, null, db, access, null, settings, abuse, storage, null);
   const service = makeFiles();
   const folderService = new FolderShareService(db, access, audit, config, settings, storage, event, abuse);
@@ -83,8 +90,110 @@ async function fixture(t, overrides = {}) {
   const origin = await app.getUrl();
   t.after(async () => { await app.close(); await fs.rm(root, { recursive: true, force: true }); });
   const request = (route, options) => fetch(`${origin}${route}`, options);
-  return { request, share, folder, file, sessions, service, folderService, makeFiles, storage, auditRows, reads: () => reads };
+  return { request, share, folder, file, sessions, service, folderService, makeFiles, storage, auditRows, abuse, ipStats, db, reads: () => reads };
 }
+
+for (const route of ['/api/shares/file-token/download', '/api/folder-shares/folder-token/files/file/download']) {
+  test(`unban immediately restores the full download budget for ${route}`, async t => {
+    const f = await fixture(t, { maxDownloads: null });
+    for (let i = 0; i < 5; i++) {
+      const response = await f.request(route);
+      assert.equal(response.status, 200);
+      await response.arrayBuffer();
+    }
+    assert.equal((await f.request(route)).status, 429);
+    const cleared = await f.abuse.unban('::ffff:127.0.0.1');
+    assert.equal(cleared.banned, false);
+    for (let i = 0; i < 5; i++) {
+      const response = await f.request(route);
+      assert.equal(response.status, 200, `download ${i + 1} after unban must succeed`);
+      await response.arrayBuffer();
+    }
+    assert.equal((await f.request(route)).status, 429, 'protection still applies to subsequent abuse');
+    assert.equal(f.ipStats[0].downloadCount, 10, 'unban preserves historical statistics');
+    assert.equal(f.ipStats[0].rateLimitCount, 2);
+  });
+}
+
+test('file and directory shares use one IP budget and both recover after unban', async t => {
+  const f = await fixture(t, { maxDownloads: null });
+  const fileRoute = '/api/shares/file-token/download';
+  const folderRoute = '/api/folder-shares/folder-token/files/file/download';
+  for (const route of [fileRoute, folderRoute, fileRoute, folderRoute, fileRoute]) {
+    const response = await f.request(route);
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }
+  assert.equal((await f.request(fileRoute)).status, 429);
+  assert.equal((await f.request(folderRoute)).status, 429);
+  await f.abuse.unban('127.0.0.1');
+  for (const route of [folderRoute, fileRoute]) {
+    const response = await f.request(route);
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }
+});
+
+test('unban clears a partial budget even when a manual ban is shorter than the rate window', async t => {
+  const f = await fixture(t, { maxDownloads: null });
+  const route = '/api/shares/file-token/download';
+  for (let i = 0; i < 4; i++) await (await f.request(route)).arrayBuffer();
+  await f.abuse.ban('127.0.0.1', { permanent: true });
+  assert.equal((await f.request(route)).status, 403);
+  await f.abuse.unban('127.0.0.1');
+  for (let i = 0; i < 5; i++) {
+    const response = await f.request(route);
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }
+});
+
+test('a download already in progress cannot restore an automatic ban after unban completes', async t => {
+  const f = await fixture(t, { maxDownloads: null });
+  for (let i = 0; i < 4; i++) await f.abuse.assertDownloadAllowed('127.0.0.1');
+  let release;
+  const paused = new Promise(resolve => { release = resolve; });
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const upsert = f.db.shareIpStat.upsert;
+  f.db.shareIpStat.upsert = async args => {
+    if (args.update.downloadCount) { entered(); await paused; }
+    return upsert(args);
+  };
+  const download = f.abuse.assertDownloadAllowed('127.0.0.1');
+  await started;
+  const unban = f.abuse.unban('::ffff:127.0.0.1');
+  // Let the original unban finish while the old download is paused; a serialized
+  // implementation instead queues it until the earlier download has finished.
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  await download;
+  assert.equal((await unban).banned, false);
+  await assert.doesNotReject(() => f.abuse.assertDownloadAllowed('127.0.0.1'));
+});
+
+test('unban clears an orphaned memory lock and leaves other IPs restricted', async t => {
+  const f = await fixture(t, { maxDownloads: null });
+  for (const ip of ['192.0.2.1', '192.0.2.2']) {
+    for (let i = 0; i < 5; i++) await f.abuse.assertDownloadAllowed(ip);
+  }
+  f.ipStats.splice(f.ipStats.findIndex(row => row.ip === '192.0.2.1'), 1);
+  await f.abuse.unban('::ffff:192.0.2.1');
+  await assert.doesNotReject(() => f.abuse.assertDownloadAllowed('192.0.2.1'));
+  await assert.rejects(() => f.abuse.assertDownloadAllowed('192.0.2.2'), error => error.getStatus() === 429);
+});
+
+test('a failed unban retains the restriction and does not block a later retry', async t => {
+  const f = await fixture(t, { maxDownloads: null });
+  for (let i = 0; i < 5; i++) await f.abuse.assertDownloadAllowed('192.0.2.1');
+  const update = f.db.shareIpStat.update;
+  f.db.shareIpStat.update = async () => { throw new Error('database unavailable'); };
+  await assert.rejects(() => f.abuse.unban('192.0.2.1'), /database unavailable/);
+  await assert.rejects(() => f.abuse.assertDownloadAllowed('192.0.2.1'), error => error.getStatus() === 429);
+  f.db.shareIpStat.update = update;
+  await f.abuse.unban('192.0.2.1');
+  await assert.doesNotReject(() => f.abuse.assertDownloadAllowed('192.0.2.1'));
+});
 
 test('raw JSON share is inline regardless of Accept, and preserves share authorization', async t => {
   const f = await fixture(t, { maxDownloads: null });

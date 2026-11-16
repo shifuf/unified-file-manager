@@ -112,17 +112,6 @@ export class FilesService {
     windowMs: 15 * 60 * 1000,
     lockMs: 15 * 60 * 1000,
   });
-  /**
-   * Share download anti-abuse: more than 5 download hits / IP / 60s → lock ~10 min + notify.
-   * Counts download issuance; resumed requests share the original ticket budget.
-   */
-  private readonly shareDownloadRateLimiter = new InMemoryAttemptLimiter({
-    maxAttempts: 5,
-    windowMs: 60 * 1000,
-    lockMs: 10 * 60 * 1000,
-    maxKeys: 20_000,
-  });
-
   constructor(
     private readonly auditService: AuditService,
     private readonly configService: ConfigService,
@@ -4106,16 +4095,7 @@ export class FilesService {
     kind: 'file-share' | 'folder-share' | 'public';
   }): Promise<void> {
     const ip = (meta.ip || 'unknown').trim().replace(/^::ffff:/i, '') || 'unknown';
-    await this.shareIpAbuseService.assertNotBanned(ip);
-
-    // Global per-IP bucket (all shares) so hammering any share page is limited.
-    const key = `share-dl:${ip}`;
-    this.shareDownloadRateLimiter.assertAllowed(
-      key,
-      '下载过于频繁，已临时限制访问（同一 IP 每分钟最多 5 次）',
-    );
-    const newlyLocked = this.shareDownloadRateLimiter.recordAttempt(key);
-    await this.shareIpAbuseService.recordDownload(ip, {
+    const newlyLocked = await this.shareIpAbuseService.assertDownloadAllowed(ip, {
       shareId: meta.shareId,
       originalName: meta.originalName,
     });
@@ -4123,11 +4103,6 @@ export class FilesService {
       this.logger.warn(
         `share download rate-limited ip=${ip} shareId=${meta.shareId || '-'} file=${meta.originalName || '-'}`,
       );
-      await this.shareIpAbuseService.recordRateLimited(ip, {
-        shareId: meta.shareId,
-        originalName: meta.originalName,
-        autoBanMinutes: 10,
-      });
       this.eventBus.emit(DOMAIN_EVENTS.SHARE_DOWNLOAD_RATE_LIMITED, {
         projectId: meta.projectId ?? null,
         fileId: meta.fileId ?? null,
