@@ -1274,7 +1274,7 @@ async function toggleFilePublic(file: ManagedFile): Promise<void> {
   ElMessage.success(
     next
       ? '文件已公开：未在授权名单的域名也可访问该直链。'
-      : '已取消公开：仅授权域名或签名链接可访问。',
+      : '已取消公开：需通过登录授权或临时签名链接访问。',
   );
   await reload();
 }
@@ -1285,7 +1285,7 @@ function copyPublicUrl(file: ManagedFile): void {
   // public files are open; non-public files only from authorized domains / signed links.
   const url = file.accessUrl || file.publicUrl || `${base}/api/public/files/${file.id}`;
   void copyText(new URL(String(url), base).toString());
-  ElMessage.success(file.isPublic ? '公开直链已复制（任意域名可访问）。' : '直链已复制（授权域名可访问；未公开）。');
+  ElMessage.success(file.isPublic ? '公开直链已复制（任意域名可访问）。' : '文件地址已复制（私有文件需授权生成临时访问链接）。');
 }
 
 function buildListParams(projectId: string | undefined, page: number, pageSize: number): FileListParams {
@@ -1725,8 +1725,9 @@ async function removeFolder(folderPath: string): Promise<void> {
   ElMessage.success('空目录已删除。');
   await reload();
 }
-function openPreview(file: ManagedFile): void {
+async function openPreview(file: ManagedFile): Promise<void> {
   if (file.textEditable) { contentFile.value = file; return; }
+  if (!file.isPublic) file = await fileApi.getMetadata(file.id);
   destroyHlsPlayer();
   previewFile.value = file;
   previewVisible.value = true;
@@ -1736,7 +1737,7 @@ function openPreview(file: ManagedFile): void {
 }
 
 function previewSource(file: ManagedFile): string {
-  return fileAccessSource(file.accessUrl);
+  return fileAccessSource(file.previewUrl || file.accessUrl);
 }
 
 function onContentSaved(file: ManagedFile): void {
@@ -1746,7 +1747,7 @@ function onContentSaved(file: ManagedFile): void {
 }
 
 function previewVideoSource(file: ManagedFile & { progressiveUrl?: string | null; hlsUrl?: string | null }): string {
-  return fileAccessSource(file.progressiveUrl || file.accessUrl);
+  return fileAccessSource(file.progressiveUrl || file.previewUrl || file.accessUrl);
 }
 
 function destroyHlsPlayer(): void {

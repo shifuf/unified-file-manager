@@ -327,6 +327,12 @@ export const replicaApi = {
 };
 
 export const fileApi = {
+  getMetadata(fileId: string) {
+    return http.get<unknown, ManagedFile>(`/files/${fileId}`);
+  },
+  getAccessUrl(fileId: string) {
+    return http.get<unknown, { url: string; expiresAt: string }>(`/files/${fileId}/access-url`, { params: { expiresIn: 300 } });
+  },
   getTextContent(fileId: string) {
     return http.get<unknown, { content: string; version: number }>(`/files/${fileId}/content`);
   },

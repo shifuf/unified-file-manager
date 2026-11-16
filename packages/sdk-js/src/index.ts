@@ -179,6 +179,11 @@ export class UfmClient {
     return this.request('GET', `/api/open/files/${fileId}`) as Promise<FileListItem>;
   }
 
+  async getTemporaryAccessUrl(fileId: string, expiresIn = 300): Promise<{ url: string; expiresAt: string }> {
+    const issued = await this.request('GET', `/api/open/files/${encodeURIComponent(fileId)}/access-url`, { expiresIn }) as { url: string; expiresAt: string };
+    return { ...issued, url: new URL(issued.url, this.baseUrl).toString() };
+  }
+
   /**
    * Display / hotlink URL for browsers, img tags, CDNs.
    * Prefer this over download() for images: public accessUrl supports HTTP cache
@@ -220,10 +225,11 @@ export class UfmClient {
   }): Promise<unknown> {
     const form = new FormData();
     const blob = new Blob([file as BlobPart], { type: options.mimeType || 'application/octet-stream' });
-    form.append('file', blob, options.fileName);
-    if (options.folderPath) form.append('folderPath', options.folderPath);
-    if (options.duplicateStrategy) form.append('duplicateStrategy', options.duplicateStrategy);
-    return this.request('POST', '/api/open/files', {}, form);
+    form.append('files', blob, options.fileName);
+    return this.request('POST', '/api/open/files', {
+      folderPath: options.folderPath,
+      duplicateStrategy: options.duplicateStrategy,
+    }, form);
   }
 
   /**

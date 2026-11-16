@@ -144,7 +144,8 @@ export class FilesService {
     options: UploadOptions = {},
   ): Promise<Record<string, unknown>[]> {
     await this.projectAccessService.assertProjectAccess(user, projectId, true);
-    return this.uploadToProject(projectId, files, user.id, options);
+    const uploaded = await this.uploadToProject(projectId, files, user.id, options);
+    return uploaded.map(file => this.withTemporaryPreviewUrls(file));
   }
 
   async uploadByCredential(
@@ -152,7 +153,8 @@ export class FilesService {
     files: Express.Multer.File[],
     options: UploadOptions = {},
   ): Promise<Record<string, unknown>[]> {
-    return this.uploadToProject(projectId, files, undefined, options);
+    const uploaded = await this.uploadToProject(projectId, files, undefined, options);
+    return uploaded.map(file => this.withTemporaryPreviewUrls(file));
   }
 
   private async uploadToProject(
@@ -1144,6 +1146,28 @@ export class FilesService {
     return this.toResponse(file);
   }
 
+  async getTemporaryAccessUrlForProject(fileId: string, projectId: string, expiresIn = 300) {
+    const file = await this.findFileForProject(fileId, projectId);
+    if (file.status !== FileStatus.ACTIVE) throw new BadRequestException('只能访问有效文件。');
+    if (!Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > 300) throw new BadRequestException('访问链接有效期必须为 1 至 300 秒。');
+    return this.storageService.createPublicAccessUrl(file.id, expiresIn);
+  }
+
+  async getTemporaryAccessUrl(fileId: string, user: RequestUser, expiresIn = 300) {
+    const file = await this.findFileForUser(fileId, user);
+    if (file.status !== FileStatus.ACTIVE) throw new BadRequestException('只能访问有效文件。');
+    if (!Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > 300) throw new BadRequestException('访问链接有效期必须为 1 至 300 秒。');
+    return this.storageService.createPublicAccessUrl(file.id, expiresIn);
+  }
+
+  withTemporaryPreviewUrls(file: Record<string, unknown>): Record<string, unknown> {
+    if (file.status !== FileStatus.ACTIVE || file.isPublic || typeof file.id !== 'string') return file;
+    const issued = this.storageService.createPublicAccessUrl(file.id);
+    const query = issued.url.slice(issued.url.indexOf('?'));
+    const signed = (value: unknown) => typeof value === 'string' && value ? `${value}${query}` : value;
+    return { ...file, previewUrl: issued.url, thumbnailUrl: signed(file.thumbnailUrl), progressiveUrl: signed(file.progressiveUrl), hlsUrl: null, previewExpiresAt: issued.expiresAt };
+  }
+
   private assertTextEditable(file: FileWithStorage): void {
     if (file.status !== FileStatus.ACTIVE) throw new BadRequestException('只能编辑有效文件。');
     if (!isTextLikePreview(file.originalName, file.mimeType)) {
@@ -2036,8 +2060,7 @@ export class FilesService {
     // Access model for /api/public/files/:id (enforced in PublicFilesController):
     // - isPublic / folder-public: open to any domain, publicly cacheable
     // - valid signed temporary link: allowed regardless of domain
-    // - otherwise: only project/global authorized domains with Origin or Referer
-    //   (missing both headers is denied — no curl/direct bypass)
+    // - private files: signed links only; Origin/Referer are not authorization.
     const publicByFolder = file.isPublic
       ? true
       : await this.folderPublicService.isPublicByFolderPolicy(file.projectId, file.folderPath);
@@ -2933,8 +2956,7 @@ export class FilesService {
     // Stable fileId-based path for ACTIVE files (overwrite-in-place keeps URL identical).
     // Access is enforced at GET /api/public/files/:id:
     // - isPublic / folder-public: open
-    // - else: authorized Origin/Referer domain allowlist, or a signed temporary link
-    // Private files must not be fetched without Referer or signature (no empty-header bypass).
+    // - else: a signed temporary link obtained through authorized API access.
     const accessUrl =
       file.status === FileStatus.ACTIVE ? this.storageService.buildPublicAccessUrl(file.id) : null;
 

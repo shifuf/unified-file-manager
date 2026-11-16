@@ -20,7 +20,8 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-ufm_password}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "${MYSQL_PORT:-3306}:3306"
+      - "${BIND_IP:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"
+    mem_limit: ${MYSQL_MEMORY_LIMIT:-512m}
     volumes:
       - ufm_mysql_data:/var/lib/mysql
     command:
@@ -38,7 +39,9 @@ services:
     container_name: ufm-redis
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${BIND_IP:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    mem_limit: ${REDIS_MEMORY_LIMIT:-96m}
+    command: ["redis-server", "--maxmemory", "48mb", "--maxmemory-policy", "noeviction"]
     volumes:
       - ufm_redis_data:/data
     healthcheck:
@@ -57,7 +60,8 @@ services:
       MEILI_NO_ANALYTICS: "true"
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-ufm_meili_change_me}
     ports:
-      - "${MEILI_PORT:-7700}:7700"
+      - "${BIND_IP:-127.0.0.1}:${MEILI_PORT:-7700}:7700"
+    mem_limit: ${MEILI_MEMORY_LIMIT:-256m}
     volumes:
       - ufm_meili_data:/meili_data
     healthcheck:
@@ -88,6 +92,8 @@ services:
       LOCAL_STORAGE_ROOT: /app/storage
       STORAGE_PLUGIN_DIR: /app/storage-plugins
       APP_PORT: ${APP_PORT:-60557}
+      NODE_OPTIONS: --max-old-space-size=256
+    mem_limit: ${API_MEMORY_LIMIT:-512m}
     depends_on:
       mysql:
         condition: service_healthy
@@ -97,7 +103,7 @@ services:
       - ufm_storage_data:/app/storage
       - ufm_plugin_data:/app/storage-plugins
     ports:
-      - "${APP_PORT:-60557}:${APP_PORT:-60557}"
+      - "${BIND_IP:-127.0.0.1}:${APP_PORT:-60557}:${APP_PORT:-60557}"
     healthcheck:
       test:
         [
@@ -139,7 +145,8 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "${WEB_PORT:-60558}:80"
+      - "${BIND_IP:-127.0.0.1}:${WEB_PORT:-60558}:80"
+    mem_limit: ${WEB_MEMORY_LIMIT:-64m}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
       interval: 5s

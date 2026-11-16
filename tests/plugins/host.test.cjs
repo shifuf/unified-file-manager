@@ -31,3 +31,21 @@ test('host applies manifest defaults and redacts custom secret values in plugin 
  const source=code.replace("upload:async(c,p)=>({storageKey:p.key})","upload:async(c,p)=>{if(c.config.credential)throw Error('bad '+c.config.credential);return {storageKey:c.config.prefix}}")
  try{const s=new PluginStore(root);await s.load();await s.install(await zip({'storage-plugin.json':JSON.stringify(m),'index.cjs':source}));const a=s.adapter('EXAMPLE');assert.equal((await a.upload({config:{}},{})).storageKey,'default-key');await assert.rejects(a.upload({config:{credential:'private-value'}},{}),e=>!e.message.includes('private-value'));}finally{await fs.rm(root,{recursive:true,force:true});}
 });
+
+test('all five packaged cloud plugins install and reload with the same provider and digest',async()=>{
+ const {PluginStore}=require('../../apps/api/src/storage/plugins/plugin-store.ts');
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'ufm-five-plugins-'));
+ try {
+  const store=new PluginStore(root); await store.load();
+  for(const name of ['qiniu','upyun','aliyun','s3','cloudflare-r2']){
+   const directory=path.resolve(__dirname,'../../plugins',name);
+   const m=JSON.parse(await fs.readFile(path.join(directory,'storage-plugin.json'),'utf8'));
+   const installed=await store.install(await fs.readFile(path.join(directory,`${m.id}-${m.version}.zip`)));
+   assert.equal(installed.id,m.id); assert.equal(installed.available,true);
+  }
+  const before=store.list().map(p=>[p.id,p.version,p.sha256]);
+  const restored=new PluginStore(root); await restored.load();
+  assert.deepEqual(restored.list().map(p=>[p.id,p.version,p.sha256]),before);
+  for(const plugin of restored.list())assert.equal(restored.adapter(plugin.id).provider,plugin.id);
+ }finally{await fs.rm(root,{recursive:true,force:true});}
+});

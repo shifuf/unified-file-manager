@@ -7,6 +7,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   Param,
   Post,
   Put,
@@ -54,14 +55,15 @@ export class OpenApiController {
   ) {}
 
   @Get()
-  list(
+  async list(
     @Req() request: OpenApiRequest,
     @Query() query: OpenListFilesDto,
   ): ReturnType<FilesService['listByProject']> {
-    return this.filesService.listByProject({
+    const page = await this.filesService.listByProject({
       ...query,
       projectId: request.openProject.id,
     });
+    return { ...page, items: page.items.map(file => this.filesService.withTemporaryPreviewUrls(file)) };
   }
 
   @Get('folders')
@@ -151,11 +153,17 @@ export class OpenApiController {
   }
 
   @Get(':fileId')
-  get(
+  async get(
     @Req() request: OpenApiRequest,
     @Param('fileId') fileId: string,
   ): ReturnType<FilesService['getForProject']> {
-    return this.filesService.getForProject(fileId, request.openProject.id);
+    return this.filesService.withTemporaryPreviewUrls(await this.filesService.getForProject(fileId, request.openProject.id));
+  }
+
+  @Get(':fileId/access-url')
+  @Header('Cache-Control', 'no-store')
+  accessUrl(@Req() request: OpenApiRequest, @Param('fileId') fileId: string, @Query('expiresIn') expiresIn?: string) {
+    return this.filesService.getTemporaryAccessUrlForProject(fileId, request.openProject.id, expiresIn === undefined ? 300 : Number(expiresIn));
   }
 
   @Put(':fileId')

@@ -234,6 +234,8 @@ export interface ManagedFile {
   checksum?: string | null;
   publicUrl?: string | null;
   accessUrl?: string | null;
+  previewUrl?: string | null;
+  previewExpiresAt?: string | null;
   remark?: string | null;
   tags: string[];
   folderPath?: string | null;

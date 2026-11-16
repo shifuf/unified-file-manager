@@ -102,13 +102,20 @@ export class FilesController {
   ) {}
 
   @Get('files')
-  list(@Query() query: ListFilesDto, @CurrentUser() user: RequestUser): ReturnType<FilesService['list']> {
-    return this.filesService.list(query, user);
+  async list(@Query() query: ListFilesDto, @CurrentUser() user: RequestUser): ReturnType<FilesService['list']> {
+    const page = await this.filesService.list(query, user);
+    return { ...page, items: page.items.map(file => this.filesService.withTemporaryPreviewUrls(file)) };
   }
 
   @Get('files/:fileId')
-  get(@Param('fileId') fileId: string, @CurrentUser() user: RequestUser): ReturnType<FilesService['get']> {
-    return this.filesService.get(fileId, user);
+  async get(@Param('fileId') fileId: string, @CurrentUser() user: RequestUser): ReturnType<FilesService['get']> {
+    return this.filesService.withTemporaryPreviewUrls(await this.filesService.get(fileId, user));
+  }
+
+  @Get('files/:fileId/access-url')
+  @Header('Cache-Control', 'no-store')
+  accessUrl(@Param('fileId') fileId: string, @CurrentUser() user: RequestUser, @Query('expiresIn') expiresIn?: string) {
+    return this.filesService.getTemporaryAccessUrl(fileId, user, expiresIn === undefined ? 300 : Number(expiresIn));
   }
 
   @Get('files/:fileId/content')
@@ -795,12 +802,14 @@ export class PublicFilesController {
     // Access model:
     // - signed temporary link: trusted as-is (still enforce HTTPS when required)
     // - isOpenPublic (per-file / folder public): open hotlink, publicly cacheable
-    // - otherwise: only project/global authorized domains with an explicit Origin/Referer
-    //   (empty Origin+Referer no longer bypasses the allowlist)
+    // - private files: require a signed link; source headers cannot authorize reads.
     const accessMode = await this.enforcePublicAccessPolicy(request, {
       allowedDomains,
       isOpenPublic,
       signatureValid,
+    }).catch(error => {
+      target.stream?.destroy();
+      throw error;
     });
 
     this.setPublicFileHeaders(response, accessMode);
@@ -1072,8 +1081,7 @@ export class PublicFilesController {
       await this.assertHttpsIfRequired(request);
       return 'open';
     }
-    await this.assertAllowedDomain(request, access.allowedDomains);
-    return 'restricted';
+    throw new ForbiddenException('私有文件需要签名链接或通过登录授权接口访问。');
   }
 
   private async assertAllowedDomain(request: Request, projectAllowlist: string[]): Promise<void> {

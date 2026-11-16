@@ -22,6 +22,7 @@ RUN npm config set registry "$NPM_REGISTRY" \
 
 FROM deps AS source
 WORKDIR /app
+ENV NODE_OPTIONS=--max-old-space-size=768
 COPY tsconfig.base.json ./
 COPY apps/api apps/api
 COPY apps/web apps/web

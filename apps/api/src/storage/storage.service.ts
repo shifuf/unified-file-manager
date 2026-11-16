@@ -390,11 +390,19 @@ export class StorageService {
   }
 
   verifyPublicAccess(fileId: string, expires: number, signature: string): boolean {
+    if (!Number.isSafeInteger(expires) || expires <= Math.floor(Date.now() / 1000)) return false;
     const expected = hmacSha256Base64Url(
       getSigningSecret(),
       `ufm-public-file\n${fileId}\n${Math.floor(expires)}`,
     );
     return expected === signature;
+  }
+
+  createPublicAccessUrl(fileId: string, expiresIn = 300): { url: string; expiresAt: string } {
+    if (!Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > 300) throw new Error('访问链接有效期必须为 1 至 300 秒。');
+    const expires = Math.floor(Date.now() / 1000) + expiresIn;
+    const signature = hmacSha256Base64Url(getSigningSecret(), `ufm-public-file\n${fileId}\n${expires}`);
+    return { url: `${this.buildPublicAccessUrl(fileId)}?expires=${expires}&signature=${encodeURIComponent(signature)}`, expiresAt: new Date(expires * 1000).toISOString() };
   }
 
   async createDirectUploadCredential(
