@@ -1,0 +1,11 @@
+{
+  "id": "EXAMPLE_S3", "name": "第三方 S3 示例", "version": "1.0.0", "apiVersion": 1, "entry": "index.cjs",
+  "capabilities": { "directUpload": true, "usage": false },
+  "fields": [
+    { "key": "endpoint", "label": "Endpoint", "type": "string", "required": true, "url": true },
+    { "key": "bucket", "label": "Bucket", "type": "string", "required": true },
+    { "key": "accessKeyId", "label": "Access Key ID", "type": "string", "required": true },
+    { "key": "secretAccessKey", "label": "Secret Access Key", "type": "string", "required": true, "secret": true },
+    { "key": "region", "label": "Region", "type": "string", "default": "us-east-1" }
+  ]
+}

@@ -15,7 +15,7 @@ export function auditDownloadSource(detail: unknown): DownloadStorageSource | nu
   const identity = (value: unknown): DownloadStorageSource['selected'] | null => {
     const row = object(value);
     if (!row || typeof row.configId !== 'string' || typeof row.configName !== 'string'
-      || !['LOCAL', 'QINIU', 'ALIYUN', 'S3', 'UPYUN'].includes(String(row.provider))) return null;
+      || typeof row.provider !== 'string' || !/^[A-Z][A-Z0-9_]{1,63}$/.test(row.provider)) return null;
     return { configId: row.configId, configName: row.configName, provider: row.provider as DownloadStorageSource['selected']['provider'] };
   };
   const selected = identity(source.selected);

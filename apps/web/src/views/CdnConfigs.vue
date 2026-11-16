@@ -15,6 +15,41 @@
       </el-button>
     </div>
 
+    <section class="surface plugin-panel">
+      <div class="surface-body">
+        <div class="toolbar">
+          <h2 class="section-title">存储插件</h2>
+          <el-button v-if="canCreateConfig" :loading="installingPlugin" @click="pluginFileInput?.click()">上传插件 ZIP / 升级</el-button>
+          <input ref="pluginFileInput" type="file" accept=".zip,application/zip" hidden @change="installPlugin" />
+        </div>
+        <p class="muted">本地存储由系统提供。其他存储需先上传安装插件，再创建存储配置。</p>
+        <p class="muted">插件会在服务器运行代码，请仅安装你信任的开发者提供的插件包。</p>
+        <el-alert v-if="pluginLoadError" type="error" :closable="false" :title="pluginLoadError" />
+        <el-table :data="remotePlugins" row-key="id">
+          <el-table-column prop="name" label="插件" min-width="170" />
+          <el-table-column prop="id" label="标识" min-width="160" />
+          <el-table-column prop="version" label="版本" width="110" />
+          <el-table-column label="能力" min-width="230">
+            <template #default="{ row }">
+              <span>上传 / 下载 / 删除</span>
+              <el-tag v-if="row.capabilities.directUpload" size="small">支持签名直传</el-tag>
+              <el-tag v-if="row.capabilities.usage" size="small">平台用量</el-tag>
+              <el-tag v-if="row.available === false" type="danger" size="small">加载失败</el-tag>
+              <div v-if="row.error" class="field-help">{{ row.error }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="190">
+            <template #default="{ row }">
+              <el-button link type="primary" @click="downloadPlugin(row)">下载包</el-button>
+              <el-button v-if="canCreateConfig" link type="danger" :loading="removingPluginId === row.id" :disabled="isPluginReferenced(row.id)" @click="removePlugin(row)">卸载</el-button>
+              <span v-if="isPluginReferenced(row.id)" class="muted">配置引用中</span>
+            </template>
+          </el-table-column>
+          <template #empty>尚未安装远程存储插件</template>
+        </el-table>
+      </div>
+    </section>
+
     <section class="surface">
       <div class="surface-body">
         <div class="toolbar">
@@ -26,6 +61,8 @@
           <el-table-column prop="provider" label="平台" width="120">
             <template #default="{ row }">
               <el-tag>{{ providerLabel(row.provider) }}</el-tag>
+              <el-tag v-if="!pluginFor(row.provider)" type="danger" size="small">插件未安装</el-tag>
+              <el-tag v-else-if="pluginFor(row.provider)?.available === false" type="danger" size="small">插件不可用</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="可使用项目" min-width="220">
@@ -67,7 +104,7 @@
           </el-table-column>
           <el-table-column label="平台用量 / 空间基准" min-width="220">
             <template #default="{ row }">
-              <div v-if="['QINIU', 'UPYUN'].includes(row.provider) || row.storageQuotaBytes != null || row.manualStorageUsedBytes != null || row.trafficQuotaBytes != null || row.manualTrafficUsedBytes != null" class="usage-cell">
+              <div v-if="supportsUsage(row.provider) || row.storageQuotaBytes != null || row.manualStorageUsedBytes != null || row.trafficQuotaBytes != null || row.manualTrafficUsedBytes != null" class="usage-cell">
                 <template v-if="usageLoadingId === row.id">
                   <span class="muted">加载中…</span>
                 </template>
@@ -115,7 +152,7 @@
                   测试
                 </el-button>
                 <el-button
-                  v-if="['QINIU', 'UPYUN'].includes(row.provider) || row.autoFailover"
+                  v-if="supportsUsage(row.provider)"
                   link
                   type="primary"
                   :loading="usageLoadingId === row.id"
@@ -152,13 +189,16 @@
     <el-dialog v-model="dialogVisible" :title="editingConfig ? '编辑存储配置' : '新建存储配置'" width="680px">
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
         <el-form-item label="平台" prop="provider">
-          <el-segmented v-model="form.provider" :options="providerOptions" @change="fillTemplate" />
+          <el-select v-model="form.provider" :disabled="Boolean(editingConfig)" style="width: 100%" @change="fillTemplate">
+            <el-option v-for="option in providerOptions" :key="option.value" :label="option.label" :value="option.value" />
+          </el-select>
         </el-form-item>
         <el-form-item label="配置名称" prop="name">
           <el-input v-model="form.name" maxlength="128" show-word-limit />
         </el-form-item>
         <div class="config-section">
           <div class="config-section-title">平台配置</div>
+          <el-alert v-if="!pluginFor(form.provider) || pluginFor(form.provider)?.available === false" type="warning" :closable="false" title="此存储插件未安装或加载失败。请上传匹配的插件后测试连接；已有配置参数保留。" />
           <div class="config-field-grid">
             <el-form-item
               v-for="field in currentHelp.fields"
@@ -167,14 +207,21 @@
               :required="field.required"
               class="config-field-item"
             >
+              <el-switch v-if="field.type === 'boolean'" v-model="form.configValues[field.key]" />
+              <el-input-number v-else-if="field.type === 'number'" :model-value="form.configValues[field.key] === undefined ? undefined : Number(form.configValues[field.key])" @update:model-value="form.configValues[field.key] = $event" />
+              <el-select v-else-if="field.type === 'select'" v-model="form.configValues[field.key]" clearable>
+                <el-option v-for="option in field.options" :key="option.value" :label="option.label" :value="option.value" />
+              </el-select>
               <el-input
-                v-model="form.configValues[field.key]"
+                v-else
+                :model-value="String(form.configValues[field.key] ?? '')"
                 :type="field.secret ? 'password' : 'text'"
                 :show-password="field.secret"
                 :placeholder="field.placeholder"
                 autocomplete="off"
+                @update:model-value="form.configValues[field.key] = $event"
               />
-              <div v-if="field.help" class="field-help">{{ field.help }}</div>
+              <div v-if="field.description" class="field-help">{{ field.description }}</div>
             </el-form-item>
           </div>
           <div class="config-help">{{ currentHelp.description }}</div>
@@ -219,7 +266,7 @@
 
       <template #footer>
         <div class="dialog-footer">
-          <el-button :icon="Connection" :loading="draftTesting" @click="testDraftConfig">测试连接</el-button>
+          <el-button :icon="Connection" :loading="draftTesting" :disabled="!pluginFor(form.provider) || pluginFor(form.provider)?.available === false" @click="testDraftConfig">测试连接</el-button>
           <div class="dialog-footer-right">
             <el-button @click="dialogVisible = false">取消</el-button>
             <el-tooltip
@@ -311,11 +358,20 @@ import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'elem
 import { computed, onMounted, reactive, ref } from 'vue';
 
 import { cdnApi, projectApi } from '@/api/modules';
+import { storagePluginsApi, type StoragePluginManifest } from '@/api/storage-plugins';
 import { useAuthStore } from '@/stores/auth';
 import type { CdnConfig, CdnProvider, Project, StorageHealthResult, StorageUsageResult } from '@/types';
 import { limitFormValues, storageLimitPayload, storageSpaceView } from '@/utils/storage-limit-form';
+import { buildPluginConfigValues, collectPluginConfigValues, type PluginConfigValue } from '@/utils/storage-plugin-form';
 
 const authStore = useAuthStore();
+async function downloadPlugin(plugin: StoragePluginManifest): Promise<void> {
+  const blob = await storagePluginsApi.download(plugin.id);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = `${plugin.id}-${plugin.version}.zip`;
+  anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 const loading = ref(false);
 const submitting = ref(false);
 const testingConfigId = ref('');
@@ -341,90 +397,31 @@ const draftTestedKey = ref('');
 const initialConnectionKey = ref('');
 const initialLimitValues = ref<ReturnType<typeof limitFormValues>>();
 const formRef = ref<FormInstance>();
-const providerOptions = [
-  { label: '本地', value: 'LOCAL' },
-  { label: '七牛云', value: 'QINIU' },
-  { label: '又拍云', value: 'UPYUN' },
-  { label: '阿里 OSS', value: 'ALIYUN' },
-  { label: 'S3 兼容', value: 'S3' },
-];
-const MASKED_SECRET = '******';
-interface ConfigField {
-  key: string;
-  label: string;
-  required: boolean;
-  secret?: boolean;
-  placeholder?: string;
-  help?: string;
-}
-
-interface ProviderHelp {
-  description: string;
-  fields: ConfigField[];
-}
-
-const providerHelp: Record<CdnProvider, ProviderHelp> = {
-  LOCAL: {
-    description: '本地存储需要保存目录和对外访问域名。',
-    fields: [
-      { key: 'root', label: '保存目录', required: true, placeholder: './storage' },
-      { key: 'domain', label: '访问域名', required: true, placeholder: 'http://localhost:60557' },
-    ],
-  },
-  QINIU: {
-    description: '编辑已有配置时，密钥保持 ****** 会沿用原值。',
-    fields: [
-      { key: 'accessKey', label: 'AccessKey', required: true, placeholder: 'AKxxxx' },
-      { key: 'secretKey', label: 'SecretKey', required: true, secret: true, placeholder: 'SKxxxx' },
-      { key: 'bucket', label: 'Bucket', required: true, placeholder: 'assets-prod' },
-      { key: 'domain', label: '访问域名', required: true, placeholder: 'https://assets.example.com' },
-    ],
-  },
-  UPYUN: {
-    description: '接口地址可不填，默认使用又拍云接口。',
-    fields: [
-      { key: 'bucket', label: '服务名', required: true, placeholder: 'assets-prod' },
-      { key: 'operator', label: '操作员', required: true, placeholder: 'operator-name' },
-      { key: 'password', label: '密码', required: true, secret: true, placeholder: 'operator-password' },
-      { key: 'domain', label: '访问域名', required: true, placeholder: 'https://assets.example.com' },
-      { key: 'endpoint', label: '接口地址', required: false, placeholder: 'https://v0.api.upyun.com' },
-      {
-        key: 'tokenSecret',
-        label: 'Token 密钥',
-        required: false,
-        secret: true,
-        placeholder: '防盗链/签名密钥，可留空',
-        help: '用于生成 _upt 防盗链签名；留空则直接使用公开域名直链。',
-      },
-    ],
-  },
-  ALIYUN: {
-    description: 'Endpoint 填 OSS 地域节点，不需要带 https://。',
-    fields: [
-      { key: 'accessKey', label: 'AccessKey', required: true, placeholder: 'LTAIxxxx' },
-      { key: 'secretKey', label: 'SecretKey', required: true, secret: true, placeholder: 'secret' },
-      { key: 'bucket', label: 'Bucket', required: true, placeholder: 'assets-prod' },
-      { key: 'endpoint', label: 'Endpoint', required: true, placeholder: 'oss-cn-hangzhou.aliyuncs.com' },
-      { key: 'domain', label: '访问域名', required: true, placeholder: 'https://assets.example.com' },
-    ],
-  },
-  S3: {
-    description: '兼容 AWS S3 / MinIO / R2 / COS S3 接口。path-style 默认开启。',
-    fields: [
-      { key: 'endpoint', label: 'Endpoint', required: true, placeholder: 'https://s3.amazonaws.com' },
-      { key: 'region', label: 'Region', required: true, placeholder: 'us-east-1' },
-      { key: 'bucket', label: 'Bucket', required: true, placeholder: 'assets-prod' },
-      { key: 'accessKeyId', label: 'AccessKeyId', required: true, placeholder: 'AKIA...' },
-      { key: 'secretAccessKey', label: 'SecretAccessKey', required: true, secret: true, placeholder: 'secret' },
-      { key: 'publicBaseUrl', label: '公开访问域名', required: false, placeholder: 'https://cdn.example.com' },
-      { key: 'forcePathStyle', label: 'Path Style (true/false)', required: false, placeholder: 'true' },
-    ],
-  },
+const localPlugin: StoragePluginManifest = {
+  id: 'LOCAL', name: '本地', version: '1', apiVersion: 1, builtin: true, capabilities: {},
+  description: '本地存储需要保存目录和对外访问域名。',
+  fields: [
+    { key: 'root', label: '保存目录', type: 'string', required: true, placeholder: './storage' },
+    { key: 'domain', label: '访问域名', type: 'string', required: true, url: true, placeholder: 'http://localhost:60557' },
+  ],
 };
+const plugins = ref<StoragePluginManifest[]>([localPlugin]);
+const pluginLoadError = ref('');
+const installingPlugin = ref(false);
+const removingPluginId = ref('');
+const pluginFileInput = ref<HTMLInputElement>();
+const remotePlugins = computed(() => plugins.value.filter(plugin => plugin.id !== 'LOCAL'));
+const providerOptions = computed(() => {
+  const options = plugins.value.filter(plugin => plugin.available !== false).map(plugin => ({ label: plugin.name, value: plugin.id }));
+  if (editingConfig.value && !options.some(option => option.value === editingConfig.value?.provider)) {
+    options.push({ label: `${editingConfig.value.provider}（插件未安装）`, value: editingConfig.value.provider });
+  }
+  return options;
+});
 const form = reactive({
   provider: 'LOCAL' as CdnProvider,
   name: '',
-  configValues: {} as Record<string, string>,
+  configValues: {} as Record<string, PluginConfigValue>,
   priority: 100,
   failoverThresholdPercent: 90,
   ...limitFormValues({}),
@@ -434,10 +431,18 @@ const rules: FormRules = {
   provider: [{ required: true, message: '请选择存储平台。', trigger: 'change' }],
   name: [{ required: true, message: '请输入配置名称。', trigger: 'blur' }],
 };
-const currentHelp = computed(() => providerHelp[form.provider]);
+const currentHelp = computed(() => pluginFor(form.provider) ?? { description: '', fields: [] });
+
+function pluginFor(provider: CdnProvider): StoragePluginManifest | undefined {
+  return plugins.value.find(plugin => plugin.id === provider);
+}
+
+function supportsUsage(provider: CdnProvider): boolean {
+  return pluginFor(provider)?.available !== false && Boolean(pluginFor(provider)?.capabilities.usage);
+}
 
 function providerLabel(provider: CdnProvider): string {
-  const option = providerOptions.find((item) => item.value === provider);
+  const option = providerOptions.value.find((item) => item.value === provider);
   return option?.label || provider;
 }
 
@@ -488,7 +493,9 @@ function checkTagType(status: string): 'success' | 'warning' | 'danger' {
 }
 
 function summarizeConfig(config: CdnConfig): string {
-  const fields = providerHelp[config.provider].fields;
+  const plugin = pluginFor(config.provider);
+  if (!plugin) return '请安装匹配的存储插件以查看和测试配置';
+  const fields = plugin.fields;
   const parts = fields
     .filter((field) => !field.secret && config.config[field.key] !== undefined && config.config[field.key] !== '')
     .map((field) => `${field.label}=${String(config.config[field.key])}`);
@@ -504,15 +511,56 @@ function fillTemplate(): void {
 async function reload(): Promise<void> {
   loading.value = true;
   try {
-    configs.value = await cdnApi.list();
+    await Promise.all([loadPlugins(), cdnApi.list().then(result => { configs.value = result; })]);
     void loadUsageForCloudConfigs();
   } finally {
     loading.value = false;
   }
 }
 
+async function loadPlugins(): Promise<void> {
+  try {
+    const result = await storagePluginsApi.list();
+    plugins.value = result.some(plugin => plugin.id === 'LOCAL') ? result : [localPlugin, ...result];
+    pluginLoadError.value = '';
+  } catch {
+    pluginLoadError.value = '插件列表加载失败，请刷新后重试。';
+  }
+}
+
+function isPluginReferenced(id: string): boolean {
+  return configs.value.some(config => config.provider === id) || Boolean(pluginFor(id)?.configCount);
+}
+
+async function installPlugin(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file || !canCreateConfig.value) return;
+  if (!file.name.toLowerCase().endsWith('.zip')) { ElMessage.error('请选择插件 ZIP 文件。'); return; }
+  installingPlugin.value = true;
+  try {
+    const result = await storagePluginsApi.install(file);
+    ElMessage.success(`${result.name} ${result.version} 已安装。`);
+    await reload();
+  } finally { installingPlugin.value = false; }
+}
+
+async function removePlugin(plugin: StoragePluginManifest): Promise<void> {
+  if (!canCreateConfig.value || plugin.id === 'LOCAL' || isPluginReferenced(plugin.id)) return;
+  try {
+    await ElMessageBox.confirm(`确认卸载「${plugin.name}」？以后可重新上传插件包安装。`, '卸载存储插件', { type: 'warning', confirmButtonText: '卸载', cancelButtonText: '取消' });
+  } catch { return; }
+  removingPluginId.value = plugin.id;
+  try {
+    await storagePluginsApi.remove(plugin.id);
+    ElMessage.success('存储插件已卸载。');
+    await reload();
+  } finally { removingPluginId.value = ''; }
+}
+
 async function loadUsage(config: CdnConfig, force = false): Promise<void> {
-  if (config.provider !== 'QINIU' && config.provider !== 'UPYUN') {
+  if (!supportsUsage(config.provider)) {
     return;
   }
   if (!force && usageByConfigId.value[config.id]) {
@@ -544,7 +592,7 @@ async function loadUsage(config: CdnConfig, force = false): Promise<void> {
 }
 
 async function loadUsageForCloudConfigs(): Promise<void> {
-  const cloud = configs.value.filter((item) => item.provider === 'QINIU' || item.provider === 'UPYUN');
+  const cloud = configs.value.filter((item) => supportsUsage(item.provider));
   // Sequential with small concurrency to avoid provider rate limits.
   const queue = [...cloud];
   const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
@@ -564,7 +612,7 @@ function openCreateDialog(): void {
   }
 
   editingConfig.value = null;
-  form.provider = 'ALIYUN';
+  form.provider = 'LOCAL';
   form.name = '';
   Object.assign(form, { priority: 100, failoverThresholdPercent: 90, ...limitFormValues({}), autoFailover: false });
   initialLimitValues.value = undefined;
@@ -712,45 +760,23 @@ async function submitConfig(): Promise<void> {
   }
 }
 
-function buildConfigValues(provider: CdnProvider, config: Record<string, unknown> = {}): Record<string, string> {
-  return Object.fromEntries(
-    providerHelp[provider].fields.map((field) => [field.key, String(config[field.key] ?? '')]),
-  );
+function buildConfigValues(provider: CdnProvider, config: Record<string, unknown> = {}): Record<string, PluginConfigValue> {
+  return buildPluginConfigValues(pluginFor(provider)?.fields ?? [], config);
 }
 
 function collectConfigValues(
   provider: CdnProvider,
-  values: Record<string, string>,
+  values: Record<string, PluginConfigValue>,
   allowMaskedSecrets: boolean,
 ): Record<string, unknown> | null {
-  const config: Record<string, unknown> = {};
-  const maskedKeys = new Set<string>();
-
-  for (const field of providerHelp[provider].fields) {
-    const value = String(values[field.key] ?? '').trim();
-
-    if (allowMaskedSecrets && field?.secret && value === MASKED_SECRET) {
-      maskedKeys.add(field.key);
-      continue;
-    }
-
-    config[field.key] = value;
-  }
-
-  const missingFields = providerHelp[provider].fields.filter((field) => {
-    if (!field.required) {
-      return false;
-    }
-
-    return !maskedKeys.has(field.key) && String(config[field.key] ?? '').trim() === '';
-  });
-
-  if (missingFields.length > 0) {
-    ElMessage.error(`请填写：${missingFields.map((field) => field.label).join('、')}。`);
+  const plugin = pluginFor(provider);
+  if (!plugin) {
+    if (connectionUnchanged.value) return {};
+    ElMessage.error('请先安装匹配的存储插件。');
     return null;
   }
-
-  return config;
+  try { return collectPluginConfigValues(plugin.fields, values, allowMaskedSecrets); }
+  catch (error) { ElMessage.error(error instanceof Error ? error.message : '存储配置无效。'); return null; }
 }
 
 async function openAssignmentDialog(config: CdnConfig): Promise<void> {
@@ -827,6 +853,7 @@ onMounted(reload);
 </script>
 
 <style scoped>
+.plugin-panel { margin-bottom: 20px; }
 .data-table {
   margin-top: 14px;
 }

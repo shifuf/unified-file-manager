@@ -209,7 +209,7 @@ model Project {
 model CdnConfig {
   id             String        @id @default(cuid())
   projectId      String?
-  provider       CdnProvider
+  provider       String       @db.VarChar(64)
   name           String        @db.VarChar(128)
   config         Json
   active         Boolean       @default(false)

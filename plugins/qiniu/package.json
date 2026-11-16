@@ -1,0 +1,1 @@
+{ "name": "@ufm/storage-qiniu", "version": "1.0.1", "private": true, "scripts": { "build": "ufm-storage-plugin pack ." }, "dependencies": { "@ufm/storage-plugin-sdk": "^1.0.0", "qiniu": "^7.14.0", "proxy-agent": "^5.0.0" }, "ufmStoragePlugin": { "unsupportedOptionalModules": ["coffee-script", "typescript"] } }

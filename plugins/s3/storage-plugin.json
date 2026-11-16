@@ -1,0 +1,13 @@
+{
+  "id": "S3", "name": "S3 / S3 兼容存储", "version": "1.0.0", "apiVersion": 1, "entry": "index.cjs",
+  "capabilities": { "directUpload": true, "usage": false },
+  "fields": [
+    { "key": "accessKeyId", "label": "Access Key ID", "type": "string", "required": true },
+    { "key": "secretAccessKey", "label": "Secret Access Key", "type": "string", "required": true, "secret": true },
+    { "key": "bucket", "label": "Bucket", "type": "string", "required": true },
+    { "key": "endpoint", "label": "API Endpoint", "type": "string", "required": true, "url": true },
+    { "key": "region", "label": "Region", "type": "string", "default": "us-east-1" },
+    { "key": "pathStyle", "label": "Path Style", "type": "boolean", "default": true },
+    { "key": "domain", "label": "公开域名", "type": "string", "url": true }
+  ]
+}

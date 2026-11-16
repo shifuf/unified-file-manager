@@ -1,0 +1,4 @@
+{
+  "name": "my-ufm-storage-plugin", "version": "1.0.0", "private": true,
+  "scripts": { "build": "ufm-storage-plugin pack .", "test": "node contract.cjs" }
+}

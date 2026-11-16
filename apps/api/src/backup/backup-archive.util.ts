@@ -26,6 +26,7 @@ export function validateBackupPayload(candidate: unknown): {
   tables: Record<string, Array<Record<string, unknown>>>;
   objects: Array<{ cdnConfigId: string; storageKey: string; mimeType: string; originalName: string; size: number; data: string }>;
   warnings: string[];
+  plugins?: Array<{ id: string; version: string; sha256: string; data?: string }>;
 } {
   if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) throw new Error('备份文件格式不正确。');
   const value = candidate as Record<string, unknown>;
@@ -66,6 +67,12 @@ export function validateBackupPayload(candidate: unknown): {
     return { cdnConfigId, storageKey, mimeType, originalName, size: Number(size), data };
   });
   const warnings = value.warnings === undefined ? [] : value.warnings;
+  const plugins = value.plugins === undefined ? [] : value.plugins;
+  if (!Array.isArray(plugins) || plugins.some((entry: unknown) => {
+    if (!entry || typeof entry !== 'object') return true;
+    const p = entry as Record<string, unknown>;
+    return typeof p.id !== 'string' || !/^[A-Z][A-Z0-9_]{1,63}$/.test(p.id) || typeof p.version !== 'string' || typeof p.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(p.sha256) || (p.data !== undefined && (typeof p.data !== 'string' || createHash('sha256').update(Buffer.from(p.data, 'base64')).digest('hex') !== p.sha256));
+  })) throw new Error('备份插件清单或包校验失败。');
   if (!Array.isArray(warnings) || !warnings.every((warning) => typeof warning === 'string')) throw new Error('备份警告列表格式不正确。');
   return {
     formatVersion: BACKUP_FORMAT_VERSION,
@@ -74,6 +81,7 @@ export function validateBackupPayload(candidate: unknown): {
     tables,
     objects,
     warnings,
+    plugins,
   };
 }
 

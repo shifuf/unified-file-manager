@@ -22,7 +22,7 @@
           <div class="section-title">目录管理</div>
           <div class="toolbar">
             <el-button size="small" :loading="directoriesLoading" @click="loadDirectories">刷新目录</el-button>
-            <el-button size="small" type="primary" @click="createDirectory()">新建目录</el-button>
+            <el-button size="small" type="primary" @click="createDirectory()">新建根目录</el-button>
           </div>
         </div>
         <p class="muted">支持创建多级目录。目录有文件时请先删除文件；有子目录时请先删除子目录。删除空目录后，回收站文件仍可恢复。</p>
@@ -198,7 +198,7 @@
           <el-table-column label="目录" min-width="140" show-overflow-tooltip>
             <template #default="{ row }">{{ row.folderPath || '/' }}</template>
           </el-table-column>
-          <el-table-column prop="category" label="类型" width="100" />
+          <el-table-column prop="category" label="类型" width="100"><template #default="{ row }">{{ fileCategoryLabel(row.category) }}</template></el-table-column>
           <el-table-column label="大小" width="120">
             <template #default="{ row }">{{ formatSize(row.size) }}</template>
           </el-table-column>
@@ -310,7 +310,7 @@
         </div>
         <el-table :data="projectStorages" row-key="id" empty-text="暂无存储配置关系">
           <el-table-column prop="name" label="配置名称" min-width="180" />
-          <el-table-column prop="provider" label="平台" width="120" />
+          <el-table-column prop="provider" label="平台" min-width="160"><template #default="{ row }">{{ storageProviderLabel(row.provider) }}</template></el-table-column>
           <el-table-column label="状态" width="120">
             <template #default="{ row }">
               <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
@@ -382,12 +382,12 @@
         <el-form label-position="top" class="migrate-form">
           <el-form-item label="源存储配置">
             <el-select v-model="migrateForm.sourceCdnConfigId" filterable class="full-input">
-              <el-option v-for="item in cdnConfigs" :key="item.id" :label="`${item.name} (${item.provider})`" :value="item.id" />
+              <el-option v-for="item in cdnConfigs" :key="item.id" :label="`${item.name} (${storageProviderLabel(item.provider)})`" :value="item.id" />
             </el-select>
           </el-form-item>
           <el-form-item label="目标存储配置">
             <el-select v-model="migrateForm.targetCdnConfigId" filterable class="full-input">
-              <el-option v-for="item in cdnConfigs" :key="item.id" :label="`${item.name} (${item.provider})`" :value="item.id" />
+              <el-option v-for="item in cdnConfigs" :key="item.id" :label="`${item.name} (${storageProviderLabel(item.provider)})`" :value="item.id" />
             </el-select>
           </el-form-item>
           <el-form-item>
@@ -486,7 +486,7 @@
           <el-table-column prop="folderPath" label="目录" min-width="140">
             <template #default="{ row }">{{ row.folderPath || '/' }}</template>
           </el-table-column>
-          <el-table-column prop="category" label="类型" width="120" />
+          <el-table-column prop="category" label="类型" width="120"><template #default="{ row }">{{ fileCategoryLabel(row.category) }}</template></el-table-column>
           <el-table-column label="大小" width="120">
             <template #default="{ row }">{{ formatSize(row.size) }}</template>
           </el-table-column>
@@ -540,6 +540,7 @@ import { http } from '@/api/http';
 import { cdnApi, downloadStatsApi, fileApi, projectApi, replicaApi, uploadCredentialApi } from '@/api/modules';
 import FileStorageDetails from '@/components/FileStorageDetails.vue';
 import { storageProviderLabel } from '@/utils/storage-replica-view';
+import { fileCategoryLabel } from '@/utils/file-category';
 import type {
   CdnConfig,
   DownloadStatsSummary,
@@ -619,7 +620,7 @@ const replicaCursors = reactive<{ sync: string | null; inspect: string | null }>
 const replicaResult = ref('');
 const replicaStates: StorageReplicaStatus[] = ['READY', 'PENDING', 'SYNCING', 'FAILED', 'MISSING', 'SKIPPED'];
 function replicaStatusLabel(status: StorageReplicaStatus): string {
-  return { READY: '已就绪', PENDING: '待同步', SYNCING: '同步中', FAILED: '失败', MISSING: '缺失', SKIPPED: '已解绑' }[status] || status;
+  return { READY: '已就绪', PENDING: '待同步', SYNCING: '同步中', FAILED: '失败', MISSING: '缺失', SKIPPED: '已解绑', DELETING: '待完成删除' }[status] || status;
 }
 function replicaStatusType(status: StorageReplicaStatus): 'success' | 'warning' | 'danger' | 'info' {
   return status === 'READY' ? 'success' : status === 'FAILED' || status === 'MISSING' ? 'danger' : status === 'PENDING' || status === 'SYNCING' ? 'warning' : 'info';
@@ -671,7 +672,7 @@ async function createDirectory(parentPath = ''): Promise<void> {
   const context = captureContext();
   let value: string;
   try {
-    ({ value } = await ElMessageBox.prompt(`在 ${parentPath || '根目录'} 下创建目录（可包含多级，如 contracts/2026）`, '新建目录', {
+    ({ value } = await ElMessageBox.prompt(`在 ${parentPath || '项目根目录'} 下创建目录（可包含多级，如 contracts/2026）`, parentPath ? '新建子目录' : '新建根目录', {
       confirmButtonText: '创建', cancelButtonText: '取消', inputPattern: /^[^\\:*?"<>|]+$/, inputErrorMessage: '目录名不能包含 \\ : * ? " < > |',
     }));
   } catch { return; }

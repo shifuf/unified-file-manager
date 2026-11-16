@@ -26,7 +26,7 @@ jobs:
       - run: npm ci --include=optional --no-audit --fund=false
       - run: npm --workspace apps/api run prisma:generate
       - run: npm run lint
-      # 测试文件按项目要求只保留本地；远端校验生产代码。
+      - run: npm test
       - run: npm run build
 
   publish:

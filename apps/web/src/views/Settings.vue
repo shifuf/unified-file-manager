@@ -41,15 +41,16 @@
               />
               <div class="setting-help">一次选择上传时允许的最多文件数。</div>
             </el-form-item>
-            <el-form-item label="回收站保留天数" prop="recycleRetentionDays">
+            <el-form-item label="旧版回收站保留天数" prop="recycleRetentionDays">
               <el-input-number
                 v-model="settingsForm.recycleRetentionDays"
+                disabled
                 :min="1"
                 :step="1"
                 controls-position="right"
                 class="setting-input"
               />
-              <div class="setting-help">到期后文件可被彻底清理。</div>
+              <div class="setting-help">当前采用手动确认删除，此旧版配置不再触发自动清理。请在回收站确认彻底删除。</div>
             </el-form-item>
             <el-form-item label="要求 HTTPS 访问" prop="requireHttps">
               <el-switch v-model="settingsForm.requireHttps" active-text="开启" inactive-text="关闭" />

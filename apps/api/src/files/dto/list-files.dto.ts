@@ -1,7 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { CdnProvider, FileCategory, FileStatus } from '@prisma/client';
+import { FileCategory, FileStatus } from '@prisma/client';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsDateString, IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsBoolean, IsDateString, IsEnum, IsInt, IsOptional, IsString, Matches, Max, Min } from 'class-validator';
 
 function emptyStringToUndefined(value: unknown): unknown {
   return value === '' ? undefined : value;
@@ -80,11 +80,12 @@ export class ListFilesDto {
   @IsString()
   extension?: string;
 
-  @ApiPropertyOptional({ enum: CdnProvider })
+  @ApiPropertyOptional({ description: '存储插件标识，例如 LOCAL、CLOUDFLARE_R2' })
   @Transform(({ value }) => emptyStringToUndefined(value))
   @IsOptional()
-  @IsEnum(CdnProvider)
-  cdnProvider?: CdnProvider;
+  @IsString()
+  @Matches(/^[A-Z][A-Z0-9_]{1,63}$/)
+  cdnProvider?: string;
 
   @ApiPropertyOptional({ description: '最小文件大小，单位字节' })
   @Transform(({ value }) => optionalNumber(value))

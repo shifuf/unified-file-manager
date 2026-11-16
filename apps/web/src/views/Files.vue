@@ -43,9 +43,9 @@
           v-if="!isRecycleBin && canManageSelectedProject"
           :icon="FolderAdd"
           :disabled="!selectedProjectId"
-          @click="createFolder()"
+          @click="createFolder('')"
         >
-          新建文件夹
+          新建根目录
         </el-button>
         <el-button
           v-if="!isRecycleBin && canManageSelectedProject"
@@ -210,11 +210,7 @@
             class="filter-select"
             @change="reloadFirstPage"
           >
-            <el-option label="本地" value="LOCAL" />
-            <el-option label="七牛" value="QINIU" />
-            <el-option label="又拍" value="UPYUN" />
-            <el-option label="阿里" value="ALIYUN" />
-            <el-option label="S3" value="S3" />
+            <el-option v-for="provider in storageProviderOptions" :key="provider" :label="provider === 'LOCAL' ? '本地' : provider" :value="provider" />
           </el-select>
           <el-checkbox v-model="filters.duplicateOnly" @change="reloadFirstPage">重复文件</el-checkbox>
           <el-button :icon="Refresh" @click="reload">刷新</el-button>
@@ -406,11 +402,8 @@
           <el-table-column v-if="!isRecycleBin" label="版本" width="80">
             <template #default="{ row }">v{{ row.currentVersion || 1 }}</template>
           </el-table-column>
-          <el-table-column v-if="isRecycleBin" label="到期清理" width="160">
-            <template #default="{ row }">
-              <span v-if="row.purgeAt">{{ formatPurgeCountdown(row.purgeAt) }}</span>
-              <span v-else class="muted">-</span>
-            </template>
+          <el-table-column v-if="isRecycleBin" label="清理方式" width="160">
+            <template #default>确认彻底删除后清理</template>
           </el-table-column>
           <el-table-column label="存储位置" min-width="280">
             <template #default="{ row }">
@@ -823,6 +816,10 @@ const pendingReplaceFileId = ref('');
 const replaceTargetLoading = ref(false);
 const replaceTargetOptions = ref<ManagedFile[]>([]);
 const projects = ref<Project[]>([]);
+const storageProviderOptions = computed(() => [...new Set([
+  'LOCAL', ...projects.value.flatMap(project => (project.storages ?? []).map(storage => storage.provider)),
+  ...pageResult.items.flatMap(file => file.cdnProvider ? [file.cdnProvider] : []),
+])]);
 const folders = ref<string[]>([]);
 const folderTree = ref<Array<{ name: string; path: string; fileCount: number; children: unknown[] }>>([]);
 const folderPublicPaths = ref<Set<string>>(new Set());
@@ -838,7 +835,7 @@ const pageTitle = computed(() =>
 );
 const pageSubtitle = computed(() =>
   isRecycleBin.value
-    ? '查看已删除文件，可在保留期内恢复，或执行不可恢复的彻底删除。'
+    ? '本地及云存储对象保留，可恢复文件；确认彻底删除后才清理全部存储副本，不会到期自动删除。'
     : '汇总查看全部项目文件，也可以选择单个项目后上传、预览、下载和回收文件。'
 );
 const folderBreadcrumbs = computed(() => {
@@ -1060,29 +1057,6 @@ function shareStatusMeta(status: ShareStatus): { label: string; type: 'success' 
 
 function formatTime(value?: string | null): string {
   return value ? new Date(value).toLocaleString() : '-';
-}
-
-function formatPurgeCountdown(value?: string | null): string {
-  if (!value) {
-    return '-';
-  }
-  const target = new Date(value).getTime();
-  if (!Number.isFinite(target)) {
-    return '-';
-  }
-  const diffMs = target - Date.now();
-  if (diffMs <= 0) {
-    return '即将清理';
-  }
-  const days = Math.floor(diffMs / (24 * 60 * 60 * 1000));
-  const hours = Math.floor((diffMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
-  if (days > 0) {
-    return `${days} 天后`;
-  }
-  if (hours > 0) {
-    return `${hours} 小时后`;
-  }
-  return '不到 1 小时';
 }
 
 function formatSize(size: number): string {
@@ -2187,7 +2161,7 @@ async function recycle(file: ManagedFile): Promise<void> {
     return;
   }
 
-  await ElMessageBox.confirm('删除后文件会进入回收站，可在保留期内恢复。', '删除文件', {
+  await ElMessageBox.confirm('删除后文件会进入回收站，本地和云存储对象保留以便恢复。只有在回收站确认“彻底删除”后，才会删除全部存储副本，不会到期自动删除。', '删除文件', {
     type: 'warning',
     confirmButtonText: '确认删除',
     cancelButtonText: '取消',
@@ -2237,7 +2211,7 @@ async function purge(file: ManagedFile): Promise<void> {
     return;
   }
 
-  await ElMessageBox.confirm('彻底删除会移除存储对象，操作不可恢复。', '彻底删除', {
+  await ElMessageBox.confirm('彻底删除会移除本地及云存储副本、历史版本和预览文件，操作不可恢复。若存储删除失败，将保留记录供重试。', '彻底删除', {
     type: 'warning',
     confirmButtonText: '彻底删除',
     cancelButtonText: '取消',

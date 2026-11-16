@@ -14,7 +14,7 @@ type FileHead = Prisma.ManagedFileGetPayload<{ select: typeof FILE_SELECT }>;
 type SafeConfig = Prisma.CdnConfigGetPayload<{ select: typeof CONFIG_SELECT }>;
 
 export type FileStorageLocation = {
-  configId: string; configName: string; provider: CdnProvider; enabled: boolean; assigned: boolean;
+  configId: string; configName: string; provider: string; enabled: boolean; assigned: boolean;
   desired: boolean; priority: number; status: string; attempts: number; lastError: string | null;
   verifiedAt: Date | null; replicaId?: string;
 };

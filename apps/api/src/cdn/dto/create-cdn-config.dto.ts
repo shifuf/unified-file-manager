@@ -1,12 +1,12 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { CdnProvider } from '@prisma/client';
 import { Type } from 'class-transformer';
-import { IsBoolean, IsEnum, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsBoolean, Matches, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 
 export class CreateCdnConfigDto {
-  @ApiProperty({ enum: CdnProvider, example: CdnProvider.ALIYUN })
-  @IsEnum(CdnProvider)
-  provider!: CdnProvider;
+  @ApiProperty({ example: 'LOCAL' })
+  @IsString()
+  @Matches(/^[A-Z][A-Z0-9_]{1,63}$/)
+  provider!: string;
 
   @ApiProperty({ example: '生产 OSS 华东节点' })
   @IsString()

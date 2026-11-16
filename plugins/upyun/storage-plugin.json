@@ -1,0 +1,13 @@
+{
+  "id": "UPYUN", "name": "又拍云", "version": "1.0.0", "apiVersion": 1, "entry": "index.cjs",
+  "capabilities": { "directUpload": false, "usage": true },
+  "fields": [
+    { "key": "operator", "label": "操作员", "type": "string", "required": true },
+    { "key": "password", "label": "操作员密码", "type": "string", "required": true, "secret": true },
+    { "key": "bucket", "label": "服务名称", "type": "string", "required": true },
+    { "key": "domain", "label": "访问域名", "type": "string", "required": true, "url": true },
+    { "key": "endpoint", "label": "API Endpoint", "type": "string", "url": true, "default": "https://v0.api.upyun.com" },
+    { "key": "tokenSecret", "label": "防盗链密钥", "type": "string", "secret": true },
+    { "key": "secret", "label": "历史防盗链密钥", "type": "string", "secret": true }
+  ]
+}

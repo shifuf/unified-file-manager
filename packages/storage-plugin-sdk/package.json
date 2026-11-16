@@ -1,0 +1,16 @@
+{
+  "name": "@ufm/storage-plugin-sdk",
+  "version": "1.0.0",
+  "description": "Unified File Manager server storage plugin SDK and packaging CLI",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" }, "./s3": { "types": "./dist/s3.d.ts", "default": "./dist/s3.js" } },
+  "bin": { "ufm-storage-plugin": "bin/cli.cjs" },
+  "files": ["dist", "bin", "README.md", "example"],
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "node --test ../../tests/plugins/sdk.test.cjs" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "archiver": "^7.0.1", "esbuild": "^0.25.0" },
+  "devDependencies": { "@types/node": "^24.10.1", "typescript": "^5.9.3" }
+}

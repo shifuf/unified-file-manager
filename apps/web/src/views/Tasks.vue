@@ -27,7 +27,7 @@
           <el-select v-model="filters.status" clearable placeholder="状态" style="width: 140px" @change="searchTasks">
             <el-option v-for="option in taskStatusOptions" :key="option.value" :label="option.label" :value="option.value" />
           </el-select>
-          <el-input v-model="filters.type" clearable placeholder="任务类型" style="width: 180px" @keyup.enter="searchTasks" @clear="searchTasks" />
+          <el-select v-model="filters.type" clearable placeholder="任务类型" style="width: 180px" @change="searchTasks"><el-option v-for="option in taskTypeOptions" :key="option.value" :label="option.label" :value="option.value" /></el-select>
           <span class="muted">仅可勾选已完成、失败或已取消的任务，删除只清理任务记录。</span>
         </div>
 
@@ -37,7 +37,7 @@
           <el-table-column label="项目" min-width="160">
             <template #default="{ row }">{{ row.project?.name || '-' }}</template>
           </el-table-column>
-          <el-table-column prop="type" label="类型" min-width="180" />
+          <el-table-column prop="type" label="类型" min-width="180"><template #default="{ row }">{{ taskTypeLabel(row.type) }}</template></el-table-column>
           <el-table-column label="状态" width="110">
             <template #default="{ row }">
               <el-tag :type="taskTagType(row.status)">{{ taskStatusLabel(row.status) }}</el-tag>
@@ -89,7 +89,7 @@
         </div>
         <div class="detail-row">
           <span class="muted">类型</span>
-          <span class="mono">{{ selectedTask.type }}</span>
+          <span>{{ taskTypeLabel(selectedTask.type) }}</span>
         </div>
         <div class="detail-row">
           <span class="muted">状态</span>
@@ -122,7 +122,7 @@ import { useRoute, useRouter } from 'vue-router';
 
 import { projectApi, taskApi } from '@/api/modules';
 import type { PageResult, Project, TaskItem } from '@/types';
-import { canDeleteTask, taskStatusLabel, taskStatusOptions, taskTagType } from '@/utils/task-view';
+import { canDeleteTask, taskStatusLabel, taskStatusOptions, taskTagType, taskTypeLabel, taskTypeOptions } from '@/utils/task-view';
 
 const route = useRoute();
 const router = useRouter();

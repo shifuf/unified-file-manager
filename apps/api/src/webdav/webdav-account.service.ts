@@ -1,6 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { CdnProvider } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 
 import { PASSWORD_SALT_ROUNDS } from '../common/constants';
@@ -17,7 +16,7 @@ export type WebdavAccount = {
   projectName: string;
   username: string;
   passwordHash: string;
-  provider: CdnProvider;
+  provider: string;
   cdnConfigId: string | null;
   /** Local disk root when the project uses LOCAL storage; null for remote. */
   localRoot: string | null;

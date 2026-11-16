@@ -40,11 +40,11 @@
       <article v-for="file in files" :key="file.id" class="library-card">
         <div class="thumb-wrap">
           <img v-if="file.thumbnailUrl || file.category === 'IMAGE'" :src="file.thumbnailUrl || file.accessUrl || ''" alt="" />
-          <div v-else class="thumb-fallback">{{ file.extension || file.category }}</div>
+          <div v-else class="thumb-fallback">{{ file.extension || fileCategoryLabel(file.category) }}</div>
         </div>
         <div class="card-body">
           <h3 :title="file.originalName">{{ file.originalName }}</h3>
-          <p class="meta">{{ formatSize(file.size) }} · {{ file.category }}</p>
+          <p class="meta">{{ formatSize(file.size) }} · {{ fileCategoryLabel(file.category) }}</p>
           <div class="card-actions">
             <el-button v-if="file.accessUrl" link type="primary" @click="openFile(file)">打开</el-button>
             <el-button v-if="file.accessUrl" link type="primary" @click="downloadFile(file)">下载</el-button>
@@ -67,6 +67,7 @@
 </template>
 
 <script setup lang="ts">
+import { fileCategoryLabel } from '@/utils/file-category';
 import { ElMessage } from 'element-plus';
 import { onMounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';

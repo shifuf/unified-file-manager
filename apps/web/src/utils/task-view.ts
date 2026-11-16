@@ -5,6 +5,15 @@ const labels: Record<string, string> = {
 
 export const taskStatusOptions = Object.entries(labels).map(([value, label]) => ({ value, label }));
 
+const typeLabels: Record<string, string> = {
+  FILE_BATCH_MOVE: '批量移动文件', FILE_BATCH_COPY: '批量复制文件', FILE_BATCH_DELETE: '批量移入回收站',
+  FILE_BATCH_RESTORE: '批量恢复文件', FILE_BATCH_PURGE: '批量彻底删除', STORAGE_MIGRATION: '存储迁移',
+  LOCAL_FILE_MIGRATION: '本地文件迁移', STORAGE_REPLICA_SYNC: '存储副本同步',
+  PROJECT_STORAGE_PURGE: '项目存储清理', PROJECT_IMPORT: '项目导入',
+};
+export const taskTypeOptions = Object.entries(typeLabels).map(([value, label]) => ({ value, label }));
+export function taskTypeLabel(type: string): string { return typeLabels[type] || '其他任务'; }
+
 export function taskStatusLabel(status: string): string {
   return labels[status] || '未知状态';
 }

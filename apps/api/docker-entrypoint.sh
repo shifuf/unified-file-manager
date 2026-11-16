@@ -38,4 +38,6 @@ echo "Starting API..."
 # Before launching the long-running server, make the bind-mounted storage writable
 # by the unprivileged runtime user and drop root privileges.
 chown -R node:node /app/storage 2>/dev/null || true
+mkdir -p "${STORAGE_PLUGIN_DIR:-/app/storage-plugins}"
+chown -R node:node "${STORAGE_PLUGIN_DIR:-/app/storage-plugins}" 2>/dev/null || true
 exec su-exec node "$@"

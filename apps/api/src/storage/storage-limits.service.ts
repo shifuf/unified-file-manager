@@ -207,6 +207,19 @@ export class StorageLimitsService {
     });
   }
 
+  async releaseDeletedObject(configId: string, storageKey: string): Promise<void> {
+    const keyHash = createHash('sha256').update(storageKey).digest('hex');
+    await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM CdnConfig WHERE id = ${configId} FOR UPDATE`;
+      const space = await tx.storageSpaceReservation.findUnique({ where: { configId_keyHash: { configId, keyHash } } });
+      if (!space) return;
+      if (space.owner && space.leaseUntil && space.leaseUntil > this.now()) throw new StorageLimitError('对象仍在上传，请稍后重试删除。');
+      await tx.cdnConfig.updateMany({ where: { id: configId, trackedStorageBytes: { gte: space.size } },
+        data: { trackedStorageBytes: { decrement: space.size } } });
+      await tx.storageSpaceReservation.delete({ where: { id: space.id } });
+    });
+  }
+
   async reconcileFailedUpload(reservation: UploadReservation, config: RuntimeCdnConfig, key: string): Promise<void> {
     let outcome: 'PRESENT' | 'ABSENT' | 'UNKNOWN' = 'UNKNOWN';
     try {

@@ -1,6 +1,7 @@
 /** Console is single super-admin only. */
 export type UserRole = 'SUPER_ADMIN';
-export type CdnProvider = 'LOCAL' | 'QINIU' | 'UPYUN' | 'ALIYUN' | 'S3';
+/** LOCAL is built in; all other identifiers belong to separately installed plugins. */
+export type CdnProvider = string;
 
 export interface DownloadStorageIdentity { configId: string; configName: string; provider: CdnProvider }
 export interface DownloadStorageSource {
@@ -10,7 +11,7 @@ export interface DownloadStorageSource {
   omittedAttempts?: number;
 }
 
-export type StorageReplicaStatus = 'PENDING' | 'SYNCING' | 'READY' | 'FAILED' | 'MISSING' | 'SKIPPED';
+export type StorageReplicaStatus = 'PENDING' | 'SYNCING' | 'READY' | 'FAILED' | 'MISSING' | 'SKIPPED' | 'DELETING';
 export interface StorageReplica {
   id: string;
   configId: string;

@@ -1,6 +1,38 @@
 # Unified File Manager
 
-多项目统一文件管理平台：NestJS + Prisma + MySQL 后端，Vue 3 + Element Plus 管理控制台，可插拔存储（本地 / 七牛 / 又拍云 / 阿里云 OSS / S3），开放 API（AppID + HMAC v2）。
+多项目统一文件管理平台：NestJS + Prisma + MySQL 后端，Vue 3 + Element Plus 管理控制台。仅本地存储内置；七牛、又拍云、阿里云 OSS、S3、Cloudflare R2 均通过独立 ZIP 插件安装。开放 API 使用 AppID + HMAC v2。
+
+存储插件使用与升级说明见 [插件说明](plugins/README.md)，第三方开发文档见 [插件 SDK](packages/storage-plugin-sdk/README.md)，本次验证范围见 [验收报告](tests/plugins/REPORT.md)。
+
+升级时先执行 `npm install`、`npm run prisma:generate`、`npm --workspace apps/api run db:deploy` 和 `npm run build`。旧配置 ID、provider 与文件 key 保留；所有远程配置需要在「存储配置 → 存储插件」上传对应 ZIP 后恢复使用，不自动预装。开发机运行 `npm run build:plugins` 生成五个 ZIP。插件目录通过 `STORAGE_PLUGIN_DIR` 指定，Docker 使用独立持久化卷；当前插件安装/升级支持单 API 实例。
+
+### 更新 main 并安装全部存储插件
+
+已通过源码 Compose 部署的服务器，在仓库目录执行（保留现有 `.env` 和数据卷）：
+
+```bash
+git switch main
+git pull --ff-only origin main
+docker compose --profile full up -d --build --wait api web
+docker compose --profile plugins run --rm --no-deps --build plugin-installer
+```
+
+最后一条命令自动构建并安装七牛、又拍云、阿里云 OSS、S3、Cloudflare R2 插件，通过管理员接口安装并检查版本。账号密码读取 `.env` 的 `ADMIN_USERNAME` / `ADMIN_PASSWORD`，应与当前管理员登录信息一致；启用两步验证时需先设置环境变量 `UFM_TOTP_CODE`。安装插件后仍需填写各供应商的存储配置并绑定项目。此流程构建 main 源码，不依赖尚未发布的 GHCR 镜像；不要额外叠加旧的 `docker-compose.ghcr.yml`。
+
+本地 Node.js 22 环境，先更新依赖、迁移和构建，再重启 API：
+
+```bash
+git switch main
+git pull --ff-only origin main
+npm ci
+npm run prisma:generate
+npm --workspace apps/api run db:deploy
+npm run build
+# 重启现有 API 服务后执行（默认读取 .env 的 APP_PORT）：
+npm run plugins:install
+```
+
+指定 API 地址示例：`npm run plugins:install -- --url http://127.0.0.1:3000`。远程 API 必须使用 HTTPS。重复执行会安装当前源码中的插件版本，失败时会明确退出，修复后可重试。
 
 当前发布：**v0.2.2**。变更见 [更新记录](CHANGELOG.md)，自动化回归及真实云验收见 [测试说明](tests/acceptance/README.md)。
 

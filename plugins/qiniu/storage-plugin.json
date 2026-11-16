@@ -1,0 +1,10 @@
+{
+  "id": "QINIU", "name": "七牛云 Kodo", "version": "1.0.1", "apiVersion": 1, "entry": "index.cjs",
+  "capabilities": { "directUpload": true, "usage": true },
+  "fields": [
+    { "key": "accessKey", "label": "Access Key", "type": "string", "required": true },
+    { "key": "secretKey", "label": "Secret Key", "type": "string", "required": true, "secret": true },
+    { "key": "bucket", "label": "Bucket", "type": "string", "required": true },
+    { "key": "domain", "label": "访问域名", "type": "string", "required": true, "url": true }
+  ]
+}

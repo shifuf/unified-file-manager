@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, Optional, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CdnProvider, type CdnConfig } from '@prisma/client';
 import { Readable } from 'node:stream';
@@ -85,6 +85,81 @@ export class StorageService {
 
     const runtime = this.runtimeConfig(cdnConfig);
     await this.registry.adapter(runtime.provider).remove(runtime, normalizeStorageKey(key));
+  }
+
+  /** Freeze indexed copies before touching bytes. Keep the index on failure so retry
+   * can finish even after some providers have already removed their objects. */
+  async removeFileObjects(fileId: string): Promise<string[]> {
+    const plan = await this.prisma.$transaction(async tx => {
+      const initial = await tx.managedFile.findUnique({ where: { id: fileId } });
+      if (!initial) return { projectId: '', keys: [] as string[], targets: [] as Array<{ config: CdnConfig; key: string }> };
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${initial.projectId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${fileId} FOR UPDATE`;
+      const file = await tx.managedFile.findUnique({ where: { id: fileId }, include: {
+        cdnConfig: true, versions: true, derivatives: true,
+      } });
+      if (!file || file.status !== 'RECYCLED') throw new ConflictException('文件状态已变化，请刷新回收站后重试。');
+      const origins = new Map<string, CdnConfig[]>();
+      const add = (key: string, config: CdnConfig | null) => {
+        if (!key) return;
+        const configs = origins.get(key) ?? [];
+        if (config && !configs.some(c => c.id === config.id)) configs.push(config);
+        origins.set(key, configs);
+      };
+      add(file.storageKey, file.cdnConfig);
+      const versionConfigs = await tx.cdnConfig.findMany({ where: { id: { in: file.versions.flatMap(v => v.cdnConfigId ? [v.cdnConfigId] : []) } } });
+      for (const version of file.versions) add(version.storageKey, versionConfigs.find(c => c.id === version.cdnConfigId) ?? null);
+      for (const derivative of file.derivatives) {
+        add(derivative.storageKey, file.cdnConfig);
+        const meta = derivative.meta as { segmentPrefix?: string; files?: unknown[] } | null;
+        if (derivative.kind === 'HLS' && typeof meta?.segmentPrefix === 'string' && Array.isArray(meta.files)) {
+          for (const name of meta.files) if (typeof name === 'string') add(`${meta.segmentPrefix}/${name}`, file.cdnConfig);
+        }
+      }
+      // Imported records and historical versions may share immutable keys. Retain
+      // bytes until the last referencing record is permanently removed.
+      for (const key of origins.keys()) {
+        const shared = await tx.managedFile.findFirst({ where: { id: { not: fileId }, OR: [
+          { storageKey: key }, { versions: { some: { storageKey: key } } }, { derivatives: { some: { storageKey: key } } },
+        ] }, select: { id: true } });
+        if (shared) origins.delete(key);
+      }
+      const keys = [...origins.keys()];
+      await tx.$queryRaw`SELECT id FROM StorageReplica WHERE projectId = ${file.projectId} FOR UPDATE`;
+      const rows = keys.length ? await tx.storageReplica.findMany({ where: { projectId: file.projectId, storageKey: { in: keys } }, include: { config: true } }) : [];
+      if (rows.some(row => row.leaseOwner && row.leaseUntil && row.leaseUntil > new Date())) {
+        throw new ConflictException('文件副本正在同步，请等待同步完成后重试彻底删除。');
+      }
+      const targets = new Map<string, { config: CdnConfig; key: string }>();
+      for (const [key, configs] of origins) for (const config of configs) targets.set(`${config.id}\0${key}`, { config, key });
+      for (const row of rows) targets.set(`${row.configId}\0${row.storageKey}`, { config: row.config, key: row.storageKey });
+      // Legacy objects also need a durable deletion marker before the first
+      // provider call; otherwise a failed partial delete could be restored.
+      if (targets.size) await tx.storageReplica.createMany({ data: [...targets.values()].map(({ config, key }) => ({
+        projectId: file.projectId, configId: config.id, storageKey: key, size: 0n, status: 'DELETING',
+      })), skipDuplicates: true });
+      if (keys.length) await tx.storageReplica.updateMany({ where: { projectId: file.projectId, storageKey: { in: keys } },
+        data: { status: 'DELETING', leaseOwner: null, leaseUntil: null, lastError: '正在彻底删除；失败后请在回收站重试。' } });
+      return { projectId: file.projectId, keys, targets: [...targets.values()] };
+    });
+    try {
+      // Clouds first: a cloud outage should leave the local safety copy available.
+      plan.targets.sort((a, b) => Number(a.config.provider === 'LOCAL') - Number(b.config.provider === 'LOCAL'));
+      for (const { config, key } of plan.targets) {
+        const runtime = this.runtimeConfig(config), adapter = this.registry.adapter(runtime.provider);
+        try { await adapter.remove(runtime, normalizeStorageKey(key)); }
+        catch (error) {
+          // An already absent object is successful, but auth/network failures are
+          // never treated as absence without an explicit provider probe.
+          if (!adapter.objectExists || await adapter.objectExists(runtime, key) !== false) throw error;
+        }
+        if (adapter.objectExists && await adapter.objectExists(runtime, key)) throw new Error('Object remains after delete');
+        await this.limits.releaseDeletedObject(config.id, key);
+      }
+    } catch {
+      throw new ServiceUnavailableException('存储对象尚未全部删除，文件记录已保留，请检查存储连接、插件和删除权限后重试。');
+    }
+    return plan.keys;
   }
 
   async materializeUploadedObject(projectId: string, configId: string, key: string, size: bigint | number | undefined,
@@ -336,7 +411,7 @@ export class StorageService {
     throw new Error('文件缺少存储配置，无法下载。');
   }
 
-  private runtimeConfig(config: CdnConfig): RuntimeCdnConfig {
+  runtimeConfig(config: CdnConfig): RuntimeCdnConfig {
     return {
       id: config.id,
       provider: config.provider,

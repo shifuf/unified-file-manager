@@ -194,6 +194,9 @@ if (Test-Path -LiteralPath $sdkSrc) {
 }
 
 Write-Step "copy infra"
+Copy-TreeFiltered -SourceDir (Join-Path $repoRoot "packages\storage-plugin-sdk") -DestDir (Join-Path $packageDir "packages\storage-plugin-sdk") -ExcludeDirNames @("node_modules", "dist")
+# Remote plugin source is independently packaged; it is never automatically installed.
+Copy-TreeFiltered -SourceDir (Join-Path $repoRoot "plugins") -DestDir (Join-Path $packageDir "plugins") -ExcludeDirNames @("node_modules", "dist") -ExcludeFilePatterns @("*.zip")
 $infraSrc = Join-Path $repoRoot "infra"
 if (Test-Path -LiteralPath $infraSrc) {
   Copy-TreeFiltered -SourceDir $infraSrc -DestDir (Join-Path $packageDir "infra") -ExcludeDirNames @("node_modules")

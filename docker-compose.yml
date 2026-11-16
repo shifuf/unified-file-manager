@@ -86,6 +86,7 @@ services:
       MEILI_URL: http://meilisearch:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-ufm_meili_change_me}
       LOCAL_STORAGE_ROOT: /app/storage
+      STORAGE_PLUGIN_DIR: /app/storage-plugins
       APP_PORT: ${APP_PORT:-60557}
     depends_on:
       mysql:
@@ -94,6 +95,7 @@ services:
         condition: service_healthy
     volumes:
       - ufm_storage_data:/app/storage
+      - ufm_plugin_data:/app/storage-plugins
     ports:
       - "${APP_PORT:-60557}:${APP_PORT:-60557}"
     healthcheck:
@@ -106,6 +108,20 @@ services:
       timeout: 5s
       retries: 30
       start_period: 120s
+
+  plugin-installer:
+    profiles: ["plugins"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: plugin-installer
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    env_file:
+      - .env
+    environment:
+      UFM_PLUGIN_API_URL: http://api:${APP_PORT:-60557}
+      UFM_TOTP_CODE: ${UFM_TOTP_CODE:-}
 
   web:
     build:
@@ -131,6 +147,8 @@ services:
       retries: 12
 
 volumes:
+  ufm_plugin_data:
+    name: ufm_plugin_data
   ufm_mysql_data:
     name: ufm_mysql_data
   ufm_redis_data:

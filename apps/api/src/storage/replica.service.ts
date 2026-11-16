@@ -93,7 +93,9 @@ export class ReplicaService {
       orderBy: [{ priority: 'asc' }, { id: 'asc' }],
     });
     await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
       const table = this.table(tx);
+      if (await table.findFirst({ where: { projectId, storageKey, status: 'DELETING' } })) return;
       await table.upsert({
         where: { projectId_storageKey_configId: { projectId, storageKey, configId: localConfigId } },
         create: { projectId, storageKey, configId: localConfigId, size, checksum, status: 'READY', verifiedAt: new Date() },
@@ -127,6 +129,7 @@ export class ReplicaService {
   async getDownloadTargetForKey(file: StorageFileInput, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget> {
     const storageKey = normalizeKey(key);
     const rows = await this.table().findMany({ where: { projectId: file.projectId, storageKey }, include: { config: true } });
+    if (rows.some(row => row.status === 'DELETING')) throw new ConflictException('文件正在彻底删除，请在回收站完成删除。');
     const attempts: DownloadStorageSource['attempts'] = [];
     const allowed = await this.boundCloudIds(file.projectId);
     // Order all states together: a pending cloud may already contain valid
@@ -218,7 +221,7 @@ export class ReplicaService {
 
   private async markUnreadable(row: ReplicaRow, error: unknown): Promise<void> {
     if (error instanceof StorageLimitError) return;
-    await this.table().updateMany({ where: { id: row.id }, data: {
+    await this.table().updateMany({ where: { id: row.id, status: { not: 'DELETING' } }, data: {
       status: error instanceof NotFoundException ? 'MISSING' : 'FAILED', verifiedAt: null,
       lastError: safeError(error), nextAttemptAt: new Date(Date.now() + 30_000),
     } });
@@ -484,7 +487,7 @@ export class ReplicaService {
 
   async inspectProject(projectId: string, cursor?: string, requestedLimit = 20): Promise<Record<string, unknown>> {
     const take = Math.min(50, Math.max(1, Math.floor(requestedLimit) || 20));
-    const rows = await this.table().findMany({ where: { projectId, ...(cursor ? { id: { gt: cursor } } : {}), OR: [{ leaseOwner: null }, { leaseUntil: { lte: new Date() } }] },
+    const rows = await this.table().findMany({ where: { projectId, status: { not: 'DELETING' }, ...(cursor ? { id: { gt: cursor } } : {}), OR: [{ leaseOwner: null }, { leaseUntil: { lte: new Date() } }] },
       include: { config: true }, orderBy: { id: 'asc' }, take });
     let ready = 0, failed = 0;
     for (const row of rows) {
@@ -498,7 +501,7 @@ export class ReplicaService {
         }
         const object = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, expectedChecksum);
         await object.cleanup();
-        await this.table().updateMany({ where: { id: row.id, leaseOwner: null }, data: { status: 'READY', checksum: object.checksum, verifiedAt: new Date(), lastError: null } }); ready++;
+        await this.table().updateMany({ where: { id: row.id, leaseOwner: null, status: { not: 'DELETING' } }, data: { status: 'READY', checksum: object.checksum, verifiedAt: new Date(), lastError: null } }); ready++;
       } catch (error) { await this.markUnreadable(row, error); failed++; }
       finally { await source?.cleanup(); }
     }
@@ -511,7 +514,7 @@ export class ReplicaService {
     const configs = await this.prisma.cdnConfig.findMany({ where: { enabled: true, projectId: null, projectBindings: { some: { projectId } } } });
     await this.table().updateMany({ where: { projectId, configId: { in: configs.map(c => c.id) }, status: 'SKIPPED', leaseOwner: null },
       data: { status: 'PENDING', nextAttemptAt: new Date(), lastError: null } });
-    const files = await this.prisma.managedFile.findMany({ where: { projectId, ...(cursor ? { id: { gt: cursor } } : {}) },
+    const files = await this.prisma.managedFile.findMany({ where: { projectId, status: 'ACTIVE', ...(cursor ? { id: { gt: cursor } } : {}) },
       orderBy: { id: 'asc' }, take, include: { versions: true, derivatives: true } });
     let queued = 0;
     for (const file of files) {
@@ -538,8 +541,15 @@ export class ReplicaService {
         const size = indexed?.size ?? object.size!;
         const checksum = indexed?.checksum ?? object.checksum;
         const configIds = [...new Set([local.id, ...configs.map(c => c.id), ...(object.configId ? [object.configId] : [])])];
-        const result = await this.table().createMany({ data: configIds.map(configId => ({ projectId, storageKey: object.storageKey, configId,
-          size, checksum, status: 'PENDING' })), skipDuplicates: true }); queued += result.count;
+        const count = await this.prisma.$transaction(async tx => {
+          await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
+          const current = await tx.managedFile.findFirst({ where: { id: file.id, status: 'ACTIVE' }, select: { id: true } });
+          if (!current || await this.table(tx).findFirst({ where: { projectId, storageKey: object.storageKey, status: 'DELETING' } })) return 0;
+          const result = await this.table(tx).createMany({ data: configIds.map(configId => ({ projectId, storageKey: object.storageKey, configId,
+            size, checksum, status: 'PENDING' })), skipDuplicates: true });
+          return result.count;
+        });
+        queued += count;
       }
     }
     return { scanned: files.length, queued, nextCursor: files.length === take ? files[files.length - 1].id : null };

@@ -696,10 +696,10 @@ export class ProjectsService {
     webdavSlug?: string | null;
     createdAt: Date;
     updatedAt: Date;
-    activeCdnConfig?: { provider: CdnProvider; name: string } | null;
-    storageBindings?: Array<{ config: { id: string; name: string; provider: CdnProvider; enabled: boolean; priority: number; projectId?: string | null } }>;
+    activeCdnConfig?: { provider: string; name: string } | null;
+    storageBindings?: Array<{ config: { id: string; name: string; provider: string; enabled: boolean; priority: number; projectId?: string | null } }>;
     _count?: { files: number };
-  }, user?: RequestUser, localFallback?: { id: string; name: string; provider: CdnProvider; enabled: boolean; priority: number } | null): Record<string, unknown> {
+  }, user?: RequestUser, localFallback?: { id: string; name: string; provider: string; enabled: boolean; priority: number } | null): Record<string, unknown> {
     const canManage = user?.role === UserRole.SUPER_ADMIN;
     const storages = (project.storageBindings ?? []).map(binding => binding.config);
     if (localFallback && !storages.some(config => config.provider === CdnProvider.LOCAL && config.enabled && config.projectId == null)
@@ -780,7 +780,7 @@ export class ProjectsService {
   }
 
   private countProviderRows(
-    rows: Array<{ cdnConfig: { provider: CdnProvider } | null; size: bigint }>,
+    rows: Array<{ cdnConfig: { provider: string } | null; size: bigint }>,
   ): Record<string, { count: number; size: number }> {
     const result: Record<string, { count: number; size: number }> = {};
 

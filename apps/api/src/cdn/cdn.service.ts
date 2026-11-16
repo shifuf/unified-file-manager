@@ -14,10 +14,8 @@ import { getAppCryptoKey } from '../common/utils/security-config.util';
 import { assertSafeOutboundUrl, normalizeOutboundUrl, safeFetch } from '../common/utils/ssrf-guard.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProjectAccessService } from '../projects/project-access.service';
-import { AliyunOssAdapter } from '../storage/adapters/aliyun-oss.adapter';
-import { QiniuAdapter } from '../storage/adapters/qiniu.adapter';
-import { S3Adapter } from '../storage/adapters/s3.adapter';
-import { UpyunAdapter } from '../storage/adapters/upyun.adapter';
+import { StorageAdapterRegistry } from '../storage/storage-registry.service';
+import { validateConfig } from '@ufm/storage-plugin-sdk';
 import { ReplicaService } from '../storage/replica.service';
 import { StorageLimitsService } from '../storage/storage-limits.service';
 import type { RuntimeCdnConfig, StorageAdapter, StorageUsageSnapshot } from '../storage/storage.types';
@@ -61,7 +59,7 @@ type HealthCheck = {
 };
 
 type StorageUsageResponse = {
-  provider: CdnProvider;
+  provider: string;
   name: string;
   configId: string;
   supported: boolean;
@@ -85,13 +83,10 @@ export class CdnService {
 
   constructor(
     private readonly auditService: AuditService,
-    private readonly aliyunOssAdapter: AliyunOssAdapter,
+    private readonly registry: StorageAdapterRegistry,
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly projectAccessService: ProjectAccessService,
-    private readonly qiniuAdapter: QiniuAdapter,
-    private readonly s3Adapter: S3Adapter,
-    private readonly upyunAdapter: UpyunAdapter,
     @Optional() private readonly replicaService?: ReplicaService,
     @Optional() private readonly storageLimits?: StorageLimitsService,
   ) {}
@@ -136,7 +131,7 @@ export class CdnService {
       data: {
         provider: dto.provider,
         name: dto.name,
-        config: this.secureConfig(dto.config),
+        config: this.secureConfig(dto.config, dto.provider),
         active: false,
         ...this.storagePolicyData(dto),
       },
@@ -181,7 +176,7 @@ export class CdnService {
       return db.cdnConfig.update({
       where: { id: configId },
       data: { provider: dto.provider, name: dto.name,
-        config: mergedConfig ? this.secureConfig(mergedConfig) : undefined,
+        config: mergedConfig ? this.secureConfig(mergedConfig, dto.provider ?? existing.provider) : undefined,
         ...this.storagePolicyData(dto, current) },
       });
     };
@@ -499,7 +494,7 @@ export class CdnService {
   }
 
   private async assertConfigHealthy(
-    provider: CdnProvider,
+    provider: string,
     name: string,
     config: Record<string, unknown>,
     user: RequestUser,
@@ -655,11 +650,11 @@ export class CdnService {
     return data;
   }
 
-  private secureConfig(config: Record<string, unknown>): Prisma.InputJsonObject {
+  private secureConfig(config: Record<string, unknown>, provider?: string): Prisma.InputJsonObject {
     const cryptoKey = getAppCryptoKey(this.configService);
     return Object.fromEntries(
       Object.entries(config).map(([key, value]) => {
-        if (typeof value === 'string' && isSensitiveConfigKey(key) && !value.startsWith(VAULT_PREFIX)) {
+        if (typeof value === 'string' && this.sensitive(key, provider) && !value.startsWith(VAULT_PREFIX)) {
           return [key, `${VAULT_PREFIX}${encryptText(value, cryptoKey)}`];
         }
 
@@ -698,14 +693,19 @@ export class CdnService {
    * On-prem S3-compatible gateways can opt out via STORAGE_ALLOW_PRIVATE_ENDPOINTS.
    */
   private async assertRemoteConfigHostsSafe(
-    provider: CdnProvider | undefined,
+    provider: string | undefined,
     config: Record<string, unknown>,
   ): Promise<void> {
     if (!provider || provider === CdnProvider.LOCAL) {
       return;
     }
 
-    for (const field of ['endpoint', 'domain']) {
+    const manifest = this.registry?.manifest(provider);
+    if (!manifest) throw new BadRequestException(`存储插件 ${provider} 未安装。`);
+    let normalized: Record<string, unknown>;
+    try { normalized = validateConfig(manifest, config); } catch (error) { throw new BadRequestException(this.errorMessage(error)); }
+    Object.assign(config, normalized);
+    for (const field of new Set(['endpoint', 'domain', ...manifest.fields.filter(field => field.url).map(field => field.key)])) {
       const raw = config[field];
       if (typeof raw !== 'string' || !raw.trim()) {
         continue;
@@ -724,7 +724,7 @@ export class CdnService {
     config: {
       id: string;
       projectId: string | null;
-      provider: CdnProvider;
+      provider: string;
       name: string;
       config: Prisma.JsonValue;
       active: boolean;
@@ -754,7 +754,8 @@ export class CdnService {
       projectId: config.projectId,
       provider: config.provider,
       name: config.name,
-      config: this.maskConfig(config.config),
+      config: this.maskConfig(config.config, config.provider),
+      pluginAvailable: config.provider === 'LOCAL' || Boolean(this.registry?.list().some(p => p.id === config.provider && p.available)),
       active: activeConfigId ? config.id === activeConfigId : false,
       enabled: config.enabled,
       priority: config.priority,
@@ -773,11 +774,15 @@ export class CdnService {
     };
   }
 
-  private maskConfig(config: Prisma.JsonValue): Record<string, unknown> {
+  private sensitive(key: string, provider?: string): boolean {
+    return isSensitiveConfigKey(key) || Boolean(provider && this.registry?.manifest(provider)?.fields.some(field => field.key === key && field.secret));
+  }
+
+  private maskConfig(config: Prisma.JsonValue, provider?: string): Record<string, unknown> {
     return Object.fromEntries(
       Object.entries(this.asRecord(config)).map(([key, value]) => [
         key,
-        isSensitiveConfigKey(key) && value ? MASK_PLACEHOLDER : value,
+        (this.sensitive(key, provider) || (typeof value === 'string' && value.startsWith(VAULT_PREFIX))) && value ? MASK_PLACEHOLDER : value,
       ]),
     );
   }
@@ -921,14 +926,9 @@ export class CdnService {
     };
   }
 
-  private usageAdapter(provider: CdnProvider): StorageAdapter | null {
-    if (provider === CdnProvider.QINIU) {
-      return this.qiniuAdapter;
-    }
-    if (provider === CdnProvider.UPYUN) {
-      return this.upyunAdapter;
-    }
-    return null;
+  private usageAdapter(provider: string): StorageAdapter | null {
+    try { return this.registry?.manifest(provider)?.capabilities.usage ? this.registry.adapter(provider) : null; }
+    catch { return null; }
   }
 
   private async testLocalConfig(config: Record<string, unknown>): Promise<HealthCheck[]> {
@@ -966,27 +966,11 @@ export class CdnService {
     return checks;
   }
 
-  private async testRemoteConfig(provider: CdnProvider, name: string, config: Record<string, unknown>): Promise<HealthCheck[]> {
-    const requiredFields: Record<CdnProvider, string[]> = {
-      [CdnProvider.LOCAL]: ['root'],
-      [CdnProvider.QINIU]: ['accessKey', 'secretKey', 'bucket', 'domain'],
-      [CdnProvider.UPYUN]: ['operator', 'password', 'bucket', 'domain'],
-      [CdnProvider.ALIYUN]: ['accessKey', 'secretKey', 'bucket', 'endpoint', 'domain'],
-      [CdnProvider.S3]: ['endpoint', 'region', 'bucket', 'accessKeyId', 'secretAccessKey'],
-    };
-
-    const checks: HealthCheck[] = requiredFields[provider].map((field) => {
-      const value = config[field];
-      return {
-        name: field,
-        status: typeof value === 'string' && value.trim() ? 'PASS' : 'FAIL',
-        message: typeof value === 'string' && value.trim() ? '已配置' : '缺少配置',
-      };
-    });
-
-    if (checks.some((check) => check.status === 'FAIL')) {
-      return checks;
-    }
+  private async testRemoteConfig(provider: string, name: string, config: Record<string, unknown>): Promise<HealthCheck[]> {
+    const manifest = this.registry.manifest(provider);
+    if (!manifest) throw new BadRequestException(`存储插件 ${provider} 未安装。`);
+    config = validateConfig(manifest, config);
+    const checks: HealthCheck[] = [{ name: 'config', status: 'PASS', message: '插件配置校验通过。' }];
 
     const adapter = this.remoteAdapter(provider);
     const key = `.healthcheck/${Date.now()}-${randomBytes(4).toString('hex')}.txt`;
@@ -1012,22 +996,35 @@ export class CdnService {
     }
 
     try {
-      const url = await adapter.getDownloadUrl(runtimeConfig, key, 60);
-      const timeoutMs = this.configService.get<number>('REMOTE_STORAGE_FETCH_TIMEOUT_MS', 30_000);
-      const response = await safeFetch(url, {
-        signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 30_000)),
-      });
+      let content: Buffer;
+      const target = await adapter.getDownloadTarget?.(runtimeConfig, key);
+      if (target?.type === 'stream' && target.stream) {
+        const chunks: Buffer[] = []; let size = 0;
+        try { for await (const chunk of target.stream) { const bytes = Buffer.from(chunk as Uint8Array); size += bytes.length; if (size > 1024) throw new Error('探测对象内容超过预期。'); chunks.push(bytes); } }
+        finally { target.stream.destroy(); }
+        content = Buffer.concat(chunks);
+      } else {
+        const url = await adapter.getDownloadUrl(runtimeConfig, key, 60);
+        const timeoutMs = this.configService.get<number>('REMOTE_STORAGE_FETCH_TIMEOUT_MS', 30_000);
+        const response = await safeFetch(url, { signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 30_000)) });
+        if (!response.ok || !response.body) { await response.body?.cancel(); throw new Error(`读取失败：${response.status}`); }
+        const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
+        try { for (;;) { const { done, value } = await reader.read(); if (done) break; size += value.length; if (size > 1024) throw new Error('探测对象内容超过预期。'); chunks.push(value); } }
+        finally { await reader.cancel(); }
+        content = Buffer.concat(chunks);
+      }
+      if (!content.equals(Buffer.from('ok'))) throw new Error('探测对象内容校验失败。');
       checks.push({
         name: 'download',
-        status: response.ok ? 'PASS' : 'FAIL',
-        message: response.ok ? '探测对象可读取。' : `读取失败：${response.status} ${response.statusText}`,
+        status: 'PASS',
+        message: '探测对象读取与内容校验成功。',
       });
     } catch (error) {
       // Network-level failures (DNS / TLS / SSRF guard) are local environment issues,
       // not a credential problem — upload already succeeded, so warn instead of failing.
       checks.push({
         name: 'download',
-        status: 'WARN',
+        status: 'FAIL',
         message: `当前网络无法读取探测对象（域名解析/证书/代理）：${this.errorMessage(error)}`,
       });
     }
@@ -1036,29 +1033,14 @@ export class CdnService {
       await adapter.remove(runtimeConfig, key);
       checks.push({ name: 'delete', status: 'PASS', message: '探测对象已删除。' });
     } catch (error) {
-      checks.push({ name: 'delete', status: 'WARN', message: this.errorMessage(error) });
+      checks.push({ name: 'delete', status: 'FAIL', message: this.errorMessage(error) });
     }
 
     return checks;
   }
-  private remoteAdapter(provider: CdnProvider): StorageAdapter {
-    if (provider === CdnProvider.QINIU) {
-      return this.qiniuAdapter;
-    }
-
-    if (provider === CdnProvider.UPYUN) {
-      return this.upyunAdapter;
-    }
-
-    if (provider === CdnProvider.ALIYUN) {
-      return this.aliyunOssAdapter;
-    }
-
-    if (provider === CdnProvider.S3) {
-      return this.s3Adapter;
-    }
-
-    throw new BadRequestException('不支持的远程存储平台。');
+  private remoteAdapter(provider: string): StorageAdapter {
+    try { return this.registry.adapter(provider); }
+    catch { throw new BadRequestException(`存储插件 ${provider} 未安装或不可用。`); }
   }
 
   private errorMessage(error: unknown): string {

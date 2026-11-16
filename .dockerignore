@@ -8,6 +8,7 @@ dist
 !.env.example
 !.env.*.example
 /storage
+/storage-plugins
 /data
 /backups
 /deploy-output

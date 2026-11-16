@@ -1,0 +1,13 @@
+{
+  "id": "CLOUDFLARE_R2", "name": "Cloudflare R2", "version": "1.0.0", "apiVersion": 1, "entry": "index.cjs",
+  "description": "Cloudflare R2 S3 API，region auto，支持私有空间与签名直传。",
+  "capabilities": { "directUpload": true, "usage": false },
+  "fields": [
+    { "key": "accountId", "label": "Account ID", "type": "string", "required": true },
+    { "key": "accessKeyId", "label": "Access Key ID", "type": "string", "required": true },
+    { "key": "secretAccessKey", "label": "Secret Access Key", "type": "string", "required": true, "secret": true },
+    { "key": "bucket", "label": "Bucket", "type": "string", "required": true },
+    { "key": "domain", "label": "公开域名（可选）", "type": "string", "url": true },
+    { "key": "endpoint", "label": "高级 API Endpoint（可选）", "type": "string", "url": true, "placeholder": "留空使用当前账号的默认 R2 地址" }
+  ]
+}

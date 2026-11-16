@@ -3,7 +3,7 @@ import * as bcrypt from 'bcryptjs';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   AuditAction,
@@ -91,7 +91,7 @@ const MAX_UPLOAD_CHUNKS = 10000;
 export interface LocalFileMigrationSummary {
   projectId: string;
   targetConfigId: string;
-  targetProvider: CdnProvider;
+  targetProvider: string;
   scanned: number;
   migrated: number;
   skipped: number;
@@ -104,7 +104,7 @@ export interface LocalFileMigrationSummary {
 }
 
 @Injectable()
-export class FilesService implements OnModuleInit, OnModuleDestroy {
+export class FilesService {
   private readonly logger = new Logger(FilesService.name);
   private readonly sharePasswordAttemptLimiter = new InMemoryAttemptLimiter({
     maxAttempts: 5,
@@ -121,7 +121,6 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     lockMs: 10 * 60 * 1000,
     maxKeys: 20_000,
   });
-  private cleanupTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly auditService: AuditService,
@@ -136,26 +135,6 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     private readonly storageService: StorageService,
     private readonly tasksService: TasksService,
   ) {}
-
-  onModuleInit(): void {
-    const intervalMinutes = this.configService.get<number>('RECYCLE_CLEANUP_INTERVAL_MINUTES', 60);
-    const intervalMs = Math.max(1, Number(intervalMinutes) || 60) * 60 * 1000;
-    const startupTimer = setTimeout(() => {
-      void this.runRecycleCleanup();
-    }, 30 * 1000);
-
-    startupTimer.unref?.();
-    this.cleanupTimer = setInterval(() => {
-      void this.runRecycleCleanup();
-    }, intervalMs);
-    this.cleanupTimer.unref?.();
-  }
-
-  onModuleDestroy(): void {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-    }
-  }
 
   async upload(
     projectId: string,
@@ -2097,6 +2076,10 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('只能恢复回收站中的文件。');
     }
 
+    if (await this.prisma.storageReplica.findFirst({ where: { projectId: file.projectId, storageKey: file.storageKey, status: 'DELETING' } })) {
+      throw new ConflictException('此文件已开始彻底删除，部分对象可能已移除，请重试彻底删除。');
+    }
+
     const restored = await this.prisma.managedFile.update({
       where: { id: fileId },
       data: { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null },
@@ -2857,32 +2840,10 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     return true;
   }
 
-  async purgeExpiredRecycledFiles(batchSize = 100): Promise<{ scanned: number; purged: number; failed: number }> {
-    const files = await this.prisma.managedFile.findMany({
-      where: {
-        status: FileStatus.RECYCLED,
-        purgeAt: { lte: new Date() },
-      },
-      include: { cdnConfig: true },
-      orderBy: { purgeAt: 'asc' },
-      take: batchSize,
-    });
-    let purged = 0;
-    let failed = 0;
-
-    for (const file of files) {
-      try {
-        await this.purgeFile(file, undefined, 'auto-recycle-cleanup');
-        purged += 1;
-      } catch (error) {
-        failed += 1;
-        this.logger.warn(
-          `回收站到期清理失败：fileId=${file.id} ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-
-    return { scanned: files.length, purged, failed };
+  /** Compatibility for old schedulers: physical deletion now requires an
+   * explicit single-file or batch purge request from the recycle bin. */
+  async purgeExpiredRecycledFiles(): Promise<{ scanned: number; purged: number; failed: number }> {
+    return { scanned: 0, purged: 0, failed: 0 };
   }
 
   async findFileForUser(fileId: string, user: RequestUser, requireAdmin = false): Promise<FileWithStorage> {
@@ -3173,26 +3134,17 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async purgeFile(file: FileWithStorage, actorId?: string, source?: string): Promise<void> {
-    // Remove the stored object on a best-effort basis. A remote provider error
-    // (network/auth/already-gone) must not strand the file in the recycle bin —
-    // the record is still hard-deleted below so the file leaves every listing.
-    let storageRemoved = true;
-    let storageError: string | undefined;
-    if (file.cdnConfig) {
-      try {
-        await this.storageService.remove(file.cdnConfig, file.storageKey);
-      } catch (error) {
-        storageRemoved = false;
-        storageError = error instanceof Error && error.message ? error.message : String(error);
-        this.logger.warn(`彻底删除时移除存储对象失败：fileId=${file.id} ${storageError}`);
-      }
-    }
+    const removedKeys = await this.storageService.removeFileObjects(file.id);
 
     // Hard-delete the record so the file truly disappears from active and recycle
     // listings. Share links are removed by the ShareLink.fileId cascade; count them
     // first only for the audit detail.
     const disabledShareCount = await this.prisma.shareLink.count({ where: { fileId: file.id } });
-    await this.prisma.managedFile.delete({ where: { id: file.id } });
+    await this.prisma.$transaction(async tx => {
+      if (removedKeys.length) await tx.storageReplica.deleteMany({ where: { projectId: file.projectId,
+        storageKey: { in: removedKeys }, status: 'DELETING' } });
+      await tx.managedFile.delete({ where: { id: file.id } });
+    });
 
     await this.auditService.write({
       action: AuditAction.FILE_PURGE,
@@ -3201,8 +3153,7 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
       detail: {
         fileId: file.id,
         disabledShareCount,
-        storageRemoved,
-        ...(storageError ? { storageError } : {}),
+        storageRemoved: true,
         ...(source ? { source } : {}),
       },
     });
@@ -4153,14 +4104,4 @@ export class FilesService implements OnModuleInit, OnModuleDestroy {
     return `share:${token}:${ip ?? 'unknown'}`;
   }
 
-  private async runRecycleCleanup(): Promise<void> {
-    const batchSize = this.configService.get<number>('RECYCLE_CLEANUP_BATCH_SIZE', 100);
-    const summary = await this.purgeExpiredRecycledFiles(Math.max(1, Number(batchSize) || 100));
-
-    if (summary.scanned > 0) {
-      this.logger.log(
-        `回收站到期清理完成：scanned=${summary.scanned} purged=${summary.purged} failed=${summary.failed}`,
-      );
-    }
-  }
 }

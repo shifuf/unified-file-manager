@@ -33,6 +33,7 @@ import {
 import type { CreateBackupDto } from './dto/create-backup.dto';
 import type { RestoreBackupDto } from './dto/restore-backup.dto';
 import { decompressBackupBuffer, validateBackupPayload, verifyBackupChecksum } from './backup-archive.util';
+import { StorageAdapterRegistry } from '../storage/storage-registry.service';
 
 type BackupRow = Record<string, unknown>;
 
@@ -52,6 +53,7 @@ type BackupPayload = {
   tables: Record<string, BackupRow[]>;
   objects: BackupObjectEntry[];
   warnings: string[];
+  plugins?: Array<{ id: string; version: string; sha256: string; data?: string }>;
 };
 
 type DmmfField = { name: string; kind: string; type: string };
@@ -121,6 +123,7 @@ export class BackupService implements OnModuleInit {
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
+    private readonly registry: StorageAdapterRegistry,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -328,6 +331,18 @@ export class BackupService implements OnModuleInit {
     const selectedModels = modelsForScopes(scopes);
     const selected = new Set<string>(selectedModels);
 
+    // Validate prerequisites before replace clears anything. Never execute backed-up code.
+    if (selected.has('cdnConfig')) {
+      for (const row of payload.tables.cdnConfig ?? []) {
+        if (row.provider === 'LOCAL') continue;
+        const installed = this.registry?.store.list().find(p => p.id === row.provider && p.available);
+        const required = payload.plugins?.find(p => p.id === row.provider);
+        if (!installed || (required && (required.version !== installed.version || required.sha256 !== installed.sha256))) {
+          throw new BadRequestException(`恢复前请先安装匹配的存储插件 ${String(row.provider)}${required ? `@${required.version}` : ''}。备份中的插件包不会自动执行。`);
+        }
+      }
+    }
+
     if (mode === 'replace') {
       // Clear only the selected business data so unselected domains stay intact.
       for (const model of REPLACE_DELETE_ORDER) {
@@ -438,6 +453,10 @@ export class BackupService implements OnModuleInit {
       tables,
       objects,
       warnings,
+      plugins: scopes.includes('storage') && this.registry ? await Promise.all(this.registry.store.list().filter(p => p.available).map(async p => ({
+        id: p.id, version: p.version, sha256: p.sha256,
+        ...(includeObjects ? { data: (await this.registry.store.package(p.id)).toString('base64') } : {}),
+      }))) : [],
     };
 
     const buffer = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'), { level: 9 });

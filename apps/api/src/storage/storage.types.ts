@@ -1,6 +1,6 @@
 import type { Readable } from 'node:stream';
 
-import type { CdnProvider } from '@prisma/client';
+type CdnProvider = string;
 
 export type RuntimeCdnConfig = {
   id: string;

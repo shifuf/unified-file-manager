@@ -67,10 +67,11 @@
           <el-table-column label="创建时间" min-width="170">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="260">
+          <el-table-column label="操作" fixed="right" width="340">
             <template #default="{ row }">
               <div class="table-actions">
                 <template v-if="row.canManage">
+                  <el-button link type="primary" @click="createRootDirectory(row)">新建根目录</el-button>
                   <el-button link type="primary" @click="openEditDialog(row)">编辑</el-button>
                   <el-button link type="primary" @click="resetSecret(row)">重置密钥</el-button>
                   <el-button link type="danger" @click="removeProject(row)">删除</el-button>
@@ -190,7 +191,7 @@ import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'elem
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 
-import { projectApi, webdavApi } from '@/api/modules';
+import { fileApi, projectApi, webdavApi } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import type { Project } from '@/types';
 
@@ -397,6 +398,20 @@ function readDomainAllowlist(value: string): string[] {
     .split(/[\s,;]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+async function createRootDirectory(project: Project): Promise<void> {
+  if (!project.canManage) return;
+  let value: string;
+  try {
+    ({ value } = await ElMessageBox.prompt(`在项目“${project.name}”的根目录下创建目录`, '新建根目录', {
+      confirmButtonText: '创建', cancelButtonText: '取消',
+      inputPlaceholder: '例如：文档 或 图片/2026',
+      inputValidator: input => Boolean(input?.trim()) || '请输入目录名称',
+    }));
+  } catch { return; }
+  await fileApi.createFolder(project.id, value.trim());
+  ElMessage.success('根目录已创建，可点击项目名称查看目录。');
 }
 
 async function resetSecret(project: Project): Promise<void> {

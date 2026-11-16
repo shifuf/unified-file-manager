@@ -1,51 +1,38 @@
-import { Injectable } from '@nestjs/common';
-import { CdnProvider } from '@prisma/client';
-
-import { AliyunOssAdapter } from './adapters/aliyun-oss.adapter';
+import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { resolve } from 'node:path';
+import { type StoragePluginManifest } from '@ufm/storage-plugin-sdk';
 import { LocalStorageAdapter } from './adapters/local.adapter';
-import { QiniuAdapter } from './adapters/qiniu.adapter';
-import { S3Adapter } from './adapters/s3.adapter';
-import { UpyunAdapter } from './adapters/upyun.adapter';
 import type { RuntimeCdnConfig, StorageAdapter } from './storage.types';
+import { PluginStore } from './plugins/plugin-store';
 
-/** Maps a provider enum onto its adapter implementation. */
+export const LOCAL_MANIFEST = {
+  id: 'LOCAL', name: '本地存储', version: '1.0.0', apiVersion: 1, entry: '',
+  description: '本地保存文件，也是远端故障时的安全副本。',
+  fields: [
+    { key: 'root', label: '保存目录', type: 'string', required: true, default: './storage' },
+    { key: 'domain', label: '访问域名', type: 'string', required: false, url: true },
+  ], capabilities: { directUpload: false, usage: false },
+} as StoragePluginManifest;
+
 @Injectable()
-export class StorageAdapterRegistry {
-  constructor(
-    private readonly aliyunOssAdapter: AliyunOssAdapter,
-    private readonly localAdapter: LocalStorageAdapter,
-    private readonly qiniuAdapter: QiniuAdapter,
-    private readonly s3Adapter: S3Adapter,
-    private readonly upyunAdapter: UpyunAdapter,
-  ) {}
-
-  adapter(provider: CdnProvider): StorageAdapter {
-    switch (provider) {
-      case CdnProvider.LOCAL:
-        return this.localAdapter;
-      case CdnProvider.QINIU:
-        return this.qiniuAdapter;
-      case CdnProvider.ALIYUN:
-        return this.aliyunOssAdapter;
-      case CdnProvider.S3:
-        return this.s3Adapter;
-      case CdnProvider.UPYUN:
-        return this.upyunAdapter;
-      default:
-        throw new Error(`不支持的存储平台：${String(provider)}`);
-    }
+export class StorageAdapterRegistry implements OnModuleInit {
+  readonly store: PluginStore;
+  constructor(private readonly localAdapter: LocalStorageAdapter, config: ConfigService) {
+    const cwd = process.cwd();
+    const workspace = /[\\/]apps[\\/]api$/.test(cwd) ? resolve(cwd, '../..') : cwd;
+    this.store = new PluginStore(resolve(config.get<string>('STORAGE_PLUGIN_DIR') || resolve(workspace, 'storage-plugins')));
   }
-
-  /** Local root directory for LOCAL configs, or null for remote providers. */
-  localRoot(config: RuntimeCdnConfig): string | null {
-    if (config.provider !== CdnProvider.LOCAL) {
-      return null;
-    }
-
-    return this.localAdapter.root(config);
+  async onModuleInit() {
+    try { await this.store.load(); }
+    catch (error) { new Logger(StorageAdapterRegistry.name).error(error instanceof Error ? error.message : '插件加载失败'); }
   }
-
-  supportsDirectUpload(provider: CdnProvider): boolean {
-    return provider !== CdnProvider.LOCAL;
+  adapter(provider: string): StorageAdapter { return provider === 'LOCAL' ? this.localAdapter : this.store.adapter(provider); }
+  manifest(provider: string) { return provider === 'LOCAL' ? LOCAL_MANIFEST : this.store.manifest(provider); }
+  list() { return [{ ...LOCAL_MANIFEST, builtin: true, available: true }, ...this.store.list()]; }
+  localRoot(config: RuntimeCdnConfig): string | null { return config.provider === 'LOCAL' ? this.localAdapter.root(config) : null; }
+  supportsDirectUpload(provider: string): boolean {
+    try { return Boolean(this.manifest(provider)?.capabilities.directUpload && typeof this.adapter(provider).createDirectUpload === 'function'); }
+    catch { return false; }
   }
 }
