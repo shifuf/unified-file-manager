@@ -31,6 +31,9 @@ tmp-*.log
 
 # 会话生成的文档草稿与本地测试，不上传 GitHub
 docs/
+!docs/
+docs/*
+!docs/online-text-editing.md
 apps/api/test/
 
 # 测试与验收文件仅保留本地
@@ -50,5 +53,6 @@ apps/api/test/
 /tests/acceptance/*
 !/tests/acceptance/root-folder-main.cjs
 !/tests/acceptance/r2-permanent-delete-main.cjs
+!/tests/acceptance/text-content.cjs
 /storage-plugins/
 /packages/storage-plugin-sdk/*.tgz

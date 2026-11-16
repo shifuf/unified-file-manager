@@ -89,6 +89,10 @@
         </div>
 
         <div class="share-actions">
+          <el-button
+            v-if="shareInfo && isTextShare(shareInfo) && !shareInfo.hasPassword && unlocked"
+            tag="a" :href="`/api/shares/${encodeURIComponent(shareToken)}/raw`" target="_blank" rel="noopener"
+          >查看原始文件</el-button>
           <!-- 有密码且尚未解锁：用「查看」触发预览；可预览类型解锁后不再显示「打开预览」 -->
           <el-button
             v-if="shareInfo?.hasPassword && !unlocked && shareInfo.previewable && !isOfficeShare(shareInfo)"
@@ -281,10 +285,6 @@ async function previewShare(): Promise<void> {
   previewError.value = '';
   try {
     const blob = await publicShareApi.preview(shareToken.value, password.value || undefined);
-    if (await looksLikeJsonError(blob)) {
-      const message = await readBlobErrorMessage(blob);
-      throw new Error(message || '预览失败。');
-    }
     if (blob.size === 0 && (shareInfo.value?.size ?? 0) > 0) {
       throw new Error('预览内容为空，请稍后重试或直接下载。');
     }
@@ -425,34 +425,6 @@ function resolvePreviewMime(info: PublicShareInfo | null): string | undefined {
   return undefined;
 }
 
-async function looksLikeJsonError(blob: globalThis.Blob): Promise<boolean> {
-  if (blob.type && blob.type.includes('json')) {
-    return true;
-  }
-  // Small payloads that look like Nest error JSON.
-  if (blob.size > 0 && blob.size < 4096) {
-    try {
-      const head = await blob.slice(0, 64).text();
-      return head.trimStart().startsWith('{') && head.includes('statusCode');
-    } catch {
-      return false;
-    }
-  }
-  return false;
-}
-
-async function readBlobErrorMessage(blob: globalThis.Blob): Promise<string> {
-  try {
-    const json = JSON.parse(await blob.text()) as { message?: string | string[] };
-    if (Array.isArray(json.message)) {
-      return json.message.join('；');
-    }
-    return json.message || '请求失败。';
-  } catch {
-    return '请求失败。';
-  }
-}
-
 function onMediaError(): void {
   previewError.value = '媒体无法显示，请尝试下载查看。';
   revokePreviewUrl();
@@ -474,6 +446,7 @@ function isImageShare(info: PublicShareInfo): boolean {
 }
 
 function isTextShare(info: PublicShareInfo): boolean {
+  if (info.textPreview) return true;
   const mime = (info.mimeType || '').toLowerCase();
   if (mime.startsWith('text/') || mime.includes('json') || mime.includes('xml') || mime === 'application/javascript') {
     return true;

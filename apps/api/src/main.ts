@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
+import { registerJsonBodyParsers } from './common/utils/json-body.util';
 
 import { AppModule } from './app.module';
 import { WebdavMiddleware } from './webdav/webdav.middleware';
@@ -28,6 +29,7 @@ async function bootstrap(): Promise<void> {
 
   app.getHttpAdapter().getInstance().set('trust proxy', resolveTrustProxy(configService));
   app.setGlobalPrefix('api');
+  registerJsonBodyParsers(app);
 
   // WebDAV accepts custom mounts and legacy project IDs with raw HTTP verbs (PROPFIND/MKCOL/
   // MOVE/COPY/LOCK/UNLOCK) that Nest routing cannot express.

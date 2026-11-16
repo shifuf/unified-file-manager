@@ -22,7 +22,7 @@ import { AuditService } from '../audit/audit.service';
 import type { RequestUser } from '../common/types/request-user.type';
 import { normalizeDomainAllowlist } from '../common/utils/domain-allowlist.util';
 import { isIpAllowed, sanitizeIpAllowlist } from '../common/utils/ip-allowlist.util';
-import { isPreviewable, resolveExtension, resolveFileCategory } from '../common/utils/file-category.util';
+import { isPreviewable, isTextLikePreview, resolveExtension, resolveFileCategory } from '../common/utils/file-category.util';
 import { InMemoryAttemptLimiter } from '../common/utils/in-memory-attempt-limiter';
 import { resolvePublicBaseUrl } from '../common/utils/origin.util';
 import { DOMAIN_EVENTS } from '../events/domain-events';
@@ -41,6 +41,7 @@ import { ListFilesDto } from './dto/list-files.dto';
 import { ListShareLinksDto } from './dto/list-share-links.dto';
 import { MoveFileDto } from './dto/move-file.dto';
 import { UpdateFileDto } from './dto/update-file.dto';
+import { UpdateFileContentDto } from './dto/update-file-content.dto';
 import { UpdateShareLinkDto } from './dto/update-share-link.dto';
 import { FolderPublicService } from './folder-public.service';
 import { ShareIpAbuseService } from './share-ip-abuse.service';
@@ -1143,6 +1144,71 @@ export class FilesService {
     return this.toResponse(file);
   }
 
+  private assertTextEditable(file: FileWithStorage): void {
+    if (file.status !== FileStatus.ACTIVE) throw new BadRequestException('只能编辑有效文件。');
+    if (!isTextLikePreview(file.originalName, file.mimeType)) {
+      throw new BadRequestException('此格式不支持文本编辑，请下载后修改并覆盖上传。');
+    }
+    if (file.size > BigInt(2 * 1024 * 1024)) throw new BadRequestException('在线文本编辑最大支持 2 MiB。');
+  }
+
+  async getTextContent(fileId: string, user: RequestUser): Promise<{ content: string; version: number }> {
+    const file = await this.findFileForUser(fileId, user);
+    this.assertTextEditable(file);
+    return { content: await this.readEditableText(file), version: file.currentVersion };
+  }
+
+  private async readEditableText(file: FileWithStorage): Promise<string> {
+    const target = await this.storageService.getDownloadTarget(file, undefined, undefined, { preferRedirect: false });
+    if (!target.stream) throw new BadRequestException('无法读取文件内容。');
+    const chunks: Buffer[] = [];
+    let size = 0;
+    try {
+      for await (const chunk of target.stream) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+        size += buffer.length;
+        if (size > 2 * 1024 * 1024) throw new BadRequestException('在线文本编辑最大支持 2 MiB。');
+        chunks.push(buffer);
+      }
+      const buffer = Buffer.concat(chunks);
+      if (buffer.includes(0)) throw new BadRequestException('文件含二进制内容，不支持文本编辑。');
+      try {
+        return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer);
+      } catch {
+        throw new BadRequestException('在线编辑仅支持 UTF-8 文本，请先转换编码后上传。');
+      }
+    } finally {
+      target.stream.destroy();
+    }
+  }
+
+  async updateTextContent(fileId: string, dto: UpdateFileContentDto, user: RequestUser): Promise<Record<string, unknown>> {
+    const file = await this.findFileForUser(fileId, user, true);
+    this.assertTextEditable(file);
+    if (file.currentVersion !== dto.expectedVersion) throw new ConflictException('文件已有新版本，请重新打开后编辑。');
+    const buffer = Buffer.from(dto.content, 'utf8');
+    if (buffer.length > 2 * 1024 * 1024) throw new BadRequestException('在线文本编辑最大支持 2 MiB。');
+    if (buffer.includes(0) || buffer.toString('utf8') !== dto.content) throw new BadRequestException('内容必须是有效的 UTF-8 文本。');
+    await this.readEditableText(file);
+    await this.assertProjectQuota(file.projectId, buffer.length, user.id, { mode: 'replace', previousBytes: Number(file.size) });
+    const project = await this.prisma.project.findUniqueOrThrow({ where: { id: file.projectId } });
+    await this.snapshotCurrentVersion(file, user.id, '在线编辑前的版本');
+    const uploaded = await this.storageService.upload(file.projectId, {
+      key: this.buildStorageKey(project.name, file.originalName, file.folderPath),
+      buffer, mimeType: file.mimeType, originalName: file.originalName,
+    });
+    const updated = await this.updateRevisionIfCurrent(file, {
+      storageKey: uploaded.storageKey, cdnConfigId: uploaded.cdnConfigId, publicUrl: uploaded.publicUrl,
+      size: BigInt(buffer.length), checksum: createHash('sha256').update(buffer).digest('hex'),
+      currentVersion: await this.nextFileRevision(file.id, file.currentVersion),
+      thumbnailUrl: null, duplicateOfId: null, scanStatus: 'SKIPPED', scanDetail: null, scannedAt: new Date(),
+    }, FileStatus.ACTIVE);
+    await this.auditService.write({ action: AuditAction.FILE_UPDATE, actorId: user.id, projectId: file.projectId,
+      detail: { fileId, contentUpdated: true, version: updated.currentVersion } });
+    this.eventBus.emit(DOMAIN_EVENTS.FILE_UPDATED, { projectId: file.projectId, fileId, originalName: file.originalName, actorId: user.id });
+    return this.toResponse(updated);
+  }
+
   async update(fileId: string, dto: UpdateFileDto, user: RequestUser): Promise<Record<string, unknown>> {
     const file = await this.findFileForUser(fileId, user, true);
     const originalName = dto.originalName === undefined ? undefined : basename(dto.originalName.trim());
@@ -2179,10 +2245,11 @@ export class FilesService {
   private async updateRevisionIfCurrent(
     file: Pick<ManagedFile, 'id' | 'storageKey' | 'currentVersion'>,
     data: Prisma.ManagedFileUncheckedUpdateManyInput,
+    status?: FileStatus,
   ): Promise<FileWithStorage> {
     return this.prisma.$transaction(async tx => {
       const changed = await tx.managedFile.updateMany({
-        where: { id: file.id, storageKey: file.storageKey, currentVersion: file.currentVersion }, data,
+        where: { id: file.id, storageKey: file.storageKey, currentVersion: file.currentVersion, ...(status ? { status } : {}) }, data,
       });
       if (changed.count !== 1) throw new ConflictException('文件已被其他操作更新，请刷新后重新执行。');
       await tx.fileDerivative.updateMany({ where: { fileId: file.id }, data: {
@@ -2696,6 +2763,7 @@ export class FilesService {
       category: share.file.category,
       size: Number(share.file.size),
       previewable: isPreviewable(share.file.category, share.file.mimeType, share.file.originalName),
+      textPreview: isTextLikePreview(share.file.originalName, share.file.mimeType),
       previewOnly: share.previewOnly,
       hasWatermark: Boolean(share.watermarkText),
       hasPassword: Boolean(share.passwordHash),
@@ -2904,6 +2972,7 @@ export class FilesService {
       duplicateReused: Boolean(file._duplicateReused),
       currentVersion: Math.max(1, Number(file.currentVersion || 1)),
       previewable,
+      textEditable: isTextLikePreview(file.originalName, file.mimeType) && file.status === FileStatus.ACTIVE && file.size <= BigInt(2 * 1024 * 1024),
       progressiveUrl,
       hlsUrl,
       cdnProvider: file.cdnConfig?.provider ?? null,

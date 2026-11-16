@@ -63,6 +63,7 @@ import { ListFilesDto } from './dto/list-files.dto';
 import { ListShareLinksDto } from './dto/list-share-links.dto';
 import { MoveFileDto } from './dto/move-file.dto';
 import { UpdateFileDto } from './dto/update-file.dto';
+import { UpdateFileContentDto } from './dto/update-file-content.dto';
 import { UpdateShareLinkDto } from './dto/update-share-link.dto';
 import { FilesService } from './files.service';
 import { FolderManagerService } from './folder-manager.service';
@@ -77,6 +78,10 @@ import { UploadFilesInterceptor } from './interceptors/upload-files.interceptor'
 import { createWatermarkStream } from './watermark.util';
 
 type ShareFileRef = { originalName: string; mimeType: string };
+
+function inlineMimeType(file: ShareFileRef): string {
+  return /\.json$/i.test(file.originalName) ? 'application/json; charset=utf-8' : file.mimeType;
+}
 
 type ArchiveFailure = {
   name: string;
@@ -104,6 +109,17 @@ export class FilesController {
   @Get('files/:fileId')
   get(@Param('fileId') fileId: string, @CurrentUser() user: RequestUser): ReturnType<FilesService['get']> {
     return this.filesService.get(fileId, user);
+  }
+
+  @Get('files/:fileId/content')
+  @Header('Cache-Control', 'no-store')
+  getContent(@Param('fileId') fileId: string, @CurrentUser() user: RequestUser): ReturnType<FilesService['getTextContent']> {
+    return this.filesService.getTextContent(fileId, user);
+  }
+
+  @Put('files/:fileId/content')
+  updateContent(@Param('fileId') fileId: string, @Body() dto: UpdateFileContentDto, @CurrentUser() user: RequestUser): ReturnType<FilesService['updateTextContent']> {
+    return this.filesService.updateTextContent(fileId, dto, user);
   }
 
   @Put('files/:fileId')
@@ -957,7 +973,7 @@ export class PublicFilesController {
     recordPublicDownload(activeTarget.storageSource, parsedRange && typeof parsedRange === 'object' ? parsedRange.length : fileSize, rangeOpts);
     applyRangeHeaders(
       response,
-      file.mimeType,
+      inlineMimeType(file),
       fileSize,
       parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
       'inline',
@@ -1243,7 +1259,7 @@ export class PublicSharesController {
     if (unsatisfiable) { writeUnsatisfiableRange(response, Number(file.size)); return; }
     if (head) {
       response.setHeader('Cache-Control', 'no-store');
-      applyRangeHeaders(response, file.mimeType, Number(file.size), range, disposition, file.originalName);
+      applyRangeHeaders(response, disposition === 'inline' ? inlineMimeType(file) : file.mimeType, Number(file.size), range, disposition, file.originalName);
       response.end();
       return;
     }
@@ -1271,6 +1287,16 @@ export class PublicSharesController {
   private prefersJson(request: Request): boolean {
     const accept = request.get('accept')?.toLowerCase() ?? '';
     return accept.includes('application/json') || accept.includes('+json');
+  }
+
+  @Get(':token/raw')
+  async raw(
+    @Param('token') token: string,
+    @Query('password') password: string | undefined,
+    @Req() request: Request,
+    @Res() response: Response,
+  ): Promise<void> {
+    await this.downloadShareFile(token, password, undefined, undefined, request, response, 'inline');
   }
 
   @Post(':token/preview')
@@ -1305,8 +1331,9 @@ export class PublicSharesController {
     // Active content (HTML/SVG/XML) is never served inline — the uploader controls
     // mimeType, so an inline HTML/SVG file would run script in this origin. Force it
     // to a download and lock everything else down with a sandboxed, no-script CSP.
+    const contentType = disposition === 'inline' ? inlineMimeType(file) : file.mimeType;
     const effectiveDisposition =
-      disposition === 'inline' && this.isInlineUnsafeType(file.mimeType) ? 'attachment' : disposition;
+      disposition === 'inline' && this.isInlineUnsafeType(contentType) ? 'attachment' : disposition;
 
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1331,7 +1358,7 @@ export class PublicSharesController {
     const size = options.size ?? 0;
     applyRangeHeaders(
       response,
-      file.mimeType,
+      contentType,
       size,
       options.range ?? null,
       effectiveDisposition,

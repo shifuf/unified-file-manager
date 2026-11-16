@@ -327,6 +327,12 @@ export const replicaApi = {
 };
 
 export const fileApi = {
+  getTextContent(fileId: string) {
+    return http.get<unknown, { content: string; version: number }>(`/files/${fileId}/content`);
+  },
+  updateTextContent(fileId: string, payload: { content: string; expectedVersion: number }) {
+    return http.put<unknown, ManagedFile>(`/files/${fileId}/content`, payload);
+  },
   list(params: {
     projectId?: string;
     keyword?: string;

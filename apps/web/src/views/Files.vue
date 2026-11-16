@@ -427,6 +427,7 @@
                   <el-button v-if="canManageFile(row)" link type="primary" @click="openEditDialog(row)">
                     编辑
                   </el-button>
+                  <el-button v-if="canManageFile(row) && row.textEditable" link type="primary" @click="contentFile = row">编辑内容</el-button>
                   <el-button v-if="canManageFile(row)" link type="primary" @click="openShareDialog(row)">
                     分享
                   </el-button>
@@ -670,6 +671,10 @@
       </template>
     </el-dialog>
 
+    <FileTextEditor
+      v-if="contentFile" :key="contentFile.id" :file="contentFile" :editable="canManageFile(contentFile)"
+      @close="contentFile = null" @saved="onContentSaved"
+    />
     <el-dialog v-model="previewVisible" :title="previewFile?.originalName || '文件预览'" width="80%" @closed="destroyHlsPlayer">
       <div v-if="previewFile" class="preview-frame">
         <img v-if="previewFile.category === 'IMAGE'" :src="previewSource(previewFile)" :alt="previewFile.originalName" />
@@ -762,6 +767,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { http } from '@/api/http';
 import { fileStorageApi } from '@/api/file-storage';
 import FileStorageDetails from '@/components/FileStorageDetails.vue';
+import FileTextEditor from '@/components/FileTextEditor.vue';
 import DownloadStorageInfo from '@/components/DownloadStorageInfo.vue';
 import StorageLocationTags from '@/components/StorageLocationTags.vue';
 import { uploadResults, retainUploadedFiles } from '@/stores/upload-results';
@@ -855,6 +861,7 @@ const fileInputRef = ref<HTMLInputElement>();
 const folderInputRef = ref<HTMLInputElement>();
 const previewVisible = ref(false);
 const previewFile = ref<ManagedFile | null>(null);
+const contentFile = ref<ManagedFile | null>(null);
 const previewVideoRef = ref<HTMLVideoElement | null>(null);
 const officePreviewBaseUrl = ref('');
 const officePreviewUrl = computed(() => {
@@ -1719,6 +1726,7 @@ async function removeFolder(folderPath: string): Promise<void> {
   await reload();
 }
 function openPreview(file: ManagedFile): void {
+  if (file.textEditable) { contentFile.value = file; return; }
   destroyHlsPlayer();
   previewFile.value = file;
   previewVisible.value = true;
@@ -1729,6 +1737,12 @@ function openPreview(file: ManagedFile): void {
 
 function previewSource(file: ManagedFile): string {
   return fileAccessSource(file.accessUrl);
+}
+
+function onContentSaved(file: ManagedFile): void {
+  if (contentFile.value?.id !== file.id) return;
+  contentFile.value = file;
+  void reload();
 }
 
 function previewVideoSource(file: ManagedFile & { progressiveUrl?: string | null; hlsUrl?: string | null }): string {
@@ -2282,6 +2296,7 @@ function resetProjectContext(): void {
   folderPublicPaths.value = new Set();
   previewVisible.value = false;
   previewFile.value = null;
+  contentFile.value = null;
   destroyHlsPlayer();
   versionsDialogVisible.value = false;
   versionsFile.value = null;

@@ -243,6 +243,7 @@ export interface ManagedFile {
   /** True when this upload response reused an existing content-addressed object. */
   duplicateReused?: boolean;
   currentVersion?: number;
+  textEditable?: boolean;
   previewable: boolean;
   progressiveUrl?: string | null;
   hlsUrl?: string | null;
@@ -285,6 +286,7 @@ export interface ShareLink {
 }
 
 export interface PublicShareInfo {
+  textPreview?: boolean;
   token: string;
   customPath?: string | null;
   fileName: string;

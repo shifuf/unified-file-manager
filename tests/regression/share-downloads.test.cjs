@@ -86,6 +86,21 @@ async function fixture(t, overrides = {}) {
   return { request, share, folder, file, sessions, service, folderService, makeFiles, storage, auditRows, reads: () => reads };
 }
 
+test('raw JSON share is inline regardless of Accept, and preserves share authorization', async t => {
+  const f = await fixture(t, { maxDownloads: null });
+  f.file.originalName = 'update.json'; f.file.mimeType = 'application/octet-stream';
+  const response = await f.request('/api/shares/file-token/raw', { headers: { Accept: 'application/json' } });
+  const body = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /^application\/json/);
+  assert.match(response.headers.get('content-disposition'), /^inline/);
+  assert.equal(body, '0123456789'); assert.equal(f.share.downloadCount, 0);
+  f.share.passwordHash = await bcrypt.hash('secret', 4);
+  assert.equal((await f.request('/api/shares/file-token/raw')).status, 400);
+  f.share.enabled = false;
+  assert.ok((await f.request('/api/shares/file-token/raw?password=secret')).status >= 400);
+});
+
 test('file share download audit retains the resolved share ID through service and controller', async t => {
   const f = await fixture(t);
   const response = await f.request('/api/shares/file-token/download');

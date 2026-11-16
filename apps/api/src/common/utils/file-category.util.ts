@@ -87,6 +87,11 @@ const TEXT_PREVIEW_EXTENSIONS = new Set([
   'tsx',
   'jsx',
   'vue',
+  'py', 'pyw', 'ipynb', 'java', 'kt', 'kts', 'c', 'h', 'cpp', 'hpp', 'cc', 'cs',
+  'go', 'rs', 'rb', 'php', 'swift', 'dart', 'scala', 'r', 'lua', 'pl', 'm',
+  'svelte', 'astro', 'scss', 'sass', 'less', 'toml', 'properties', 'dockerfile',
+  'makefile', 'gitignore', 'editorconfig', 'lock', 'graphql', 'gql', 'proto',
+  'svg', 'rst', 'tex', 'tsv', 'fish', 'zsh', 'bash', 'cmd', 'psm1',
 ]);
 
 export function isTextLikePreview(filename?: string, mimeType?: string): boolean {
@@ -97,7 +102,7 @@ export function isTextLikePreview(filename?: string, mimeType?: string): boolean
   if (!filename) {
     return false;
   }
-  return TEXT_PREVIEW_EXTENSIONS.has(resolveExtension(filename));
+  return TEXT_PREVIEW_EXTENSIONS.has(resolveExtension(filename)) || TEXT_PREVIEW_EXTENSIONS.has(filename.toLowerCase());
 }
 
 export function isPreviewable(category: FileCategory, mimeType: string, filename?: string): boolean {
