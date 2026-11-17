@@ -5,6 +5,8 @@ import { type StoragePluginManifest } from '@ufm/storage-plugin-sdk';
 import { LocalStorageAdapter } from './adapters/local.adapter';
 import type { RuntimeCdnConfig, StorageAdapter } from './storage.types';
 import { PluginStore } from './plugins/plugin-store';
+import { PluginStateStore } from './plugins/plugin-state-store';
+import { getAppCryptoKey } from '../common/utils/security-config.util';
 
 export const LOCAL_MANIFEST = {
   id: 'LOCAL', name: '本地存储', version: '1.0.0', apiVersion: 1, entry: '',
@@ -21,7 +23,9 @@ export class StorageAdapterRegistry implements OnModuleInit {
   constructor(private readonly localAdapter: LocalStorageAdapter, config: ConfigService) {
     const cwd = process.cwd();
     const workspace = /[\\/]apps[\\/]api$/.test(cwd) ? resolve(cwd, '../..') : cwd;
-    this.store = new PluginStore(resolve(config.get<string>('STORAGE_PLUGIN_DIR') || resolve(workspace, 'storage-plugins')));
+    const root = resolve(config.get<string>('STORAGE_PLUGIN_DIR') || resolve(workspace, 'storage-plugins'));
+    const state = new PluginStateStore(resolve(root, 'state'), getAppCryptoKey(config));
+    this.store = new PluginStore(root, provider => state.context(provider));
   }
   async onModuleInit() {
     try { await this.store.load(); }

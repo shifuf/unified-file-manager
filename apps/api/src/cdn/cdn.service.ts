@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, mkdir, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
@@ -54,7 +54,7 @@ function isSensitiveConfigKey(key: string): boolean {
 
 type HealthCheck = {
   name: string;
-  status: 'PASS' | 'WARN' | 'FAIL';
+  status: 'PASS' | 'WARN' | 'FAIL' | 'SKIP';
   message: string;
 };
 
@@ -167,6 +167,7 @@ export class CdnService {
 
     if (mergedConfig) {
       const provider = dto.provider ?? existing.provider;
+      this.assertImmutablePluginConfig(existing, provider, mergedConfig);
       await this.assertRemoteConfigHostsSafe(provider, mergedConfig);
       await this.assertConfigHealthy(provider, dto.name ?? existing.name, mergedConfig, user);
     }
@@ -407,6 +408,8 @@ export class CdnService {
       dto.config ?? {},
     );
 
+    this.assertImmutablePluginConfig(existing, provider, merged);
+
     await this.assertRemoteConfigHostsSafe(provider, merged);
 
     const checks =
@@ -435,6 +438,16 @@ export class CdnService {
     await this.assertCanManageStorage(user, true);
     const config = await this.findConfig(configId);
     return this.testConfig(config, user);
+  }
+
+  private assertImmutablePluginConfig(existing: CdnConfig, provider: string, next: Record<string, unknown>) {
+    const manifest = this.registry?.manifest(existing.provider);
+    if (!manifest?.capabilities.authentication) return;
+    const previous = this.revealConfig(existing.config);
+    if (provider !== existing.provider || manifest.fields.some(field => field.immutable &&
+      (previous[field.key] ?? field.default) !== (next[field.key] ?? field.default))) {
+      throw new BadRequestException('已有网盘配置不能更换账号、云盘或对象根目录。请新建存储配置并迁移文件。');
+    }
   }
 
   async testForProject(projectId: string, configId: string, user: RequestUser): Promise<Record<string, unknown>> {
@@ -996,6 +1009,13 @@ export class CdnService {
     }
 
     try {
+      if (manifest.capabilities.backupOnly) {
+        if (!adapter.verifyBackup) throw new Error('备份插件缺少元数据确认能力。');
+        const checksum = createHash('sha256').update('ok').digest('hex');
+        await adapter.verifyBackup(runtimeConfig, { key, size: 2, checksum });
+        checks.push({ name: 'backup', status: 'PASS', message: '备份已上传并通过云端元数据确认。' });
+        checks.push({ name: 'download', status: 'SKIP', message: '仅上传备份，不执行内容下载。' });
+      } else {
       let content: Buffer;
       const target = await adapter.getDownloadTarget?.(runtimeConfig, key);
       if (target?.type === 'stream' && target.stream) {
@@ -1019,12 +1039,13 @@ export class CdnService {
         status: 'PASS',
         message: '探测对象读取与内容校验成功。',
       });
+      }
     } catch (error) {
       // Network-level failures (DNS / TLS / SSRF guard) are local environment issues,
       // not a credential problem — upload already succeeded, so warn instead of failing.
-      checks.push({
-        name: 'download',
-        status: 'FAIL',
+      if (manifest.capabilities.backupOnly) checks.push({ name: 'backup', status: 'FAIL', message: this.errorMessage(error) });
+      else checks.push({
+        name: 'download', status: 'FAIL',
         message: `当前网络无法读取探测对象（域名解析/证书/代理）：${this.errorMessage(error)}`,
       });
     }

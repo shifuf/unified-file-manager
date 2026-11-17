@@ -17,6 +17,7 @@ export interface StorageReplica {
   configId: string;
   configName?: string;
   provider?: CdnProvider;
+  backupOnly?: boolean;
   storageKey: string;
   size: number | string;
   status: StorageReplicaStatus;
@@ -36,6 +37,7 @@ export interface FileStorageLocation {
   configId: string;
   configName: string;
   provider: CdnProvider;
+  backupOnly?: boolean;
   enabled: boolean;
   assigned: boolean;
   desired: boolean;
@@ -390,7 +392,7 @@ export interface StorageHealthResult {
   checkedAt: string;
   checks: Array<{
     name: string;
-    status: 'PASS' | 'WARN' | 'FAIL';
+    status: 'PASS' | 'WARN' | 'FAIL' | 'SKIP';
     message: string;
   }>;
   usage?: StorageUsageResult | null;

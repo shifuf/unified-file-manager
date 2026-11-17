@@ -48,7 +48,17 @@ import { S3Adapter, signS3Headers, presignS3 } from '@ufm/storage-plugin-sdk/s3'
 
 插件是管理员授权执行的受信任服务端代码，不是恶意代码沙箱。当前安装生命周期支持单 API 实例；不要让多个 API 实例同时管理同一插件目录。
 
+## 交互登录与持久状态
+
+声明 `capabilities.authentication:true` 的插件必须实现 `startLogin`、`pollLogin`、`cancelLogin`、`accountStatus` 和 `disconnectAccount`。宿主仅向超级管理员开放认证操作，登录凭据不得包含在这些方法的响应中。SDK 同时提供 `PluginAccount`、`PluginLoginSession` 和 `PluginLoginResult` 类型。
+
+插件入口可以导出 `createAdapter(context?: PluginContext)`。宿主传入按插件隔离的 `getState`、`setState`、`withLock`，状态使用宿主 `APP_CRYPTO_KEY` 加密保存在插件目录的 `state/<ID>` 中，升级不会覆盖。对同一凭据的刷新、重新登录及删除使用相同锁，更新使用原子写入。打包验证时不传 context，此时允许构造适配器，但需要状态的方法应明确报错。
+
+配置字段可声明 `hidden:true`（表单不显示）和 `immutable:true`（交互登录插件的已有配置不可更换该字段）。内部账号引用可作为隐藏字段；令牌及设备密钥应存入加密状态，不能返回表单。备份时同时保存数据库、插件 state 目录和原 APP_CRYPTO_KEY。
+
 ## 仓库构建与测试
+
+仅备份插件声明 `capabilities.backupOnly:true`，并实现 `verifyBackup(config, { key, size, checksum })`。该方法通过云端元数据确认对象与源摘要映射，不下载内容。宿主跳过内容读取及下载流量预留，保留空间额度限制；备份不能成为预览、下载或复制恢复的来源。已有插件未声明该能力时沿用完整读取校验。
 
 ```sh
 npm run build:plugin-sdk

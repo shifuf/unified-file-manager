@@ -140,7 +140,8 @@ export class ReplicaService {
     for (const row of ordered) {
       const config = row.config!;
       let skipped: string | undefined;
-      if (config.provider !== CdnProvider.LOCAL) {
+      if (this.isBackupOnly(config.provider)) skipped = '该存储仅用于上传备份，不参与下载。';
+      if (!skipped && config.provider !== CdnProvider.LOCAL) {
         if (!config.enabled) skipped = '存储已停用。';
         else if (!allowed.has(row.configId)) skipped = '存储未绑定当前项目。';
       }
@@ -161,7 +162,7 @@ export class ReplicaService {
     }
     // Unindexed versions/derivatives use their original location, with only the
     // current object's metadata applied to the current key.
-    if (rows.length === 0 && file.cdnConfig && (file.cdnConfig.provider === CdnProvider.LOCAL ||
+    if (rows.length === 0 && file.cdnConfig && !this.isBackupOnly(file.cdnConfig.provider) && (file.cdnConfig.provider === CdnProvider.LOCAL ||
       (file.cdnConfig.enabled && (await this.boundCloudIds(file.projectId)).has(file.cdnConfig.id)))) {
       try {
         const current = storageKey === normalizeKey(file.storageKey);
@@ -209,9 +210,22 @@ export class ReplicaService {
     return new Set(configs.map(c => c.id));
   }
 
+  isBackupOnly(provider: string): boolean { return this.registry.manifest?.(provider)?.capabilities.backupOnly === true; }
+
+  async confirmStoredObject(config: RuntimeCdnConfig, key: string, size: number, checksum: string, reservation?: ReadReservation): Promise<void> {
+    if (this.isBackupOnly(config.provider)) {
+      const adapter = this.registry.adapter(config.provider);
+      if (!adapter.verifyBackup) throw new Error('备份插件缺少元数据确认能力。');
+      await adapter.verifyBackup(config, { key, size, checksum });
+    } else {
+      const verified = await this.readVerified(config, key, size, checksum, reservation);
+      await verified.cleanup();
+    }
+  }
+
   private async readableRows(rows: ReplicaRow[], localFirst = false, projectId?: string): Promise<ReplicaRow[]> {
     const allowed = projectId ? await this.boundCloudIds(projectId) : null;
-    const eligible = rows.filter(r => r.config && (r.config.provider === CdnProvider.LOCAL || (r.config.enabled && (!allowed || allowed.has(r.configId)))));
+    const eligible = rows.filter(r => r.config && !this.isBackupOnly(r.config.provider) && (r.config.provider === CdnProvider.LOCAL || (r.config.enabled && (!allowed || allowed.has(r.configId)))));
     return eligible.sort((a, b) => {
       const al = a.config!.provider === CdnProvider.LOCAL, bl = b.config!.provider === CdnProvider.LOCAL;
       if (al !== bl) return al === localFirst ? -1 : 1;
@@ -261,7 +275,7 @@ export class ReplicaService {
       try {
         // Only a known digest can identify a previously uploaded target. Legacy
         // objects first derive their digest from the original/local source.
-        if (row.checksum) {
+        if (row.checksum && !this.isBackupOnly(row.config.provider)) {
           try { source = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, row.checksum); } catch { /* copy a verified source */ }
           if (!source && row.config.provider === CdnProvider.LOCAL) {
             const adapter = this.registry.adapter(CdnProvider.LOCAL);
@@ -285,8 +299,7 @@ export class ReplicaService {
           } else {
             uploadReservation = await this.uploadDisk(this.runtime(row.config), row.storageKey, source, 'application/octet-stream', row.storageKey.split('/').pop() || 'object');
           }
-          const verified = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, source.checksum, uploadReservation?.verification);
-          await verified.cleanup();
+          await this.confirmStoredObject(this.runtime(row.config), row.storageKey, Number(row.size), source.checksum, uploadReservation?.verification);
           if (uploadReservation) await this.limits.finishUpload(uploadReservation, 'PRESENT');
         }
         const updated = await this.table().updateMany({ where: { id: row.id, leaseOwner: owner, leaseUntil: { gt: new Date() } }, data: {
@@ -329,7 +342,7 @@ export class ReplicaService {
       where: { projectId: target.projectId, storageKey: target.storageKey, status: 'ACTIVE', deletedAt: null },
       include: { cdnConfig: true },
     });
-    if (legacy?.cdnConfig && legacy.cdnConfigId !== target.configId) {
+    if (legacy?.cdnConfig && legacy.cdnConfigId !== target.configId && !this.isBackupOnly(legacy.cdnConfig.provider)) {
       return this.readVerified(this.runtime(legacy.cdnConfig), target.storageKey, target.size, target.checksum || legacy.checksum);
     }
     throw new NotFoundException('没有可验证的源副本，无法补齐目标对象。');
@@ -351,6 +364,7 @@ export class ReplicaService {
   }
 
   async readVerified(config: RuntimeCdnConfig, key: string, size?: bigint | number, checksum?: string | null, reservation?: ReadReservation): Promise<VerifiedObject> {
+    if (this.isBackupOnly(config.provider)) throw new Error('该存储仅用于上传备份，不提供下载。');
     const ticket = reservation ?? await this.limits.reserveRead(config, size);
     try {
       const adapter = this.registry.adapter(config.provider);
@@ -421,8 +435,7 @@ export class ReplicaService {
     let reservation: UploadReservation | undefined;
     try {
       reservation = await this.uploadDisk(this.runtime(target), file.storageKey, object, file.mimeType, file.originalName);
-      const verified = await this.readVerified(this.runtime(target), file.storageKey, BigInt(object.size), object.checksum, reservation.verification);
-      await verified.cleanup();
+      await this.confirmStoredObject(this.runtime(target), file.storageKey, object.size, object.checksum, reservation.verification);
       await this.limits.finishUpload(reservation, 'PRESENT');
       await this.table().upsert({ where: { projectId_storageKey_configId: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id } },
         create: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id, size: BigInt(object.size), checksum: object.checksum, status: 'READY', verifiedAt: new Date() },
@@ -463,7 +476,8 @@ export class ReplicaService {
       }
       return {
         total: currentTotal, page, pageSize,
-        items: rows.map(({ config, ...row }) => ({ ...row, size: row.size.toString(), configName: config?.name, provider: config?.provider })),
+        items: rows.map(({ config, ...row }) => ({ ...row, size: row.size.toString(), configName: config?.name, provider: config?.provider,
+          ...(config && this.isBackupOnly(config.provider) ? { backupOnly: true } : {}) })),
         counts: Object.fromEntries(counts.map(c => [c.status, c._count._all])),
         nextCursor: page * pageSize < currentTotal && rows.length ? rows[rows.length - 1].id : null,
       };
@@ -474,7 +488,8 @@ export class ReplicaService {
       this.table().groupBy({ by: ['status'], where: { projectId }, _count: { _all: true } }),
     ]);
     return {
-      items: rows.map(({ config, ...row }) => ({ ...row, size: row.size.toString(), configName: config?.name, provider: config?.provider })),
+      items: rows.map(({ config, ...row }) => ({ ...row, size: row.size.toString(), configName: config?.name, provider: config?.provider,
+        ...(config && this.isBackupOnly(config.provider) ? { backupOnly: true } : {}) })),
       counts: Object.fromEntries(counts.map(c => [c.status, c._count._all])), nextCursor: rows.length === take ? rows[rows.length - 1].id : null,
     };
   }
@@ -499,9 +514,14 @@ export class ReplicaService {
           source = await this.sourceForReplica(row);
           expectedChecksum = source.checksum;
         }
-        const object = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, expectedChecksum);
-        await object.cleanup();
-        await this.table().updateMany({ where: { id: row.id, leaseOwner: null, status: { not: 'DELETING' } }, data: { status: 'READY', checksum: object.checksum, verifiedAt: new Date(), lastError: null } }); ready++;
+        if (this.isBackupOnly(row.config.provider)) {
+          if (!expectedChecksum) throw new Error('缺少可确认的源文件摘要。');
+          await this.confirmStoredObject(this.runtime(row.config), row.storageKey, Number(row.size), expectedChecksum);
+        } else {
+          const object = await this.readVerified(this.runtime(row.config), row.storageKey, row.size, expectedChecksum);
+          expectedChecksum = object.checksum; await object.cleanup();
+        }
+        await this.table().updateMany({ where: { id: row.id, leaseOwner: null, status: { not: 'DELETING' } }, data: { status: 'READY', checksum: expectedChecksum, verifiedAt: new Date(), lastError: null } }); ready++;
       } catch (error) { await this.markUnreadable(row, error); failed++; }
       finally { await source?.cleanup(); }
     }

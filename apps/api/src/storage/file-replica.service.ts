@@ -15,7 +15,7 @@ type SafeConfig = Prisma.CdnConfigGetPayload<{ select: typeof CONFIG_SELECT }>;
 
 export type FileStorageLocation = {
   configId: string; configName: string; provider: string; enabled: boolean; assigned: boolean;
-  desired: boolean; priority: number; status: string; attempts: number; lastError: string | null;
+  desired: boolean; backupOnly?: boolean; priority: number; status: string; attempts: number; lastError: string | null;
   verifiedAt: Date | null; replicaId?: string;
 };
 export type FileReplicaDetail = {
@@ -120,7 +120,8 @@ export class FileReplicaService {
         const bound = assigned.some(binding => binding.configId === config.id);
         const desired = config.enabled && config.projectId === null
           && (config.provider === CdnProvider.LOCAL ? config.id === local?.id : bound);
-        return { configId: config.id, configName: config.name, provider: config.provider, enabled: config.enabled,
+        return { configId: config.id, configName: config.name, provider: config.provider,
+          ...(this.replicas.isBackupOnly?.(config.provider) ? { backupOnly: true } : {}), enabled: config.enabled,
           assigned: bound, desired, priority: config.priority,
           status: row ? row.status === 'READY' && !row.verifiedAt ? 'UNVERIFIED' : row.status
             : config.id === file.cdnConfigId ? 'UNVERIFIED' : 'NOT_SYNCED',

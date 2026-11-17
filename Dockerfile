@@ -15,6 +15,7 @@ COPY packages/storage-plugin-sdk/package.json packages/storage-plugin-sdk/packag
 COPY plugins/qiniu/package.json plugins/qiniu/package.json
 COPY plugins/upyun/package.json plugins/upyun/package.json
 COPY plugins/aliyun/package.json plugins/aliyun/package.json
+COPY plugins/aliyun-drive/package.json plugins/aliyun-drive/package.json
 COPY plugins/s3/package.json plugins/s3/package.json
 COPY plugins/cloudflare-r2/package.json plugins/cloudflare-r2/package.json
 RUN npm config set registry "$NPM_REGISTRY" \

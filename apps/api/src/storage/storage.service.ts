@@ -240,7 +240,7 @@ export class StorageService {
       if (config.provider !== CdnProvider.LOCAL) {
         const reader = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
         const checksum = createHash('sha256').update(params.buffer).digest('hex');
-        await reader.verifyLocalObject(config, storageKey, BigInt(params.buffer.length), checksum, reservation.verification);
+        await reader.confirmStoredObject(config, storageKey, params.buffer.length, checksum, reservation.verification);
       }
       await this.limits.finishUpload(reservation, 'PRESENT');
 

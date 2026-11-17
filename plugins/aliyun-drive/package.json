@@ -1,0 +1,7 @@
+{
+  "name": "@ufm/storage-aliyun-drive",
+  "version": "1.1.0",
+  "private": true,
+  "scripts": { "build": "ufm-storage-plugin pack ." },
+  "dependencies": { "@ufm/storage-plugin-sdk": "^1.0.0", "@noble/curves": "1.9.7" }
+}

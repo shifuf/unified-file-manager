@@ -1,10 +1,10 @@
 import type { FileReplicaDetail, FileStorageLocation, ManagedFile } from '../types';
 
 export function storageProviderLabel(provider: string): string {
-  return ({ LOCAL: '本地存储', QINIU: '七牛云', UPYUN: '又拍云', ALIYUN: '阿里云对象存储', S3: 'S3 兼容对象存储', CLOUDFLARE_R2: 'Cloudflare R2 对象存储' } as Record<string, string>)[provider] || provider;
+  return ({ LOCAL: '本地存储', QINIU: '七牛云', UPYUN: '又拍云', ALIYUN: '阿里云对象存储', ALIYUN_DRIVE: '阿里云盘', S3: 'S3 兼容对象存储', CLOUDFLARE_R2: 'Cloudflare R2 对象存储' } as Record<string, string>)[provider] || provider;
 }
 export function downloadLocations(locations: FileStorageLocation[] | null): FileStorageLocation[] {
-  return (locations || []).filter(item => item.enabled && (item.desired || item.assigned))
+  return (locations || []).filter(item => item.enabled && !item.backupOnly && (item.desired || item.assigned))
     .slice().sort((a, b) => Number(a.provider === 'LOCAL') - Number(b.provider === 'LOCAL') || a.priority - b.priority || a.configId.localeCompare(b.configId));
 }
 export function preferredDownloadLabel(locations: FileStorageLocation[] | null): string {
@@ -23,6 +23,7 @@ const labels: Record<FileStorageLocation['status'], string> = {
 };
 export function replicaLabel(location: FileStorageLocation): string {
   const suffix = !location.enabled ? ' · 已停用' : !location.assigned && !location.desired ? ' · 未绑定' : '';
+  if (location.backupOnly && location.status === 'READY') return '已备份' + suffix;
   return (labels[location.status] || '未知') + suffix;
 }
 export function replicaTagType(location: FileStorageLocation): 'success' | 'warning' | 'danger' | 'info' {

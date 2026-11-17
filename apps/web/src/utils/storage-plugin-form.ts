@@ -7,6 +7,8 @@ export interface StoragePluginField {
   required?: boolean;
   secret?: boolean;
   url?: boolean;
+  hidden?: boolean;
+  immutable?: boolean;
   default?: string | number | boolean;
   description?: string;
   placeholder?: string;

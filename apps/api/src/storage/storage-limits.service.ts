@@ -130,7 +130,8 @@ export class StorageLimitsService {
     for (let attempt = 0; attempt < 64; attempt++) {
       const current = await this.current(config.id);
       if (await this.resetMonth(current)) continue;
-      if (current.trafficLimitEnabled && (this.remaining(current) <= 0n || size > this.remaining(current))) {
+      const chargeRead = current.trafficLimitEnabled && this.registry.manifest?.(current.provider)?.capabilities.backupOnly !== true;
+      if (chargeRead && (this.remaining(current) <= 0n || size > this.remaining(current))) {
         throw new StorageLimitError('云存储流量额度不足，无法上传并校验对象。');
       }
       if (current.storageLimitEnabled !== false && usage === undefined) usage = await this.usage(current);
@@ -138,14 +139,14 @@ export class StorageLimitsService {
       const trackSpace = current.storageLimitEnabled !== false && quota !== null;
       if (trackSpace && storageKey !== undefined) return this.reserveKeyUpload(config.id, storageKey, size, usage ?? {});
       if (trackSpace) this.assertSpace(current, usage ?? {}, size);
-      if (!trackSpace && !current.trafficLimitEnabled) return { verification: this.unlimited(config.id) };
+      if (!trackSpace && !chargeRead) return { verification: this.unlimited(config.id) };
       const changed = await this.prisma.cdnConfig.updateMany({ where: this.compare(current), data: {
         ...(trackSpace ? { trackedStorageBytes: (current.trackedStorageBytes ?? 0n) + size } : {}),
         ...(trackSpace && current.manualStorageUsedBytes == null && current.storageBaselineBytes == null
           ? { storageBaselineBytes: measurement(usage?.storageUsedBytes) } : {}),
-        ...(current.trafficLimitEnabled ? { manualTrafficUsedBytes: (current.manualTrafficUsedBytes ?? 0n) + size } : {}),
+        ...(chargeRead ? { manualTrafficUsedBytes: (current.manualTrafficUsedBytes ?? 0n) + size } : {}),
       } });
-      if (changed.count === 1) return { verification: current.trafficLimitEnabled ? this.ticket(current, size) : this.unlimited(config.id) };
+      if (changed.count === 1) return { verification: chargeRead ? this.ticket(current, size) : this.unlimited(config.id) };
     }
     throw new StorageLimitError('云存储额度正在被其他请求使用，请稍后重试。');
   }
@@ -156,13 +157,14 @@ export class StorageLimitsService {
       await tx.$queryRaw`SELECT id FROM CdnConfig WHERE id = ${configId} FOR UPDATE`;
       let current = await this.current(configId, tx);
       if (await this.resetMonth(current, tx)) current = await this.current(configId, tx);
+      const chargeRead = current.trafficLimitEnabled && this.registry.manifest?.(current.provider)?.capabilities.backupOnly !== true;
       const track = current.storageLimitEnabled !== false && (current.storageQuotaBytes ?? measurement(usage.storageQuotaBytes)) !== null;
       const existing = track ? await tx.storageSpaceReservation.findUnique({ where: { configId_keyHash: { configId, keyHash } } }) : null;
       if (existing?.owner && existing.leaseUntil && existing.leaseUntil > this.now()) {
         throw new StorageLimitError('同一云对象正在上传，请稍后重试。');
       }
       if (existing && (existing.storageKey !== storageKey || existing.size !== size)) throw new StorageLimitError('不可变对象空间预留大小冲突。');
-      if (current.trafficLimitEnabled && (this.remaining(current) <= 0n || size > this.remaining(current))) {
+      if (chargeRead && (this.remaining(current) <= 0n || size > this.remaining(current))) {
         throw new StorageLimitError('云存储流量额度不足，无法上传并校验对象。');
       }
       if (track) this.assertSpace(current, usage, size, existing?.size ?? 0n);
@@ -178,9 +180,9 @@ export class StorageLimitsService {
         ...(track && !existing ? { trackedStorageBytes: (current.trackedStorageBytes ?? 0n) + size } : {}),
         ...(track && current.manualStorageUsedBytes == null && current.storageBaselineBytes == null
           ? { storageBaselineBytes: measurement(usage.storageUsedBytes) } : {}),
-        ...(current.trafficLimitEnabled ? { manualTrafficUsedBytes: (current.manualTrafficUsedBytes ?? 0n) + size } : {}),
+        ...(chargeRead ? { manualTrafficUsedBytes: (current.manualTrafficUsedBytes ?? 0n) + size } : {}),
       } });
-      return { verification: current.trafficLimitEnabled ? this.ticket(current, size) : this.unlimited(configId),
+      return { verification: chargeRead ? this.ticket(current, size) : this.unlimited(configId),
         ...(space ? { space: { id: space.id, configId, owner, revision: current.quotaRevision, size } } : {}) };
     });
   }

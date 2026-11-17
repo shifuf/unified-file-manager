@@ -39,6 +39,15 @@ test('adapter contract catches missing streaming and mismatched advertised capab
   assert.throws(() => validateAdapter(manifest(), { ...adapter, provider: 'OTHER' }));
 });
 
+test('backup-only plugins require metadata confirmation and a boolean capability', () => {
+  const { validateManifest, validateAdapter } = sdk();
+  const m = { ...manifest(), capabilities: { directUpload: false, usage: false, backupOnly: true } };
+  const adapter = { provider: m.id, upload() {}, uploadFile() {}, remove() {}, getDownloadUrl() {}, objectExists() {} };
+  assert.throws(() => validateManifest({ ...m, capabilities: { ...m.capabilities, backupOnly: 'true' } }));
+  assert.throws(() => validateAdapter(m, adapter), /verifyBackup/);
+  assert.equal(validateAdapter(m, { ...adapter, verifyBackup() {} }).provider, m.id);
+});
+
 test('all remote bundles load outside the repository with their declared contract', () => {
   const { validateManifest, validateAdapter } = sdk();
   for (const id of ['qiniu', 'upyun', 'aliyun', 's3', 'cloudflare-r2']) {

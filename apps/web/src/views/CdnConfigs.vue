@@ -186,7 +186,7 @@
       </div>
     </section>
 
-    <el-dialog v-model="dialogVisible" :title="editingConfig ? '编辑存储配置' : '新建存储配置'" width="680px">
+    <el-dialog v-model="dialogVisible" :title="editingConfig ? '编辑存储配置' : '新建存储配置'" width="680px" destroy-on-close>
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
         <el-form-item label="平台" prop="provider">
           <el-select v-model="form.provider" :disabled="Boolean(editingConfig)" style="width: 100%" @change="fillTemplate">
@@ -199,13 +199,15 @@
         <div class="config-section">
           <div class="config-section-title">平台配置</div>
           <el-alert v-if="!pluginFor(form.provider) || pluginFor(form.provider)?.available === false" type="warning" :closable="false" title="此存储插件未安装或加载失败。请上传匹配的插件后测试连接；已有配置参数保留。" />
+          <StoragePluginAuth v-if="dialogVisible && pluginFor(form.provider)?.capabilities.authentication" :key="`${form.provider}-${editingConfig?.id || 'new'}`" :provider="form.provider" :values="form.configValues" :locked="Boolean(editingConfig)" @update="form.configValues = $event" />
           <div class="config-field-grid">
             <el-form-item
-              v-for="field in currentHelp.fields"
+              v-for="field in currentHelp.fields.filter(item => !item.hidden)"
               :key="field.key"
               :label="field.label"
               :required="field.required"
               class="config-field-item"
+              :disabled="Boolean(editingConfig) && field.immutable"
             >
               <el-switch v-if="field.type === 'boolean'" v-model="form.configValues[field.key]" />
               <el-input-number v-else-if="field.type === 'number'" :model-value="form.configValues[field.key] === undefined ? undefined : Number(form.configValues[field.key])" @update:model-value="form.configValues[field.key] = $event" />
@@ -219,6 +221,7 @@
                 :show-password="field.secret"
                 :placeholder="field.placeholder"
                 autocomplete="off"
+                :disabled="Boolean(editingConfig) && field.immutable"
                 @update:model-value="form.configValues[field.key] = $event"
               />
               <div v-if="field.description" class="field-help">{{ field.description }}</div>
@@ -360,6 +363,7 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import { cdnApi, projectApi } from '@/api/modules';
 import { storagePluginsApi, type StoragePluginManifest } from '@/api/storage-plugins';
 import { useAuthStore } from '@/stores/auth';
+import StoragePluginAuth from '@/components/StoragePluginAuth.vue';
 import type { CdnConfig, CdnProvider, Project, StorageHealthResult, StorageUsageResult } from '@/types';
 import { limitFormValues, storageLimitPayload, storageSpaceView } from '@/utils/storage-limit-form';
 import { buildPluginConfigValues, collectPluginConfigValues, type PluginConfigValue } from '@/utils/storage-plugin-form';
@@ -484,7 +488,8 @@ function shortMessage(message?: string): string {
   return message.length > 36 ? `${message.slice(0, 36)}…` : message;
 }
 
-function checkTagType(status: string): 'success' | 'warning' | 'danger' {
+function checkTagType(status: string): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'SKIP') return 'info';
   if (status === 'PASS') {
     return 'success';
   }

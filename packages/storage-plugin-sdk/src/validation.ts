@@ -3,12 +3,12 @@ import type { StorageAdapter } from './types';
 export const STORAGE_PLUGIN_API_VERSION = 1;
 export interface StoragePluginField {
   key: string; label: string; type: 'string' | 'number' | 'boolean' | 'select';
-  required?: boolean; secret?: boolean; url?: boolean; default?: string | number | boolean;
+  required?: boolean; secret?: boolean; url?: boolean; hidden?: boolean; immutable?: boolean; default?: string | number | boolean;
   placeholder?: string; description?: string; options?: Array<{ label: string; value: string }>;
 }
 export interface StoragePluginManifest {
   id: string; name: string; version: string; apiVersion: 1; entry: string; description?: string;
-  fields: StoragePluginField[]; capabilities: { directUpload: boolean; usage: boolean };
+  fields: StoragePluginField[]; capabilities: { directUpload: boolean; usage: boolean; authentication?: boolean; backupOnly?: boolean };
 }
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 function record(value: unknown): value is Record<string, unknown> {
@@ -25,6 +25,8 @@ export function validateManifest(input: unknown): StoragePluginManifest {
   if (input.entry !== 'index.cjs') fail('entry 必须为 index.cjs');
   if (input.description !== undefined && (typeof input.description !== 'string' || input.description.length > 2000)) fail('description 无效');
   if (!record(input.capabilities) || typeof input.capabilities.directUpload !== 'boolean' || typeof input.capabilities.usage !== 'boolean') fail('capabilities 无效');
+  if (input.capabilities.authentication !== undefined && typeof input.capabilities.authentication !== 'boolean') fail('authentication 无效');
+  if (input.capabilities.backupOnly !== undefined && typeof input.capabilities.backupOnly !== 'boolean') fail('backupOnly 无效');
   if (!Array.isArray(input.fields) || input.fields.length > 100) fail('fields 无效');
   const keys = new Set<string>();
   for (const f of input.fields) {
@@ -32,7 +34,7 @@ export function validateManifest(input: unknown): StoragePluginManifest {
     keys.add(f.key);
     if (typeof f.label !== 'string' || !f.label.trim() || f.label.length > 128) fail(`字段 ${f.key} label 无效`);
     if (!['string', 'number', 'boolean', 'select'].includes(String(f.type))) fail(`字段 ${f.key} type 无效`);
-    for (const flag of ['required', 'secret', 'url']) if (f[flag] !== undefined && typeof f[flag] !== 'boolean') fail(`字段 ${f.key} ${flag} 无效`);
+    for (const flag of ['required', 'secret', 'url', 'hidden', 'immutable']) if (f[flag] !== undefined && typeof f[flag] !== 'boolean') fail(`字段 ${f.key} ${flag} 无效`);
     if ((f.secret || f.url) && f.type !== 'string') fail(`字段 ${f.key} secret/url 仅支持 string`);
     for (const text of ['description', 'placeholder']) if (f[text] !== undefined && typeof f[text] !== 'string') fail(`字段 ${f.key} ${text} 无效`);
     if (f.type === 'select') {
@@ -82,6 +84,10 @@ export function validateConfig(manifest: StoragePluginManifest, input: unknown):
 export function validateAdapter(manifest: StoragePluginManifest, adapter: unknown): StorageAdapter {
   if (!record(adapter) || adapter.provider !== manifest.id) fail('适配器 provider 与 manifest 不一致');
   for (const method of ['upload', 'uploadFile', 'remove', 'getDownloadUrl', 'objectExists']) if (typeof adapter[method] !== 'function') fail(`适配器缺少 ${method}`);
+  if (manifest.capabilities.backupOnly && typeof adapter.verifyBackup !== 'function') fail('备份适配器缺少 verifyBackup');
+  if (manifest.capabilities.authentication) for (const method of ['startLogin', 'pollLogin', 'cancelLogin', 'accountStatus', 'disconnectAccount']) {
+    if (typeof adapter[method] !== 'function') fail(`认证适配器缺少 ${method}`);
+  }
   for (const [capability, method] of [['directUpload', 'createDirectUpload'], ['usage', 'getUsage']] as const) {
     if (manifest.capabilities[capability] !== (typeof adapter[method] === 'function')) fail(`能力 ${capability} 与适配器不一致`);
   }

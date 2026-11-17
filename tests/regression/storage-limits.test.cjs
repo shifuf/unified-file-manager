@@ -41,6 +41,17 @@ test('concurrent traffic reservations cannot spend the same persistent balance',
   assert.ok(results.find(r => r.status === 'rejected').reason instanceof StorageLimitError);
 });
 
+test('backup uploads reserve storage but need no download traffic even when traffic is exhausted', async () => {
+  const f = fixture({ provider: 'ALIYUN_DRIVE', trafficQuotaBytes: 0n });
+  f.service.registry.manifest = () => ({ capabilities: { backupOnly: true } });
+  const reservation = await f.service.reserveUpload(f.row, 10n, 'backup-key');
+  assert.equal(reservation.verification.bytes, null); assert.equal(f.row.manualTrafficUsedBytes, 0n);
+  assert.equal(f.row.trackedStorageBytes, 10n);
+  await f.service.finishUpload(reservation, 'PRESENT');
+  assert.equal(f.ledger[0].owner, null);
+  await assert.rejects(f.service.reserveUpload(f.row, 100n, 'too-large'), /空间/);
+});
+
 test('failed partial reads charge consumed bytes and refund only the unused reservation', async () => {
   const { row, service } = fixture();
   const ticket = await service.reserveRead(row, 80n);

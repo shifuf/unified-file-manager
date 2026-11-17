@@ -359,13 +359,13 @@
           <el-tag v-for="state in replicaStates" :key="state" :type="replicaStatusType(state)">{{ replicaStatusLabel(state) }} {{ replicas ? (replicas.counts?.[state] || 0) : '未知' }}</el-tag>
         </div>
         <el-table v-loading="replicasLoading" :data="replicas?.items || []" row-key="id" empty-text="暂无副本记录">
-          <el-table-column label="存储" min-width="150"><template #default="{ row }">{{ row.configName || row.provider || row.configId }}</template></el-table-column>
+          <el-table-column label="存储" min-width="150"><template #default="{ row }">{{ row.configName || row.provider || row.configId }}<div v-if="row.backupOnly" class="muted">仅上传备份</div></template></el-table-column>
           <el-table-column prop="storageKey" label="对象" min-width="220" show-overflow-tooltip />
           <el-table-column label="大小" width="110"><template #default="{ row }">{{ formatSize(Number(row.size)) }}</template></el-table-column>
-          <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="replicaStatusType(row.status)">{{ replicaStatusLabel(row.status) }}</el-tag></template></el-table-column>
+          <el-table-column label="状态" width="100"><template #default="{ row }"><el-tag :type="replicaStatusType(row.status)">{{ row.backupOnly && row.status === 'READY' ? '已备份' : replicaStatusLabel(row.status) }}</el-tag></template></el-table-column>
           <el-table-column prop="attempts" label="尝试次数" width="100" />
           <el-table-column prop="lastError" label="最近失败" min-width="160" show-overflow-tooltip />
-          <el-table-column label="最近校验" min-width="170"><template #default="{ row }">{{ formatTime(row.verifiedAt) }}</template></el-table-column>
+          <el-table-column label="最近确认" min-width="170"><template #default="{ row }">{{ formatTime(row.verifiedAt) }}<div v-if="row.backupOnly" class="muted">云端元数据确认</div></template></el-table-column>
         </el-table>
         <el-pagination :current-page="replicaPage" :page-size="replicaPageSize" :page-sizes="pageSizes" :total="replicaTotal" layout="total, sizes, prev, pager, next, jumper" class="panel-pagination" :pager-count="5" @update:current-page="changeReplicaPage" @update:page-size="changeReplicaPageSize" />
       </div>

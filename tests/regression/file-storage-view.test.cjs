@@ -21,6 +21,14 @@ test('preferred download names cloud priority independently of upload status', (
   assert.equal(view.preferredDownloadLabel(null), '下载优先存储待确认');
 });
 
+test('backup-only locations display uploaded backup but never appear in the download order', () => {
+  const view = load(), backup = location('READY', { backupOnly: true, provider: 'ALIYUN_DRIVE', configName: '网盘' });
+  const local = location('READY', { provider: 'LOCAL', configName: '本地', configId: 'local' });
+  assert.equal(view.downloadOrderLabel([backup, local]), '本地（兜底）');
+  assert.equal(view.replicaLabel(backup), '已备份');
+  assert.equal(view.storageProviderLabel(backup.provider), '阿里云盘');
+});
+
 // Execute the actual Files methods/template with only API/data boundaries
 // substituted, so the pre-fix merge and upload claims also fail behaviorally.
 const filesSource = () => fs.readFileSync(path.resolve(__dirname, '../../apps/web/src/views/Files.vue'), 'utf8');

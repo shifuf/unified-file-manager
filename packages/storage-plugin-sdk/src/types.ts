@@ -4,6 +4,8 @@ export type RuntimeCdnConfig = { id: string; provider: string; name: string; con
 export type StorageUploadParams = { key: string; buffer: Buffer; mimeType: string; originalName: string };
 /** Immutable object verified by host: upload bytes from path without buffering the whole file. */
 export type StorageUploadFileParams = { key: string; path: string; size: number; checksum: string; mimeType: string; originalName: string };
+/** Metadata confirmation of a backup; does not certify a downloaded SHA256. */
+export type StorageBackupParams = { key: string; size: number; checksum: string };
 export type StorageObjectFingerprint = { size: number; checksum: string; identity: string };
 export type StoredObject = { storageKey: string; publicUrl?: string | null };
 export type DownloadStorageIdentity = { configId: string; configName: string; provider: string };
@@ -15,15 +17,30 @@ export type DirectUploadParams = { key: string; fileName: string; mimeType: stri
 export type DirectUploadCredential = { provider: string; storageKey: string; uploadUrl: string; method: 'POST' | 'PUT'; headers?: Record<string, string>; uploadToken?: string; formFields?: Record<string, string>; publicUrl?: string | null; expiresAt: string };
 export interface StorageAdapter {
   readonly provider: string;
+  startLogin?(accountId?: string): Promise<PluginLoginSession>;
+  pollLogin?(sessionId: string): Promise<PluginLoginResult>;
+  cancelLogin?(sessionId: string): Promise<void>;
+  accountStatus?(accountId: string): Promise<PluginAccount>;
+  disconnectAccount?(accountId: string): Promise<void>;
   upload(config: RuntimeCdnConfig, params: StorageUploadParams): Promise<StoredObject>;
   uploadFile(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject>;
   remove(config: RuntimeCdnConfig, key: string): Promise<void>;
   getDownloadUrl(config: RuntimeCdnConfig, key: string, expiresSeconds: number): Promise<string>;
   objectExists(config: RuntimeCdnConfig, key: string): Promise<boolean>;
+  /** Metadata-only confirmation; backupOnly adapters do not expose content reads. */
+  verifyBackup?(config: RuntimeCdnConfig, params: StorageBackupParams): Promise<void>;
   getObjectFingerprint?(config: RuntimeCdnConfig, key: string): Promise<StorageObjectFingerprint | null>;
   repairFile?(config: RuntimeCdnConfig, params: StorageUploadFileParams, corrupt: StorageObjectFingerprint): Promise<StoredObject>;
   getDownloadTarget?(config: RuntimeCdnConfig, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget>;
   createDirectUpload?(config: RuntimeCdnConfig, params: DirectUploadParams, expiresSeconds: number): Promise<DirectUploadCredential | null>;
   getUsage?(config: RuntimeCdnConfig): Promise<StorageUsageSnapshot>;
 }
-export interface StoragePluginModule { createAdapter(): StorageAdapter }
+export type PluginAccount = { accountId: string; userId: string; name: string; connected: boolean; drives: Array<{ id: string; name: string }> };
+export type PluginLoginSession = { sessionId: string; qrCode: string; expiresAt: string };
+export type PluginLoginResult = { status: 'WAITING' | 'SCANNED' | 'CONFIRMED' | 'EXPIRED'; account?: PluginAccount };
+export interface PluginContext {
+  getState<T = Record<string, unknown>>(key: string): Promise<T | null>;
+  setState(key: string, value: unknown): Promise<void>;
+  withLock<T>(key: string, action: () => Promise<T>): Promise<T>;
+}
+export interface StoragePluginModule { createAdapter(context?: PluginContext): StorageAdapter }

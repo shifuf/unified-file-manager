@@ -93,6 +93,8 @@ export type DirectUploadCredential = {
 export interface StorageAdapter {
   readonly provider: CdnProvider;
 
+  verifyBackup?(config: RuntimeCdnConfig, params: { key: string; size: number; checksum: string }): Promise<void>;
+
   upload(config: RuntimeCdnConfig, params: StorageUploadParams): Promise<StoredObject>;
 
   uploadFile?(config: RuntimeCdnConfig, params: StorageUploadFileParams): Promise<StoredObject>;

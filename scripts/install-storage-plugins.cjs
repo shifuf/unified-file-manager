@@ -18,7 +18,10 @@ async function main() {
   const username = env.UFM_ADMIN_USERNAME || env.ADMIN_USERNAME;
   const password = env.UFM_ADMIN_PASSWORD || env.ADMIN_PASSWORD;
   if (!username || !password) throw new Error('请在 .env 配置 ADMIN_USERNAME / ADMIN_PASSWORD，或设置 UFM_ADMIN_USERNAME / UFM_ADMIN_PASSWORD');
-  const archives = ['qiniu', 'upyun', 'aliyun', 's3', 'cloudflare-r2'].map(name => {
+  const requested = option('--plugin');
+  const names = ['qiniu', 'upyun', 'aliyun', 's3', 'cloudflare-r2', 'aliyun-drive'];
+  if (requested && !names.includes(requested)) throw new Error('不支持的插件名称');
+  const archives = (requested ? [requested] : names).map(name => {
     const directory = path.join(root, 'plugins', name);
     const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'storage-plugin.json'), 'utf8'));
     const filename = `${manifest.id}-${manifest.version}.zip`;
@@ -50,7 +53,7 @@ async function main() {
     }
     const installed = await request('/storage-plugins');
     for (const { manifest, sha256 } of archives) if (!installed.some(item => item.id === manifest.id && item.version === manifest.version && item.sha256 === sha256 && item.available)) throw new Error(`${manifest.id} 安装后验证失败`);
-    console.log('全部 5 个存储插件已安装并验证。请在存储配置中填写供应商参数并绑定项目。');
+    console.log(`全部 ${archives.length} 个存储插件已安装并验证。请在存储配置中连接账号或填写供应商参数并绑定项目。`);
   } finally {
     if (cookie) await request('/auth/logout', 'POST', {}).catch(() => console.error('安装会话注销失败，请在控制台会话管理中撤销。'));
   }

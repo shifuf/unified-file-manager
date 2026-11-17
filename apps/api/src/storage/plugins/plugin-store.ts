@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile, rename, open } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import * as yauzl from 'yauzl';
-import { validateManifest, validateAdapter, validateConfig, type RuntimeCdnConfig, type StoragePluginManifest, type StorageAdapter } from '@ufm/storage-plugin-sdk';
+import { validateManifest, validateAdapter, validateConfig, type RuntimeCdnConfig, type StoragePluginManifest, type StorageAdapter, type PluginContext } from '@ufm/storage-plugin-sdk';
 
 type Entry = { manifest: StoragePluginManifest; digest: string; directory: string };
 type Loaded = Entry & { adapter?: StorageAdapter; error?: string };
@@ -12,7 +12,7 @@ const MAX_EXPANDED = 128 * 1024 * 1024;
 /** Trusted server code. Archive validation protects installation paths, not against malicious JavaScript. */
 export class PluginStore {
   private entries = new Map<string, Loaded>();
-  constructor(readonly root: string) {}
+  constructor(readonly root: string, private readonly context?: (provider: string) => PluginContext) {}
 
   async load(): Promise<void> {
     await mkdir(this.root, { recursive: true });
@@ -41,6 +41,11 @@ export class PluginStore {
 
   list() { return [...this.entries.values()].map(({ manifest, digest: sha256, error }) => ({ ...manifest, sha256, builtin: false, available: !error, ...(error ? { error } : {}) })); }
   manifest(id: string) { return this.entries.get(id)?.manifest; }
+  authAdapter(id: string): StorageAdapter {
+    const item = this.entries.get(id);
+    if (!item?.adapter || !item.manifest.capabilities.authentication) throw new Error('插件不支持交互登录。');
+    return item.adapter;
+  }
   adapter(id: string): StorageAdapter {
     const item = this.entries.get(id);
     if (!item?.adapter) throw new Error(`存储插件 ${id} 未安装或不可用，请先在插件管理中安装。`);
@@ -104,9 +109,9 @@ export class PluginStore {
   }
   private instantiate(item: Entry): StorageAdapter {
     const entry = resolve(this.root, item.directory, item.manifest.entry);
-    const module = require(entry) as { createAdapter?: () => StorageAdapter };
+    const module = require(entry) as { createAdapter?: (context?: PluginContext) => StorageAdapter };
     if (typeof module.createAdapter !== 'function') throw new Error('插件必须导出 createAdapter()。');
-    const adapter = module.createAdapter(); validateAdapter(item.manifest, adapter); return adapter;
+    const adapter = module.createAdapter(this.context?.(item.manifest.id)); validateAdapter(item.manifest, adapter); return adapter;
   }
   private async persist(entries: Map<string, Loaded>) {
     const temporary = join(this.root, `index-${randomUUID()}.json`);

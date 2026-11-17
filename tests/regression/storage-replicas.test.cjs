@@ -72,6 +72,57 @@ async function collect(target) { assert.equal(target.type, 'stream'); const chun
 function replicas(f) { const { ReplicaService } = require('../../apps/api/src/storage/replica.service.ts'); return new ReplicaService(configService, f.db, f.registry); }
 function row(f, configId, status = 'READY', key = 'p/object') { const r = { id: `r${f.records.length}`, projectId: 'p', configId, storageKey: key, size: BigInt(bytes.length), checksum: hash(bytes), status, attempts: 0, nextAttemptAt: new Date(0), leaseOwner: null, leaseUntil: null, verifiedAt: null }; f.records.push(r); return r; }
 
+function backupFixture() {
+  const f = fixture(); f.configs[1].provider = 'ALIYUN_DRIVE';
+  f.registry.manifest = provider => ({ capabilities: { backupOnly: provider === 'ALIYUN_DRIVE' } });
+  const base = f.registry.adapter; f.reads = []; f.confirmations = [];
+  f.registry.adapter = provider => {
+    const adapter = base(provider), read = adapter.getDownloadTarget;
+    adapter.getDownloadTarget = async (config, key) => { f.reads.push(config.id); return read(config, key); };
+    adapter.verifyBackup = async (config, params) => {
+      f.confirmations.push(config.id); const data = f.objects.get(`${config.id}:${params.key}`);
+      if (!data || data.length !== params.size || hash(data) !== params.checksum) throw new Error('备份元数据不匹配');
+    };
+    return adapter;
+  };
+  return f;
+}
+
+test('backup-only cloud is excluded from downloads and cannot be used through the read entry', async () => {
+  const f = backupFixture(), service = replicas(f); row(f, 'local'); row(f, 'cloud-a');
+  f.objects.set('local:p/object', bytes); f.objects.set('cloud-a:p/object', bytes);
+  const target = await service.getDownloadTargetForKey({ projectId: 'p', storageKey: 'p/object' }, 'p/object');
+  assert.deepEqual(await collect(target), bytes); assert.equal(target.storageSource.selected.configId, 'local');
+  assert.deepEqual(f.reads, ['local']);
+  await assert.rejects(service.readVerified(f.configs[1], 'p/object', bytes.length, hash(bytes)), /仅.*备份/);
+});
+
+test('worker uploads and confirms a backup with metadata without reading cloud bytes', async () => {
+  const f = backupFixture(), service = replicas(f); row(f, 'local'); const target = row(f, 'cloud-a', 'PENDING');
+  f.objects.set('local:p/object', bytes);
+  await service.runBatch('backup-worker');
+  assert.equal(target.status, 'READY'); assert.ok(target.verifiedAt);
+  assert.deepEqual(f.uploads, ['cloud-a']); assert.ok(f.confirmations.length > 0);
+  assert.ok(!f.reads.includes('cloud-a'));
+});
+
+test('manual copy and inspection confirm backup metadata without cloud content reads', async () => {
+  const f = backupFixture(), service = replicas(f); row(f, 'local'); f.objects.set('local:p/object', bytes);
+  const file = { projectId: 'p', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: 'test' };
+  await service.copyToConfig(file, 'cloud-a');
+  const target = f.records.find(r => r.configId === 'cloud-a'); assert.equal(target.status, 'READY');
+  await service.inspectProject('p'); assert.equal(target.status, 'READY'); assert.ok(!f.reads.includes('cloud-a'));
+  f.objects.set('cloud-a:p/object', Buffer.alloc(bytes.length));
+  await service.inspectProject('p'); assert.equal(target.status, 'FAILED');
+});
+
+test('a backup cannot be selected as the source for repairing other replicas or legacy versions', async () => {
+  const f = backupFixture(), service = replicas(f); row(f, 'cloud-a'); const target = row(f, 'cloud-b', 'PENDING');
+  f.objects.set('cloud-a:p/object', bytes);
+  f.db.managedFile.findFirst = async () => ({ cdnConfigId: 'cloud-a', cdnConfig: f.configs[1], checksum: hash(bytes) });
+  await service.runBatch('backup-source'); assert.equal(target.status, 'MISSING'); assert.ok(!f.reads.includes('cloud-a'));
+});
+
 test('inspection must not revive a replica frozen by permanent deletion', async () => {
   const f = fixture(); row(f, 'local', 'DELETING'); f.objects.set('local:p/object', bytes);
   const result = await replicas(f).inspectProject('p');
