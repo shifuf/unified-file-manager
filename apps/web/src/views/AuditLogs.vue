@@ -137,11 +137,10 @@
 
     <el-dialog v-model="cleanupVisible" title="清理日志" width="520px">
       <el-form label-position="top">
-        <el-form-item label="清理早于">
+        <el-form-item label="清理早于（可留空，清理全部匹配日志）">
           <el-date-picker
             v-model="cleanupForm.beforeAt"
             type="datetime"
-            value-format="YYYY-MM-DDTHH:mm:ss"
             placeholder="选择截止时间"
             class="cleanup-date"
           />
@@ -426,11 +425,6 @@ function openCleanupDialog(): void {
 }
 
 async function cleanupLogs(): Promise<void> {
-  if (!cleanupForm.beforeAt) {
-    ElMessage.warning('请选择清理截止时间。');
-    return;
-  }
-
   await ElMessageBox.confirm('清理后日志不可恢复，确认继续？', '清理日志', {
     type: 'warning',
     confirmButtonText: '确认清理',
@@ -440,7 +434,7 @@ async function cleanupLogs(): Promise<void> {
   cleanupLoading.value = true;
   try {
     const result = await settingsApi.cleanupAuditLogs({
-      beforeAt: cleanupForm.beforeAt,
+      ...(cleanupForm.beforeAt ? { beforeAt: new Date(cleanupForm.beforeAt).toISOString() } : { all: true }),
       ...(cleanupForm.useCurrentFilters
         ? {
             keyword: filters.keyword || undefined,

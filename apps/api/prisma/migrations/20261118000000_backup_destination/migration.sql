@@ -1,0 +1,3 @@
+ALTER TABLE `Backup`
+  ADD COLUMN `retainLocal` BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN `destination` JSON NULL;

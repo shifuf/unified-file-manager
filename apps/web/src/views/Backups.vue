@@ -19,7 +19,7 @@
         <div class="toolbar">
           <el-button :icon="Refresh" :loading="loading" @click="reload">刷新</el-button>
           <span class="muted">
-            备份文件保存在服务器 BACKUP_ROOT 目录，可下载到本地留存。
+            可选存储配置上传；仅远端备份需从云端取回后导入恢复。
           </span>
         </div>
 
@@ -32,6 +32,12 @@
           </el-table-column>
           <el-table-column label="大小" width="120">
             <template #default="{ row }">{{ formatBytes(row.fileSize) }}</template>
+          </el-table-column>
+          <el-table-column label="存储位置" min-width="220">
+            <template #default="{ row }">
+              <div>{{ row.destination ? `${row.destination.name}（${row.destination.provider}）` : '服务器本地' }}</div>
+              <small v-if="row.destination" class="muted">{{ destinationStatus(row.destination.status) }} · {{ row.fileAvailable ? '有本地副本' : row.retainLocal ? '本地文件不可用' : '不保留本地副本' }}</small>
+            </template>
           </el-table-column>
           <el-table-column label="含文件内容" width="120">
             <template #default="{ row }">
@@ -74,7 +80,7 @@
                 >
                   恢复
                 </el-button>
-                <el-button link type="danger" @click="removeBackup(row)">删除</el-button>
+                <el-button link type="danger" :disabled="row.status === 'RUNNING' || row.status === 'PENDING'" @click="removeBackup(row)">删除</el-button>
               </div>
             </template>
           </el-table-column>
@@ -86,6 +92,15 @@
       <el-form label-position="top">
         <el-form-item label="备份名称">
           <el-input v-model="createForm.name" maxlength="128" placeholder="留空按时间自动命名" />
+        </el-form-item>
+        <el-form-item label="目标存储配置">
+          <el-select v-model="createForm.storageConfigId" clearable placeholder="仅保存在服务器本地" style="width: 100%" @change="onDestinationChange">
+            <el-option v-for="config in destinations" :key="config.id" :value="config.id" :label="`${config.name}（${config.provider}）`" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="保留本地副本">
+          <el-switch v-model="createForm.retainLocal" :disabled="!selectedRemote" />
+          <div class="field-help">关闭后，仅在远端上传并校验成功后删除本地临时文件；上传失败会保留文件。阿里云盘仅支持上传，恢复时需自行取回归档后导入。</div>
         </el-form-item>
         <el-form-item label="备份内容（不选=全部）">
           <div class="scope-toolbar">
@@ -159,7 +174,7 @@
 <script setup lang="ts">
 import { Plus, Refresh, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 
 import { backupApi, type BackupRecord, type BackupScopeInfo, type BackupStatus } from '@/api/modules';
 
@@ -173,11 +188,19 @@ const restoreTarget = ref<BackupRecord | null>(null);
 const importing = ref(false);
 const fileInput = ref<HTMLInputElement>();
 const scopeOptions = ref<BackupScopeInfo[]>([]);
-const createForm = reactive<{ name: string; includeObjects: boolean; scopes: string[] }>({
+const destinations = ref<Array<{ id: string; name: string; provider: string }>>([]);
+const createForm = reactive<{ name: string; includeObjects: boolean; scopes: string[]; storageConfigId: string; retainLocal: boolean }>({
   name: '',
   includeObjects: false,
   scopes: [],
+  storageConfigId: '',
+  retainLocal: true,
 });
+const selectedRemote = computed(() => destinations.value.some(config => config.id === createForm.storageConfigId && config.provider !== 'LOCAL'));
+function onDestinationChange(): void { if (!selectedRemote.value) createForm.retainLocal = true; }
+function destinationStatus(status: string): string {
+  return ({ PENDING: '等待上传', UPLOADING: '正在上传及校验', VERIFIED: '云端已确认', FAILED: '上传失败' } as Record<string, string>)[status] || status;
+}
 const restoreForm = reactive<{ mode: 'merge' | 'replace'; scopes: string[] }>({
   mode: 'merge',
   scopes: [],
@@ -282,6 +305,8 @@ async function reload(): Promise<void> {
 function openCreateDialog(): void {
   createForm.name = '';
   createForm.includeObjects = false;
+  createForm.storageConfigId = '';
+  createForm.retainLocal = true;
   createForm.scopes = scopeOptions.value.map((scope) => scope.key);
   createVisible.value = true;
 }
@@ -293,6 +318,8 @@ async function submitCreate(): Promise<void> {
       name: createForm.name.trim() || undefined,
       scopes: createForm.scopes.length > 0 ? createForm.scopes : undefined,
       includeObjects: createForm.includeObjects && createForm.scopes.includes('projects'),
+      storageConfigId: createForm.storageConfigId || undefined,
+      retainLocal: createForm.retainLocal,
     });
     ElMessage.success('备份已完成。');
     createVisible.value = false;
@@ -367,8 +394,13 @@ async function removeBackup(row: BackupRecord): Promise<void> {
 
 onMounted(async () => {
   await loadScopes().catch(() => undefined);
+  destinations.value = await backupApi.destinations();
   await reload();
 });
+const monitor = window.setInterval(() => {
+  if (creating.value || backups.value.some(row => row.status === 'RUNNING')) void reload();
+}, 4000);
+onUnmounted(() => window.clearInterval(monitor));
 </script>
 
 <style scoped>

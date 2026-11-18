@@ -6,6 +6,7 @@
         <p class="page-subtitle">查看批量文件操作、迁移、导入等后台任务记录。</p>
       </div>
       <div class="toolbar">
+        <el-button :icon="Delete" type="danger" plain :disabled="loading || deleting" @click="cleanupTasks">清理已结束记录</el-button>
         <el-button :icon="Delete" type="danger" plain :disabled="!selectedTasks.length || loading" :loading="deleting" @click="removeSelectedTasks">批量删除{{ selectedTasks.length ? `（${selectedTasks.length}）` : '' }}</el-button>
         <el-button :icon="Refresh" :disabled="deleting" @click="reload">刷新</el-button>
       </div>
@@ -190,6 +191,28 @@ async function retryTask(task: TaskItem): Promise<void> {
 
 async function removeTask(task: TaskItem): Promise<void> {
   await deleteTasks([task]);
+}
+
+async function cleanupTasks(): Promise<void> {
+  if (loading.value || deleting.value) return;
+  try {
+    await ElMessageBox.confirm('清理当前项目下全部已完成、失败或已取消的任务记录？无需选择时间，不会删除文件或正在执行的任务。', '清理任务记录', {
+      type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消',
+    });
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return;
+    throw error;
+  }
+  deleting.value = true;
+  try {
+    const result = await taskApi.cleanup({ projectId: filters.projectId || undefined });
+    detailVisible.value = false;
+    selectedTask.value = null;
+    ElMessage.success(`已清理 ${result.deleted} 条任务记录。`);
+    await reload();
+  } finally {
+    deleting.value = false;
+  }
 }
 
 function handleSelectionChange(tasks: TaskItem[]): void {

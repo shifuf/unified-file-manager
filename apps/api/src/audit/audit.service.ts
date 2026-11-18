@@ -139,21 +139,25 @@ export class AuditService {
   }
 
   async cleanup(params: {
-    beforeAt: string;
+    beforeAt?: string;
+    all?: boolean;
     projectId?: string;
     action?: AuditAction;
     keyword?: string;
   }, actorId?: string): Promise<{ success: boolean; deleted: number }> {
-    if (!params.beforeAt) {
+    if (!params.beforeAt && params.all !== true) {
       throw new BadRequestException('请选择要清理的截止时间。');
     }
 
-    const beforeAt = new Date(params.beforeAt);
-    if (Number.isNaN(beforeAt.getTime())) {
+    const beforeAt = params.beforeAt ? new Date(params.beforeAt) : null;
+    if (params.beforeAt && !/(?:Z|[+-]\d{2}:\d{2})$/i.test(params.beforeAt)) {
+      throw new BadRequestException('清理截止时间必须包含时区。');
+    }
+    if (beforeAt && Number.isNaN(beforeAt.getTime())) {
       throw new BadRequestException('清理截止时间无效。');
     }
 
-    if (beforeAt.getTime() > Date.now()) {
+    if (beforeAt && beforeAt.getTime() > Date.now()) {
       throw new BadRequestException('清理截止时间不能晚于当前时间。');
     }
 
@@ -171,6 +175,7 @@ export class AuditService {
       actorId,
       detail: {
         beforeAt: params.beforeAt,
+        all: params.all === true,
         projectId: params.projectId,
         action: params.action,
         keyword: params.keyword,

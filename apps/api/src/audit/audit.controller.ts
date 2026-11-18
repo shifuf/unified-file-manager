@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, ForbiddenException, Get, Post, Query, Res, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 
@@ -48,6 +48,7 @@ export class AuditController {
     @Body() dto: CleanupAuditLogsDto,
     @CurrentUser() user: RequestUser,
   ): ReturnType<AuditService['cleanup']> {
+    if (user.role !== 'SUPER_ADMIN') throw new ForbiddenException('只有超级管理员可以清理审计日志。');
     return this.auditService.cleanup(dto, user.id);
   }
 }

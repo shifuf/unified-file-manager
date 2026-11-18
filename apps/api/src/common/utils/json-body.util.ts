@@ -1,5 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
-import { json } from 'express';
+import { json, type Request } from 'express';
 import type { IncomingMessage } from 'node:http';
 
 export function registerJsonBodyParsers(app: Pick<INestApplication, 'use'>): void {
@@ -8,7 +8,15 @@ export function registerJsonBodyParsers(app: Pick<INestApplication, 'use'>): voi
   // Nest detects the parser above and skips its automatic JSON parser.
   // A custom parser disables Nest's built-in rawBody capture. HMAC v2 must
   // authenticate the original JSON bytes, including whitespace and key order.
-  app.use(json({ verify: (request: IncomingMessage & { rawBody?: Buffer }, _response, buffer) => {
-    request.rawBody = Buffer.from(buffer);
-  } }));
+  app.use(json({
+    type: (request) => {
+      const req = request as Request;
+      // A DAV upload stores the original stream, including files with a JSON MIME type.
+      if (req.method === 'PUT' && req.path.startsWith('/api/dav/')) return false;
+      return Boolean(req.is('application/json'));
+    },
+    verify: (request: IncomingMessage & { rawBody?: Buffer }, _response, buffer) => {
+      request.rawBody = Buffer.from(buffer);
+    },
+  }));
 }

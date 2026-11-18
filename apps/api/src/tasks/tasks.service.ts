@@ -289,6 +289,24 @@ export class TasksService {
     });
   }
 
+  async cleanup(params: { projectId?: string }, user: RequestUser): Promise<{ success: boolean; deleted: number }> {
+    if (user.role !== UserRole.SUPER_ADMIN) throw new NotFoundException('任务不存在。');
+    if (params.projectId) await this.projectAccessService.assertProjectAccess(user, params.projectId, true);
+    return this.prisma.$transaction(async tx => {
+      const result = await tx.task.deleteMany({ where: {
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        status: { in: ['COMPLETED', 'FAILED', 'CANCELED'] },
+      } });
+      await tx.auditLog.create({ data: {
+        action: AuditAction.TASK_DELETE,
+        actorId: user.id,
+        projectId: params.projectId,
+        detail: { cleanup: true, deleted: result.count },
+      } });
+      return { success: true, deleted: result.count };
+    });
+  }
+
   private asRecord(value: Prisma.JsonValue | null): Record<string, unknown> {
     return value && typeof value === 'object' && !Array.isArray(value)
       ? value as Record<string, unknown>

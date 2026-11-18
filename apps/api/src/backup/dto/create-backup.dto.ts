@@ -26,4 +26,15 @@ export class CreateBackupDto {
   @IsOptional()
   @IsBoolean()
   includeObjects?: boolean;
+
+  @ApiPropertyOptional({ description: '上传目标存储配置，留空仅保存在本地' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(191)
+  storageConfigId?: string;
+
+  @ApiPropertyOptional({ description: '云端确认后是否继续保留本地副本', default: true })
+  @IsOptional()
+  @IsBoolean()
+  retainLocal?: boolean;
 }

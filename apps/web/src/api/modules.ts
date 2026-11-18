@@ -1054,7 +1054,8 @@ export const settingsApi = {
     return http.get<unknown, PageResult<AuditLog>>('/audit-logs', { params: compactParams(params) });
   },
   cleanupAuditLogs(payload: {
-    beforeAt: string;
+    beforeAt?: string;
+    all?: boolean;
     projectId?: string;
     action?: AuditAction | '';
     keyword?: string;
@@ -1150,6 +1151,9 @@ export const versionApi = {
 };
 
 export const taskApi = {
+  cleanup(payload: { projectId?: string } = {}) {
+    return http.post<unknown, { success: boolean; deleted: number }>('/tasks/cleanup', compactParams(payload));
+  },
   list(params: { projectId?: string; status?: string; type?: string; page?: number; pageSize?: number }) {
     return http.get<unknown, PageResult<TaskItem>>('/tasks', { params: compactParams(params) });
   },
@@ -1191,6 +1195,8 @@ export interface BackupRecord {
   name: string;
   status: BackupStatus;
   includeObjects: boolean;
+  retainLocal: boolean;
+  destination: { configId: string; name: string; provider: string; storageKey: string; status: 'PENDING' | 'UPLOADING' | 'VERIFIED' | 'FAILED' } | null;
   fileName: string | null;
   fileSize: number;
   checksum: string | null;
@@ -1218,14 +1224,17 @@ export interface BackupRestoreResult {
 }
 
 export const backupApi = {
+  destinations() {
+    return http.get<unknown, Array<{ id: string; name: string; provider: string }>>('/backups/destinations');
+  },
   list() {
     return http.get<unknown, BackupRecord[]>('/backups');
   },
   scopes() {
     return http.get<unknown, BackupScopeInfo[]>('/backups/scopes');
   },
-  create(payload: { name?: string; scopes?: string[]; includeObjects?: boolean }) {
-    return http.post<unknown, BackupRecord>('/backups', payload);
+  create(payload: { name?: string; scopes?: string[]; includeObjects?: boolean; storageConfigId?: string; retainLocal?: boolean }) {
+    return http.post<unknown, BackupRecord>('/backups', payload, { timeout: 30 * 60_000 });
   },
   importFile(file: File) {
     const form = new FormData();

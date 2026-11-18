@@ -70,6 +70,8 @@ export type BackupView = {
   name: string;
   status: Backup['status'];
   includeObjects: boolean;
+  retainLocal: boolean;
+  destination: BackupDestination | null;
   fileName: string | null;
   fileSize: number;
   checksum: string | null;
@@ -85,6 +87,14 @@ export type BackupView = {
   createdAt: Date;
   updatedAt: Date;
   fileAvailable: boolean;
+};
+
+type BackupDestination = {
+  configId: string;
+  name: string;
+  provider: string;
+  storageKey: string;
+  status: 'PENDING' | 'UPLOADING' | 'VERIFIED' | 'FAILED';
 };
 
 export type RestoreResult = {
@@ -149,6 +159,15 @@ export class BackupService implements OnModuleInit {
 
   async create(dto: CreateBackupDto, user: RequestUser): Promise<BackupView> {
     this.assertCanManageBackups(user);
+    const retainLocal = dto.retainLocal !== false;
+    const storageConfigId = dto.storageConfigId?.trim();
+    const target = storageConfigId ? await this.prisma.cdnConfig.findFirst({ where: { id: storageConfigId, enabled: true, projectId: null } }) : null;
+    if (storageConfigId && !target) throw new BadRequestException('目标存储配置不存在或已停用。');
+    if (!retainLocal && (!target || target.provider === 'LOCAL')) throw new BadRequestException('不保留本地副本时必须选择远端存储。');
+    let destination: BackupDestination | null = target ? {
+      configId: target.id, name: target.name, provider: target.provider,
+      storageKey: `system-backups/${randomUUID()}.json.gz`, status: 'PENDING',
+    } : null;
     const name = (dto.name ?? '').trim() || `全量备份 ${new Date().toLocaleString('zh-CN')}`;
     const scopes = this.resolveScopes(dto.scopes);
     const includeObjects = Boolean(dto.includeObjects);
@@ -157,6 +176,8 @@ export class BackupService implements OnModuleInit {
       data: {
         name,
         includeObjects,
+        retainLocal,
+        ...(destination ? { destination: destination as unknown as Prisma.InputJsonValue } : {}),
         scopes: scopes as unknown as Prisma.InputJsonValue,
         status: 'RUNNING',
         startedAt: new Date(),
@@ -166,6 +187,20 @@ export class BackupService implements OnModuleInit {
 
     try {
       const result = await this.buildArchive(record.id, includeObjects, scopes);
+      await this.prisma.backup.update({ where: { id: record.id }, data: {
+        fileName: result.fileName, fileSize: BigInt(result.fileSize), checksum: result.checksum,
+      } });
+      if (destination) {
+        destination = { ...destination, status: 'UPLOADING' };
+        await this.prisma.backup.update({ where: { id: record.id }, data: { destination: destination as unknown as Prisma.InputJsonValue } });
+        const buffer = await readFile(this.archivePath(result.fileName));
+        await this.storageService.uploadToConfig(destination.configId, {
+          key: destination.storageKey, buffer, mimeType: 'application/gzip', originalName: result.fileName,
+        });
+        destination = { ...destination, status: 'VERIFIED' };
+        await this.prisma.backup.update({ where: { id: record.id }, data: { destination: destination as unknown as Prisma.InputJsonValue } });
+      }
+      if (!retainLocal) await rm(this.archivePath(result.fileName));
       const updated = await this.prisma.backup.update({
         where: { id: record.id },
         data: {
@@ -199,10 +234,17 @@ export class BackupService implements OnModuleInit {
       this.logger.error(`备份失败 id=${record.id}：${message}`);
       await this.prisma.backup.update({
         where: { id: record.id },
-        data: { status: 'FAILED', message, finishedAt: new Date() },
+        data: { status: 'FAILED', message, finishedAt: new Date(),
+          ...(destination ? { destination: { ...destination, status: destination.status === 'VERIFIED' ? 'VERIFIED' : 'FAILED' } as unknown as Prisma.InputJsonValue } : {}),
+        },
       });
       throw new BadRequestException(`备份失败：${message}`);
     }
+  }
+
+  async destinations(user: RequestUser): Promise<Array<{ id: string; name: string; provider: string }>> {
+    this.assertCanManageBackups(user);
+    return this.prisma.cdnConfig.findMany({ where: { enabled: true, projectId: null }, select: { id: true, name: true, provider: true }, orderBy: { priority: 'asc' } });
   }
 
   /**
@@ -282,7 +324,7 @@ export class BackupService implements OnModuleInit {
 
     const path = this.archivePath(record.fileName);
     if (!existsSync(path)) {
-      throw new NotFoundException('备份文件已丢失，请重新创建。');
+      throw new NotFoundException(record.retainLocal === false ? '此备份仅保存在远端，请从所选存储取回后导入。' : '备份文件已丢失，请重新创建。');
     }
 
     await this.auditService.write({
@@ -309,7 +351,7 @@ export class BackupService implements OnModuleInit {
 
     const path = this.archivePath(record.fileName);
     if (!existsSync(path)) {
-      throw new NotFoundException('备份文件已丢失，无法恢复。');
+      throw new NotFoundException(record.retainLocal === false ? '此备份仅保存在远端，请从所选存储取回后导入恢复。' : '备份文件已丢失，无法恢复。');
     }
 
     const archiveBuffer = await readFile(path);
@@ -397,6 +439,13 @@ export class BackupService implements OnModuleInit {
   async remove(id: string, user: RequestUser): Promise<{ success: boolean }> {
     this.assertCanManageBackups(user);
     const record = await this.findBackup(id);
+    if (record.status === 'RUNNING' || record.status === 'PENDING') throw new BadRequestException('备份正在处理中，暂时不能删除。');
+    const destination = this.destinationOf(record);
+    if (destination && (destination.status === 'VERIFIED' || destination.status === 'FAILED')) {
+      const config = await this.prisma.cdnConfig.findUnique({ where: { id: destination.configId } });
+      if (!config) throw new BadRequestException('远端存储配置已删除，不能确认备份对象清理。');
+      await this.storageService.remove(config, destination.storageKey);
+    }
 
     if (record.fileName) {
       await rm(this.archivePath(record.fileName), { force: true }).catch(() => undefined);
@@ -638,6 +687,8 @@ export class BackupService implements OnModuleInit {
       name: record.name,
       status: record.status,
       includeObjects: record.includeObjects,
+      retainLocal: record.retainLocal !== false,
+      destination: this.destinationOf(record),
       fileName: record.fileName,
       fileSize: Number(record.fileSize),
       checksum: record.checksum,
@@ -654,6 +705,12 @@ export class BackupService implements OnModuleInit {
       updatedAt: record.updatedAt,
       fileAvailable: Boolean(record.fileName) && existsSync(this.archivePath(record.fileName as string)),
     };
+  }
+
+  private destinationOf(record: Backup): BackupDestination | null {
+    const value = record.destination;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    return value as unknown as BackupDestination;
   }
 
   private asCountRecord(value: Prisma.JsonValue | null): Record<string, number> {

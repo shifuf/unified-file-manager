@@ -6,6 +6,7 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { RequestUser } from '../common/types/request-user.type';
 import { ListTasksDto } from './dto/list-tasks.dto';
 import { BatchDeleteTasksDto } from './dto/batch-delete-tasks.dto';
+import { CleanupTasksDto } from './dto/cleanup-tasks.dto';
 import { TasksService } from './tasks.service';
 
 @ApiTags('任务中心')
@@ -29,6 +30,11 @@ export class TasksController {
     @CurrentUser() user: RequestUser,
   ): ReturnType<TasksService['batchRemove']> {
     return this.tasksService.batchRemove(dto.taskIds, user);
+  }
+
+  @Post('cleanup')
+  cleanup(@Body() dto: CleanupTasksDto, @CurrentUser() user: RequestUser): ReturnType<TasksService['cleanup']> {
+    return this.tasksService.cleanup(dto, user);
   }
 
   @Get(':taskId')

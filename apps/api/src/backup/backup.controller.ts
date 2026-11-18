@@ -42,6 +42,11 @@ export class BackupController {
     return this.backupService.scopeCatalog();
   }
 
+  @Get('destinations')
+  destinations(@CurrentUser() user: RequestUser): ReturnType<BackupService['destinations']> {
+    return this.backupService.destinations(user);
+  }
+
   /** Register a previously downloaded backup archive so it can be restored. */
   @Post('import')
   @ApiConsumes('multipart/form-data')
