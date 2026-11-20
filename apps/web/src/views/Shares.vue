@@ -31,8 +31,9 @@
           </el-select>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="分享列表">
         <el-table v-loading="loading" :data="pageResult.items" row-key="id" class="data-table">
-          <el-table-column label="文件" min-width="220" show-overflow-tooltip>
+          <el-table-column label="文件" min-width="220">
             <template #default="{ row }">
               <div class="file-cell">
                 <span>{{ row.fileName }}</span>
@@ -44,7 +45,8 @@
           <el-table-column label="链接" min-width="300">
             <template #default="{ row }">
               <div class="link-cell">
-                <span class="mono">{{ row.url }}</span>
+                <a v-if="safeShareUrl(row.url)" class="mono share-url" :href="safeShareUrl(row.url)" target="_blank" rel="noopener noreferrer">{{ row.url }}</a>
+                <span v-else class="mono">{{ row.url }}</span>
                 <span v-if="row.customPath" class="muted">自定义：/s/{{ row.customPath }}</span>
               </div>
             </template>
@@ -66,7 +68,7 @@
               <el-tag :type="shareStatusMeta(row.status).type">{{ shareStatusMeta(row.status).label }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="250">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="250">
             <template #default="{ row }">
               <el-button link type="primary" @click="copyText(row.url)">复制分享页</el-button>
               <el-button link type="primary" @click="copyText(row.downloadUrl)">复制直链</el-button>
@@ -75,6 +77,7 @@
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
 
         <div class="pagination-row">
           <el-pagination
@@ -194,10 +197,12 @@ import { Refresh, Search } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { fileApi, projectApi } from '@/api/modules';
 import type { PageResult, Project, ShareLink, ShareStatus } from '@/types';
 import { copyText } from '@/utils/io';
+import { safeShareUrl } from '@/utils/share-url';
 
 const route = useRoute();
 const router = useRouter();
@@ -388,9 +393,14 @@ onMounted(async () => {
 }
 
 .link-cell .mono {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.share-url {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .pagination-row {

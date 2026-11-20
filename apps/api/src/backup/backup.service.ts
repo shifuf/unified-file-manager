@@ -11,6 +11,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
   type OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -148,7 +149,7 @@ export class BackupService implements OnModuleInit {
 
   async list(user: RequestUser): Promise<BackupView[]> {
     this.assertCanManageBackups(user);
-    const rows = await this.prisma.backup.findMany({ orderBy: { createdAt: 'desc' } });
+    const rows = await this.readMetadata(() => this.prisma.backup.findMany({ orderBy: { createdAt: 'desc' } }));
     return rows.map((row) => this.toView(row));
   }
 
@@ -244,7 +245,23 @@ export class BackupService implements OnModuleInit {
 
   async destinations(user: RequestUser): Promise<Array<{ id: string; name: string; provider: string }>> {
     this.assertCanManageBackups(user);
-    return this.prisma.cdnConfig.findMany({ where: { enabled: true, projectId: null }, select: { id: true, name: true, provider: true }, orderBy: { priority: 'asc' } });
+    return this.readMetadata(() => this.prisma.cdnConfig.findMany({ where: { enabled: true, projectId: null }, select: { id: true, name: true, provider: true }, orderBy: { priority: 'asc' } }));
+  }
+
+  private async readMetadata<T>(query: () => Promise<T>): Promise<T> {
+    try {
+      return await query();
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && (error.code === 'P2021' || error.code === 'P2022')) {
+        this.logger.error(`备份元数据读取失败：数据库结构与应用版本不一致（${error.code}）。`);
+        throw new ServiceUnavailableException({
+          statusCode: 503,
+          code: 'BACKUP_SCHEMA_OUTDATED',
+          message: '备份数据库结构尚未更新，请管理员执行当前版本的数据库迁移后重试。',
+        }, { cause: error });
+      }
+      throw error;
+    }
   }
 
   /**

@@ -48,6 +48,7 @@
           <el-button @click="resetFilters">重置</el-button>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="审计日志列表">
         <el-table v-loading="loading" :data="result.items" row-key="id" class="data-table">
           <el-table-column label="动作" min-width="170">
             <template #default="{ row }">
@@ -79,12 +80,13 @@
           <el-table-column label="时间" min-width="180">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="90">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="90">
             <template #default="{ row }">
               <el-button link type="primary" @click="openDetail(row)">详情</el-button>
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
 
         <div class="pagination-row">
           <el-pagination
@@ -161,6 +163,7 @@
 import { Delete, Refresh, Search } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { projectApi, settingsApi } from '@/api/modules';
 import type { AuditAction, AuditLog, PageResult, Project } from '@/types';

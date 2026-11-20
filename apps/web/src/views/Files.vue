@@ -6,7 +6,13 @@
         <p class="page-subtitle">{{ pageSubtitle }}</p>
       </div>
       <div class="toolbar">
-        <input ref="fileInputRef" type="file" multiple class="hidden-input" @change="handleFileChange" />
+        <input
+          ref="fileInputRef"
+          type="file"
+          multiple
+          class="hidden-input"
+          @change="handleFileChange"
+        />
         <input
           ref="replaceFileInputRef"
           type="file"
@@ -47,438 +53,620 @@
         >
           新建根目录
         </el-button>
-        <el-button
+        <el-dropdown
           v-if="!isRecycleBin && canManageSelectedProject"
-          :icon="Refresh"
-          :disabled="!selectedProjectId"
-          @click="router.push(`/projects/${selectedProjectId}`)"
+          trigger="click"
+          @command="router.push('/projects/' + selectedProjectId)"
         >
-          项目副本补同步
-        </el-button>
-        <el-button v-if="!isRecycleBin" :icon="Download" :disabled="selectedRows.length === 0" @click="batchDownload">
-          批量下载
-        </el-button>
-        <el-button
-          v-if="!isRecycleBin"
-          type="danger"
-          :icon="Delete"
-          :disabled="!canManageSelectedRows"
-          @click="batchRecycle"
-        >
-          批量删除
-        </el-button>
-        <el-button
-          v-if="!isRecycleBin"
-          :disabled="!canManageSelectedRows"
-          @click="openBatchMoveDialog"
-        >
-          批量移动
-        </el-button>
-        <el-button
-          v-if="!isRecycleBin"
-          :disabled="!canManageSelectedRows"
-          @click="openBatchCopyDialog"
-        >
-          批量复制
-        </el-button>
-        <el-button
-          v-if="isRecycleBin"
-          :icon="Back"
-          :disabled="!canManageSelectedRows"
-          @click="batchRestore"
-        >
-          批量恢复
-        </el-button>
-        <el-button
-          v-if="isRecycleBin"
-          type="danger"
-          :icon="Delete"
-          :disabled="!canManageSelectedRows"
-          @click="batchPurge"
-        >
-          批量彻底删除
-        </el-button>
+          <el-button :icon="MoreFilled" :disabled="!selectedProjectId" aria-label="更多项目操作" />
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="sync">项目副本补同步</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-button v-if="isRecycleBin" :icon="Back" @click="goFiles">返回文件管理</el-button>
       </div>
     </div>
+
+    <section class="surface surface-body file-search" aria-label="文件筛选">
+      <div class="toolbar filters">
+        <el-select
+          v-model="selectedProjectId"
+          filterable
+          clearable
+          placeholder="全部项目"
+          aria-label="选择项目"
+          class="filter-project"
+          @change="handleProjectFilterChange"
+        >
+          <el-option label="全部项目" value="" />
+          <el-option
+            v-for="project in projects"
+            :key="project.id"
+            :label="project.name"
+            :value="project.id"
+          />
+        </el-select>
+        <el-input
+          v-model="filters.keyword"
+          clearable
+          placeholder="文件名、备注、标签"
+          aria-label="搜索文件名、备注或标签"
+          class="filter-keyword"
+          :prefix-icon="Search"
+          @keyup.enter="reloadFirstPage"
+          @clear="reloadFirstPage"
+        />
+        <el-button class="file-search-button" @click="reloadFirstPage">搜索</el-button>
+        <el-button class="file-refresh-button" :icon="Refresh" aria-label="刷新" title="刷新" @click="reload" />
+      </div>
+
+      <el-collapse class="advanced-filters">
+        <el-collapse-item title="高级过滤" name="advanced">
+          <div class="toolbar">
+            <el-input
+              v-model="filters.tag"
+              clearable
+              placeholder="标签" aria-label="按标签筛选"
+              class="filter-tag"
+              @keyup.enter="reloadFirstPage"
+            />
+            <el-input
+              v-model="filters.extension"
+              clearable
+              placeholder="扩展名" aria-label="按扩展名筛选"
+              class="filter-ext"
+              @keyup.enter="reloadFirstPage"
+            />
+            <el-select
+              v-model="filters.category"
+              clearable
+              placeholder="类型" aria-label="按文件类型筛选"
+              class="filter-select"
+              @change="reloadFirstPage"
+            >
+              <el-option
+                v-for="item in categoryOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-select
+              v-model="filters.cdnProvider"
+              clearable
+              placeholder="存储" aria-label="按存储筛选"
+              class="filter-select"
+              @change="reloadFirstPage"
+            >
+              <el-option
+                v-for="provider in storageProviderOptions"
+                :key="provider"
+                :label="provider === 'LOCAL' ? '本地' : provider"
+                :value="provider"
+              />
+            </el-select>
+            <el-checkbox v-model="filters.duplicateOnly" @change="reloadFirstPage">重复文件</el-checkbox>
+
+            <el-input-number
+              v-model="filters.minSizeMb"
+              :min="0"
+              :precision="1"
+              controls-position="right"
+              placeholder="最小 MB" aria-label="最小文件大小，MB"
+              class="size-input"
+            />
+            <el-input-number
+              v-model="filters.maxSizeMb"
+              :min="0"
+              :precision="1"
+              controls-position="right"
+              placeholder="最大 MB" aria-label="最大文件大小，MB"
+              class="size-input"
+            />
+            <el-date-picker
+              v-model="filters.dateRange"
+              type="daterange"
+              unlink-panels
+              start-placeholder="开始日期"
+              end-placeholder="结束日期"
+              value-format="YYYY-MM-DD"
+            />
+          </div>
+        </el-collapse-item>
+      </el-collapse>
+    </section>
 
     <section class="surface">
       <div class="surface-body files-layout" :class="{ 'has-folder': showFolderPane }">
         <aside v-if="showFolderPane" class="folder-pane">
           <div class="folder-pane-head">
-            <span>目录</span>
-            <el-button link type="primary" @click="selectFolder('')">根目录</el-button>
+            <el-button
+              class="folder-toggle"
+              text
+              :aria-expanded="folderPaneOpen"
+              aria-controls="folder-directory"
+              @click="folderPaneOpen = !folderPaneOpen"
+            >
+              <el-icon><FolderOpened /></el-icon>项目目录<el-icon
+                :class="{ expanded: folderPaneOpen }"
+                ><ArrowDown /></el-icon>
+            </el-button>
+            <span class="folder-pane-title">项目目录</span>
           </div>
-          <el-tree
-            v-loading="foldersLoading"
-            :data="folderTree"
-            node-key="path"
-            :props="{ label: 'name', children: 'children' }"
-            highlight-current
-            :expand-on-click-node="false"
-            :current-node-key="filters.folderPath || ''"
-            @node-click="onFolderNodeClick"
-          >
-            <template #default="{ data }">
-              <span class="folder-node">
-                <span>{{ data.name }}</span>
-                <el-tag v-if="isFolderPublic(data.path)" size="small" type="success" effect="plain">公开</el-tag>
-                <span class="folder-count">{{ data.fileCount }}</span>
-                <el-dropdown
-                  v-if="canManageSelectedProject"
-                  trigger="click"
-                  @command="(cmd: string) => handleFolderCommand(cmd, data.path)"
-                >
-                  <el-button link type="primary" size="small" @click.stop>⋯</el-button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <el-dropdown-item command="create-child">新建子目录</el-dropdown-item>
-                      <el-dropdown-item command="delete-folder">删除空目录</el-dropdown-item>
-                      <el-dropdown-item command="public-on">设为公开（继承）</el-dropdown-item>
-                      <el-dropdown-item command="public-off">取消公开策略</el-dropdown-item>
-                      <el-dropdown-item command="batch-public">批量公开现有文件</el-dropdown-item>
-                      <el-dropdown-item command="batch-private">批量取消文件公开</el-dropdown-item>
-                      <el-dropdown-item command="folder-share">分享目录</el-dropdown-item>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
-              </span>
-            </template>
-          </el-tree>
-          <p v-if="canManageSelectedProject" class="muted">目录有文件时请先删除文件；有子目录时请先删除子目录。</p>
-        </aside>
-
-        <div class="files-main">
-        <div v-if="showFolderPane" class="breadcrumb-row">
-          <el-breadcrumb separator="/">
-            <el-breadcrumb-item>
-              <a href="javascript:;" @click.prevent="selectFolder('')">根目录</a>
-            </el-breadcrumb-item>
-            <el-breadcrumb-item v-for="seg in folderBreadcrumbs" :key="seg.path">
-              <a href="javascript:;" @click.prevent="selectFolder(seg.path)">{{ seg.name }}</a>
-            </el-breadcrumb-item>
-          </el-breadcrumb>
-        </div>
-        <div class="toolbar filters">
-          <el-select
-            v-model="selectedProjectId"
-            filterable
-            clearable
-            placeholder="全部项目"
-            class="filter-project"
-            @change="handleProjectFilterChange"
-          >
-            <el-option label="全部项目" value="" />
-            <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
-          </el-select>
-          <el-input
-            v-model="filters.keyword"
-            clearable
-            placeholder="文件名、备注、标签"
-            class="filter-keyword"
-            :prefix-icon="Search"
-            @keyup.enter="reloadFirstPage"
-            @clear="reloadFirstPage"
-          />
-          <el-input
-            v-model="filters.tag"
-            clearable
-            placeholder="标签"
-            class="filter-tag"
-            @keyup.enter="reloadFirstPage"
-          />
-          <el-input
-            v-model="filters.extension"
-            clearable
-            placeholder="扩展名"
-            class="filter-ext"
-            @keyup.enter="reloadFirstPage"
-          />
-          <el-select
-            v-model="filters.category"
-            clearable
-            placeholder="类型"
-            class="filter-select"
-            @change="reloadFirstPage"
-          >
-            <el-option v-for="item in categoryOptions" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-          <el-select
-            v-model="filters.cdnProvider"
-            clearable
-            placeholder="存储"
-            class="filter-select"
-            @change="reloadFirstPage"
-          >
-            <el-option v-for="provider in storageProviderOptions" :key="provider" :label="provider === 'LOCAL' ? '本地' : provider" :value="provider" />
-          </el-select>
-          <el-checkbox v-model="filters.duplicateOnly" @change="reloadFirstPage">重复文件</el-checkbox>
-          <el-button :icon="Refresh" @click="reload">刷新</el-button>
-        </div>
-
-        <div v-if="!isRecycleBin && canManageSelectedProject" class="upload-options">
-          <el-select v-model="uploadStrategy" style="width: 320px">
-            <el-option label="禁止重复（默认，内容相同则拒绝）" value="reject" />
-            <el-option label="同名覆盖（保持直链/分享）" value="replace" />
-            <el-option label="秒传复用（内容相同则复用已有）" value="reuse" />
-          </el-select>
-          <el-select
-            v-if="uploadStrategy === 'replace'"
-            v-model="replaceTargetFileId"
-            clearable
-            filterable
-            remote
-            reserve-keyword
-            :remote-method="searchReplaceTargets"
-            :loading="replaceTargetLoading"
-            placeholder="可选：搜索并指定要覆盖的目标文件"
-            style="width: 360px"
-          >
-            <el-option
-              v-for="file in replaceTargetOptions"
-              :key="file.id"
-              :label="`${file.originalName}（${file.folderPath || '/'}）`"
-              :value="file.id"
-            />
-          </el-select>
-          <el-button
-            v-if="uploadStrategy === 'replace'"
-            type="primary"
-            plain
-            :disabled="uploading"
-            @click="triggerReplaceUpload"
-          >
-            选择文件覆盖
-          </el-button>
-          <span class="upload-hint">
-            {{
-              replaceTargetFileId
-                ? '覆盖指定记录：fileId/直链/分享不变；即使上传不同文件名也会覆盖并更新名称'
-                : uploadStrategy === 'replace'
-                  ? '按同名+当前目录覆盖；行内「上传覆盖」可对不同文件名强制覆盖并改名'
-                  : uploadStrategy === 'reuse'
-                    ? '内容相同则直接返回已有文件'
-                    : '内容重复时拒绝上传'
-            }}
-          </span>
-        </div>
-
-        <div
-          v-if="!isRecycleBin && canManageSelectedProject"
-          class="drop-zone"
-          :class="{ 'is-dragging': isDragging, 'is-disabled': !selectedProjectId || uploading }"
-          @dragenter.prevent="handleDragEnter"
-          @dragover.prevent="handleDragOver"
-          @dragleave.prevent="handleDragLeave"
-          @drop.prevent="handleDrop"
-          @click="selectedProjectId && !uploading && fileInputRef?.click()"
-        >
-          <el-icon class="drop-icon"><Upload /></el-icon>
-          <div class="drop-title">拖拽文件到此处上传</div>
-          <div class="drop-subtitle">
-            {{ selectedProjectId ? '也可点击选择文件；支持多文件' : '请先选择项目' }}
-          </div>
-        </div>
-
-        <el-collapse class="advanced-filters">
-          <el-collapse-item title="高级过滤" name="advanced">
-            <div class="toolbar">
-              <el-input-number
-                v-model="filters.minSizeMb"
-                :min="0"
-                :precision="1"
-                controls-position="right"
-                placeholder="最小 MB"
-                class="size-input"
-              />
-              <el-input-number
-                v-model="filters.maxSizeMb"
-                :min="0"
-                :precision="1"
-                controls-position="right"
-                placeholder="最大 MB"
-                class="size-input"
-              />
-              <el-date-picker
-                v-model="filters.dateRange"
-                type="daterange"
-                unlink-panels
-                start-placeholder="开始日期"
-                end-placeholder="结束日期"
-                value-format="YYYY-MM-DD"
-              />
-            </div>
-          </el-collapse-item>
-        </el-collapse>
-
-        <div v-if="uploading" class="upload-controls">
-          <div class="toolbar">
-            <span>上传项目：{{ uploadQueueState.projectName || uploadQueueState.projectId }}</span>
-            <el-tag v-if="uploadQueueState.paused" type="warning">上传已暂停</el-tag>
-            <el-button v-if="!uploadQueueState.paused" @click="pauseUploadQueue()">暂停上传</el-button>
-            <el-button v-else type="primary" @click="resumeUploadQueue">继续上传</el-button>
-            <el-button @click="cancelUploadQueue">取消上传</el-button>
-            <span class="muted">暂停或取消在当前请求完成后生效；页面内切换可继续上传。</span>
-          </div>
-          <el-alert v-if="uploadQueueState.error" :title="uploadQueueState.error" type="warning" :closable="false" style="margin-top: 8px" />
-          <el-progress :percentage="uploadProgress" class="upload-progress" />
-        </div>
-
-        <section v-if="uploadResults.files.length" class="upload-results">
-          <div class="toolbar"><strong>本次上传结果</strong><span class="muted">{{ uploadResults.projectName || uploadResults.projectId }} · 已提交或复用 {{ uploadResults.files.length }} 个文件</span><el-button size="small" :loading="uploadResultsLoading" @click="loadUploadResultStorage">刷新副本</el-button></div>
-          <p class="muted">上传提交或已有文件复用已完成；本地保存结果以实际副本校验状态为准，选中的云存储在后台同步。点击详情可查看每个存储的状态。</p>
-          <el-table :data="visibleUploadResults" row-key="id" size="small">
-            <el-table-column prop="originalName" label="文件名" min-width="180" show-overflow-tooltip />
-            <el-table-column label="本地保存" min-width="145"><template #default="{ row }">{{ localReplicaResult(storageLocations(row)) }}</template></el-table-column>
-            <el-table-column label="存储状态" min-width="300"><template #default="{ row }"><StorageLocationTags :locations="storageLocations(row)" :error="uploadResultsError" @open="openStorageDetails(row)" /></template></el-table-column>
-            <el-table-column label="操作" width="95"><template #default="{ row }"><el-button link type="primary" @click="openStorageDetails(row)">详情</el-button></template></el-table-column>
-          </el-table>
-          <el-pagination v-model:current-page="uploadResultPage" :page-size="20" :total="uploadResults.files.length" layout="total, prev, pager, next" @current-change="loadUploadResultStorage" />
-        </section>
-
-        <section v-if="downloadResults.length" class="upload-results download-results">
-          <div class="toolbar"><strong>本次页面下载记录</strong><span class="muted">云存储按优先级依次尝试，失败或无可用云副本时使用本地。</span></div>
-          <el-table :data="downloadResults" size="small">
-            <el-table-column prop="name" label="文件名" min-width="180" show-overflow-tooltip />
-            <el-table-column label="实际下载平台／切换详情" min-width="340"><template #default="{ row }"><DownloadStorageInfo :source="row.source" /></template></el-table-column>
-            <el-table-column prop="time" label="时间" width="180" />
-          </el-table>
-        </section>
-
-        <el-table
-          v-loading="loading"
-          :data="pageResult.items"
-          row-key="id"
-          class="data-table"
-          @selection-change="handleSelectionChange"
-        >
-          <el-table-column type="selection" width="48" />
-          <el-table-column prop="originalName" label="文件名" min-width="300" show-overflow-tooltip>
-            <template #default="{ row }">
-              <div class="file-name">
-                <img
-                  v-if="row.thumbnailUrl"
-                  :src="fileAccessSource(row.thumbnailUrl)"
-                  :alt="row.originalName"
-                  class="thumb"
-                  @error="handleThumbError(row)"
-                />
-                <el-icon v-else><Document /></el-icon>
-                <div class="file-main">
-                  <div class="file-title">
-                    <span>{{ row.originalName }}</span>
-                    <el-tag v-if="row.isPublic" type="success" size="small">公开</el-tag>
-                    <el-tag v-if="row.duplicate" type="warning" size="small">重复</el-tag>
-                  </div>
-                  <div class="file-meta">
-                    <span>{{ row.folderPath || '/' }}</span>
-                    <span v-if="row.remark">{{ row.remark }}</span>
-                  </div>
-                </div>
-              </div>
-            </template>
-          </el-table-column>
-          <el-table-column v-if="!selectedProjectId" label="项目" min-width="150" show-overflow-tooltip>
-            <template #default="{ row }">
-              {{ row.projectName || row.projectId }}
-            </template>
-          </el-table-column>
-          <el-table-column label="标签" min-width="160">
-            <template #default="{ row }">
-              <div class="tag-line">
-                <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
-                <span v-if="row.tags.length === 0" class="muted">-</span>
-              </div>
-            </template>
-          </el-table-column>
-          <el-table-column prop="category" label="类型" width="110">
-            <template #default="{ row }">
-              <el-tag>{{ categoryLabel(row.category) }}</el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="大小" width="120">
-            <template #default="{ row }">{{ formatSize(row.size) }}</template>
-          </el-table-column>
-          <el-table-column v-if="!isRecycleBin" label="版本" width="80">
-            <template #default="{ row }">v{{ row.currentVersion || 1 }}</template>
-          </el-table-column>
-          <el-table-column v-if="isRecycleBin" label="清理方式" width="160">
-            <template #default>确认彻底删除后清理</template>
-          </el-table-column>
-          <el-table-column label="存储位置" min-width="280">
-            <template #default="{ row }">
-              <StorageLocationTags :locations="storageLocations(row)" :error="storageSummaryError" @open="openStorageDetails(row)" />
-            </template>
-          </el-table-column>
-          <el-table-column :label="isRecycleBin ? '删除时间' : '上传时间'" min-width="170">
-            <template #default="{ row }">
-              {{ formatTime(isRecycleBin ? row.deletedAt || row.updatedAt : row.createdAt) }}
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" fixed="right" min-width="280" width="300">
-            <template #default="{ row }">
-              <div class="table-actions">
-                <template v-if="!isRecycleBin">
-                  <el-button link type="primary" :disabled="!row.previewable" @click="openPreview(row)">预览</el-button>
-                  <el-button link type="primary" :loading="downloadingIds.has(row.id)" @click="download(row)">
-                    下载
-                  </el-button>
-                  <el-button link type="primary" @click="openStorageDetails(row)">详情</el-button>
-                  <el-button v-if="canManageFile(row)" link type="primary" @click="openEditDialog(row)">
-                    编辑
-                  </el-button>
-                  <el-button v-if="canManageFile(row) && row.textEditable" link type="primary" @click="contentFile = row">编辑内容</el-button>
-                  <el-button v-if="canManageFile(row)" link type="primary" @click="openShareDialog(row)">
-                    分享
-                  </el-button>
+          <div id="folder-directory" :class="['folder-directory', { 'is-open': folderPaneOpen }]">
+            <el-alert v-if="foldersError" title="目录加载失败" type="error" :closable="false">
+              <el-button link type="primary" @click="reload">重新加载目录</el-button>
+            </el-alert>
+            <el-tree
+              v-loading="foldersLoading"
+              :data="folderTree"
+              node-key="path"
+              :props="{ label: 'name', children: 'children' }"
+              highlight-current
+              :expand-on-click-node="false"
+              :current-node-key="filters.folderPath || ''"
+              @node-click="onFolderNodeClick"
+            >
+              <template #default="{ data }">
+                <span class="folder-node">
+                  <span>{{ data.name }}</span>
+                  <el-tag
+                    v-if="isFolderPublic(data.path)"
+                    size="small"
+                    type="success"
+                    effect="plain"
+                    >公开</el-tag>
+                  <span class="folder-count">{{ data.fileCount }}</span>
                   <el-dropdown
-                    v-if="canManageFile(row)"
+                    v-if="canManageSelectedProject"
                     trigger="click"
-                    @command="(cmd: string) => handleFileCommand(cmd, row)"
+                    @command="(cmd: string) => handleFolderCommand(cmd, data.path)"
                   >
-                    <el-button link type="primary">更多</el-button>
+                    <el-button
+                      link
+                      type="primary"
+                      size="small"
+                      :aria-label="data.name + '目录操作'"
+                      @click.stop
+                      >⋯</el-button>
                     <template #dropdown>
                       <el-dropdown-menu>
-                        <el-dropdown-item command="public">
-                          {{ row.isPublic ? '取消公开' : '公开（允许未授权域名）' }}
-                        </el-dropdown-item>
-                        <el-dropdown-item command="public-url">
-                          {{ row.isPublic ? '复制公开直链' : '复制直链' }}
-                        </el-dropdown-item>
-                        <el-dropdown-item v-if="row.status === 'ACTIVE'" command="versions">
-                          版本历史
-                        </el-dropdown-item>
-                        <el-dropdown-item command="replace">上传覆盖（直链不变）</el-dropdown-item>
-                        <el-dropdown-item command="move">移动</el-dropdown-item>
-                        <el-dropdown-item command="copy">复制</el-dropdown-item>
-                        <el-dropdown-item command="delete" divided>
-                          <span class="danger">删除</span>
-                        </el-dropdown-item>
+                        <el-dropdown-item command="create-child">新建子目录</el-dropdown-item>
+                        <el-dropdown-item command="delete-folder">删除空目录</el-dropdown-item>
+                        <el-dropdown-item command="public-on">设为公开（继承）</el-dropdown-item>
+                        <el-dropdown-item command="public-off">取消公开策略</el-dropdown-item>
+                        <el-dropdown-item command="batch-public">批量公开现有文件</el-dropdown-item>
+                        <el-dropdown-item command="batch-private">批量取消文件公开</el-dropdown-item>
+                        <el-dropdown-item command="folder-share">分享目录</el-dropdown-item>
                       </el-dropdown-menu>
                     </template>
                   </el-dropdown>
-                </template>
-                <template v-else-if="canManageFile(row)">
-                  <template v-if="row.status === 'RECYCLED'">
-                    <el-button link type="primary" @click="restore(row)">恢复</el-button>
-                    <el-button link type="danger" @click="purge(row)">彻底删除</el-button>
-                  </template>
-                </template>
-              </div>
-            </template>
-          </el-table-column>
-        </el-table>
+                </span>
+              </template>
+            </el-tree>
+            <p v-if="canManageSelectedProject" class="muted folder-hint">
+              目录非空时，请先清理文件和子目录。
+            </p>
+          </div>
+        </aside>
 
-        <div class="pagination-row">
-          <el-pagination
-            v-model:current-page="pageResult.page"
-            v-model:page-size="pageResult.pageSize"
-            :page-sizes="[10, 20, 50, 100]"
-            layout="total, sizes, prev, pager, next"
-            :total="pageResult.total"
-            @change="reload"
-          />
-        </div>
+        <div ref="filesMain" class="files-main">
+          <div v-if="showFolderPane" class="breadcrumb-row">
+            <el-breadcrumb separator="/" aria-label="当前目录">
+              <el-breadcrumb-item>
+                <el-button v-if="folderBreadcrumbs.length" link type="primary" @click="selectFolder('')">根目录</el-button>
+                <span v-else>根目录</span>
+              </el-breadcrumb-item>
+              <el-breadcrumb-item v-for="(seg, index) in folderBreadcrumbs" :key="seg.path">
+                <el-button v-if="index < folderBreadcrumbs.length - 1" link type="primary" @click="selectFolder(seg.path)">{{ seg.name }}</el-button>
+                <span v-else aria-current="location">{{ seg.name }}</span>
+              </el-breadcrumb-item>
+            </el-breadcrumb>
+          </div>
+
+          <button
+            v-if="!isRecycleBin && canManageSelectedProject"
+            type="button"
+            :disabled="!selectedProjectId || uploading"
+            class="drop-zone"
+            :class="{ 'is-dragging': isDragging }"
+            @dragenter.prevent="handleDragEnter"
+            @dragover.prevent="handleDragOver"
+            @dragleave.prevent="handleDragLeave"
+            @drop.prevent="handleDrop"
+            @click="selectedProjectId && !uploading && fileInputRef?.click()"
+          >
+            <el-icon class="drop-icon" aria-hidden="true"><Upload /></el-icon>
+            <span class="drop-copy">
+              <span class="drop-title">拖拽文件到此处上传</span>
+              <span class="drop-subtitle">也可点击选择多个文件</span>
+            </span>
+          </button>
+          <el-collapse v-if="!isRecycleBin && canManageSelectedProject" class="upload-settings">
+            <el-collapse-item title="上传设置" name="upload-settings">
+              <div class="upload-options">
+                <el-select
+                  v-model="uploadStrategy"
+                  class="upload-strategy"
+                  aria-label="重复文件处理方式"
+                >
+                  <el-option label="禁止重复（默认，内容相同则拒绝）" value="reject" />
+                  <el-option label="同名覆盖（保持直链/分享）" value="replace" />
+                  <el-option label="秒传复用（内容相同则复用已有）" value="reuse" />
+                </el-select>
+                <el-select
+                  v-if="uploadStrategy === 'replace'"
+                  v-model="replaceTargetFileId"
+                  clearable
+                  filterable
+                  remote
+                  reserve-keyword
+                  :remote-method="searchReplaceTargets"
+                  :loading="replaceTargetLoading"
+                  placeholder="可选：搜索并指定要覆盖的目标文件"
+                  class="upload-replace-target"
+                >
+                  <el-option
+                    v-for="file in replaceTargetOptions"
+                    :key="file.id"
+                    :label="`${file.originalName}（${file.folderPath || '/'}）`"
+                    :value="file.id"
+                  />
+                </el-select>
+                <el-button
+                  v-if="uploadStrategy === 'replace'"
+                  type="primary"
+                  plain
+                  :disabled="uploading"
+                  @click="triggerReplaceUpload"
+                >
+                  选择文件覆盖
+                </el-button>
+                <span class="upload-hint">
+                  {{
+                    replaceTargetFileId
+                      ? '覆盖指定文件并更新文件名，保留原有直链和分享。'
+                      : uploadStrategy === 'replace'
+                        ? '覆盖当前目录中的同名文件，保留原有直链和分享。'
+                        : uploadStrategy === 'reuse'
+                          ? '内容相同则直接返回已有文件'
+                          : '内容重复时拒绝上传'
+                  }}
+                </span>
+              </div>
+            </el-collapse-item>
+          </el-collapse>
+
+          <div v-if="uploading" class="upload-controls">
+            <div class="toolbar">
+              <span>上传项目：{{ uploadQueueState.projectName || uploadQueueState.projectId }}</span>
+              <el-tag v-if="uploadQueueState.paused" type="warning">上传已暂停</el-tag>
+              <el-button v-if="!uploadQueueState.paused" @click="pauseUploadQueue()">暂停上传</el-button>
+              <el-button v-else type="primary" @click="resumeUploadQueue">继续上传</el-button>
+              <el-button @click="cancelUploadQueue">取消上传</el-button>
+              <span class="muted">暂停或取消在当前请求完成后生效；页面内切换可继续上传。</span>
+            </div>
+            <el-alert
+              v-if="uploadQueueState.error"
+              :title="uploadQueueState.error"
+              type="warning"
+              :closable="false"
+              style="margin-top: 8px"
+            />
+            <el-progress :percentage="uploadProgress" class="upload-progress" />
+          </div>
+
+          <section v-if="uploadResults.files.length" class="upload-results">
+            <div class="toolbar">
+              <strong>本次上传结果</strong><span class="muted">{{ uploadResults.projectName || uploadResults.projectId }} · 已提交或复用
+                {{ uploadResults.files.length }} 个文件</span><el-button
+                size="small"
+                :loading="uploadResultsLoading"
+                @click="loadUploadResultStorage"
+                >刷新副本</el-button>
+            </div>
+            <p class="muted">
+              上传提交或已有文件复用已完成；本地保存结果以实际副本校验状态为准，选中的云存储在后台同步。点击详情可查看每个存储的状态。
+            </p>
+            <el-table :data="visibleUploadResults" row-key="id" size="small">
+              <el-table-column
+                prop="originalName"
+                label="文件名"
+                min-width="180"
+                show-overflow-tooltip
+              />
+              <el-table-column label="本地保存" min-width="145"><template #default="{ row }">{{
+                  localReplicaResult(storageLocations(row))
+                }}</template></el-table-column>
+              <el-table-column label="存储状态" min-width="300"><template #default="{ row }"><StorageLocationTags
+                    :locations="storageLocations(row)"
+                    :error="uploadResultsError"
+                    @open="openStorageDetails(row)"
+/></template></el-table-column>
+              <el-table-column label="操作" width="95"><template #default="{ row }"><el-button link type="primary" @click="openStorageDetails(row)">详情</el-button></template></el-table-column>
+            </el-table>
+            <el-pagination
+              v-model:current-page="uploadResultPage"
+              :page-size="20"
+              :total="uploadResults.files.length"
+              layout="total, prev, pager, next"
+              @current-change="loadUploadResultStorage"
+            />
+          </section>
+
+          <section v-if="downloadResults.length" class="upload-results download-results">
+            <div class="toolbar">
+              <strong>本次页面下载记录</strong><span class="muted">云存储按优先级依次尝试，失败或无可用云副本时使用本地。</span>
+            </div>
+            <el-table :data="downloadResults" size="small">
+              <el-table-column prop="name" label="文件名" min-width="180" show-overflow-tooltip />
+              <el-table-column label="实际下载平台／切换详情" min-width="340"><template #default="{ row }"><DownloadStorageInfo :source="row.source" /></template></el-table-column>
+              <el-table-column prop="time" label="时间" width="180" />
+            </el-table>
+          </section>
+
+          <div class="file-list-heading">
+            <div>
+              <h2>{{ isRecycleBin ? '已删除文件' : '文件列表' }}</h2>
+              <span role="status">共 {{ pageResult.total }} 个文件<span v-if="selectedRows.length">
+                  · 已选择 {{ selectedRows.length }} 项</span></span>
+            </div>
+            <el-button
+              v-if="selectedRows.length"
+              link
+              type="primary"
+              @click="fileTable?.clearSelection()"
+              >取消选择</el-button>
+          </div>
+          <div
+            v-if="selectedRows.length"
+            class="toolbar file-bulk-actions"
+            aria-label="所选文件操作"
+          >
+            <el-button v-if="!isRecycleBin" :icon="Download" @click="batchDownload">
+              批量下载
+            </el-button>
+            <el-button
+              v-if="!isRecycleBin"
+              type="danger"
+              :icon="Delete"
+              :disabled="!canManageSelectedRows"
+              @click="batchRecycle"
+            >
+              批量删除
+            </el-button>
+            <el-button
+              v-if="!isRecycleBin"
+              :disabled="!canManageSelectedRows"
+              @click="openBatchMoveDialog"
+            >
+              批量移动
+            </el-button>
+            <el-button
+              v-if="!isRecycleBin"
+              :disabled="!canManageSelectedRows"
+              @click="openBatchCopyDialog"
+            >
+              批量复制
+            </el-button>
+            <el-button
+              v-if="isRecycleBin"
+              :icon="Back"
+              :disabled="!canManageSelectedRows"
+              @click="batchRestore"
+            >
+              批量恢复
+            </el-button>
+            <el-button
+              v-if="isRecycleBin"
+              type="danger"
+              :icon="Delete"
+              :disabled="!canManageSelectedRows"
+              @click="batchPurge"
+            >
+              批量彻底删除
+            </el-button>
+          </div>
+          <el-alert v-if="filesError" class="files-error" type="error" :closable="false" show-icon>
+            <template #title>文件加载失败，请重试。</template>
+            <el-button link type="primary" @click="reload">重新加载文件</el-button>
+          </el-alert>
+          <p v-if="!pinFileActions && pageResult.items.length" class="table-scroll-hint">
+            横向滚动可查看其他列和文件操作
+          </p>
+
+          <el-table
+            ref="fileTable"
+            v-loading="loading"
+            :data="pageResult.items"
+            row-key="id"
+            class="data-table"
+            :aria-busy="loading"
+            :scrollbar-always-on="!pinFileActions"
+            :scrollbar-tabindex="pinFileActions ? undefined : 0"
+            :empty-text="
+              filesError
+                ? '文件加载失败'
+                : loading
+                  ? '正在加载文件…'
+                  : filters.keyword
+                    ? '没有找到匹配的文件'
+                    : isRecycleBin
+                      ? '回收站为空'
+                      : '暂无文件，请选择项目后上传'
+            "
+            @selection-change="handleSelectionChange"
+          >
+            <el-table-column type="selection" width="48" />
+            <el-table-column
+              prop="originalName"
+              label="文件名"
+              min-width="300"
+              show-overflow-tooltip
+            >
+              <template #default="{ row }">
+                <div class="file-name">
+                  <img
+                    v-if="row.thumbnailUrl"
+                    :src="fileAccessSource(row.thumbnailUrl)"
+                    :alt="row.originalName"
+                    class="thumb"
+                    @error="handleThumbError(row)"
+                  />
+                  <el-icon v-else><Document /></el-icon>
+                  <div class="file-main">
+                    <div class="file-title">
+                      <span>{{ row.originalName }}</span>
+                      <el-tag v-if="row.isPublic" type="success" size="small">公开</el-tag>
+                      <el-tag v-if="row.duplicate" type="warning" size="small">重复</el-tag>
+                    </div>
+                    <div class="file-meta">
+                      <span>{{ row.folderPath || '/' }}</span>
+                      <span v-if="row.remark">{{ row.remark }}</span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column
+              v-if="!selectedProjectId"
+              label="项目"
+              min-width="150"
+              show-overflow-tooltip
+            >
+              <template #default="{ row }">
+                {{ row.projectName || row.projectId }}
+              </template>
+            </el-table-column>
+            <el-table-column label="标签" min-width="160">
+              <template #default="{ row }">
+                <div class="tag-line">
+                  <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain">{{
+                    tag
+                  }}</el-tag>
+                  <span v-if="row.tags.length === 0" class="muted">-</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column prop="category" label="类型" width="110">
+              <template #default="{ row }">
+                <el-tag>{{ categoryLabel(row.category) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="大小" width="120">
+              <template #default="{ row }">{{ formatSize(row.size) }}</template>
+            </el-table-column>
+            <el-table-column v-if="!isRecycleBin" label="版本" width="80">
+              <template #default="{ row }">v{{ row.currentVersion || 1 }}</template>
+            </el-table-column>
+            <el-table-column v-if="isRecycleBin" label="清理方式" width="160">
+              <template #default>确认彻底删除后清理</template>
+            </el-table-column>
+            <el-table-column label="存储位置" min-width="280">
+              <template #default="{ row }">
+                <StorageLocationTags
+                  :locations="storageLocations(row)"
+                  :error="storageSummaryError"
+                  @open="openStorageDetails(row)"
+                />
+              </template>
+            </el-table-column>
+            <el-table-column :label="isRecycleBin ? '删除时间' : '上传时间'" min-width="170">
+              <template #default="{ row }">
+                {{ formatTime(isRecycleBin ? row.deletedAt || row.updatedAt : row.createdAt) }}
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" :fixed="pinFileActions ? 'right' : false" width="300">
+              <template #default="{ row }">
+                <div class="table-actions">
+                  <template v-if="!isRecycleBin">
+                    <el-button
+                      link
+                      type="primary"
+                      :disabled="!row.previewable"
+                      @click="openPreview(row)"
+                      >预览</el-button>
+                    <el-button
+                      link
+                      type="primary"
+                      :loading="downloadingIds.has(row.id)"
+                      @click="download(row)"
+                    >
+                      下载
+                    </el-button>
+                    <el-button link type="primary" @click="openStorageDetails(row)">详情</el-button>
+                    <el-button
+                      v-if="canManageFile(row)"
+                      link
+                      type="primary"
+                      @click="openEditDialog(row)"
+                    >
+                      编辑
+                    </el-button>
+                    <el-button
+                      v-if="canManageFile(row) && row.textEditable"
+                      link
+                      type="primary"
+                      @click="contentFile = row"
+                      >编辑内容</el-button>
+                    <el-button
+                      v-if="canManageFile(row)"
+                      link
+                      type="primary"
+                      @click="openShareDialog(row)"
+                    >
+                      分享
+                    </el-button>
+                    <el-dropdown
+                      v-if="canManageFile(row)"
+                      trigger="click"
+                      @command="(cmd: string) => handleFileCommand(cmd, row)"
+                    >
+                      <el-button link type="primary">更多</el-button>
+                      <template #dropdown>
+                        <el-dropdown-menu>
+                          <el-dropdown-item command="public">
+                            {{ row.isPublic ? '取消公开' : '公开（允许未授权域名）' }}
+                          </el-dropdown-item>
+                          <el-dropdown-item command="public-url">
+                            {{ row.isPublic ? '复制公开直链' : '复制直链' }}
+                          </el-dropdown-item>
+                          <el-dropdown-item v-if="row.status === 'ACTIVE'" command="versions">
+                            版本历史
+                          </el-dropdown-item>
+                          <el-dropdown-item command="replace">上传覆盖（直链不变）</el-dropdown-item>
+                          <el-dropdown-item command="move">移动</el-dropdown-item>
+                          <el-dropdown-item command="copy">复制</el-dropdown-item>
+                          <el-dropdown-item command="delete" divided>
+                            <span class="danger">删除</span>
+                          </el-dropdown-item>
+                        </el-dropdown-menu>
+                      </template>
+                    </el-dropdown>
+                  </template>
+                  <template v-else-if="canManageFile(row)">
+                    <template v-if="row.status === 'RECYCLED'">
+                      <el-button link type="primary" @click="restore(row)">恢复</el-button>
+                      <el-button link type="danger" @click="purge(row)">彻底删除</el-button>
+                    </template>
+                  </template>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <div class="pagination-row">
+            <el-pagination
+              v-model:current-page="pageResult.page"
+              v-model:page-size="pageResult.pageSize"
+              :page-sizes="[10, 20, 50, 100]"
+              layout="total, sizes, prev, pager, next"
+              :total="pageResult.total"
+              @change="reload"
+            />
+          </div>
         </div>
       </div>
     </section>
@@ -617,6 +805,7 @@
             <span class="share-form-section-title">已有分享</span>
             <span class="muted">共 {{ shareLinks.length }} 条</span>
           </div>
+          <TableViewport v-slot="{ pinActions }" label="文件分享列表">
           <el-table :data="shareLinks" row-key="id" size="small" empty-text="暂无分享，创建后显示在此">
             <el-table-column label="分享地址" min-width="280">
               <template #default="{ row }">
@@ -639,7 +828,7 @@
                 <el-tag :type="shareStatusMeta(row.status).type" size="small">{{ shareStatusMeta(row.status).label }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="220" fixed="right">
+            <el-table-column label="操作" width="220" :fixed="pinActions ? 'right' : false">
               <template #default="{ row }">
                 <el-button link type="primary" @click="copyText(row.url)">复制</el-button>
                 <el-button link type="primary" @click="copyText(row.downloadUrl)">直链</el-button>
@@ -648,6 +837,7 @@
               </template>
             </el-table-column>
           </el-table>
+          </TableViewport>
         </div>
       </div>
     </el-dialog>
@@ -713,6 +903,7 @@
       :title="versionsFile ? `版本历史 — ${versionsFile.originalName}` : '版本历史'"
       width="780px"
     >
+      <TableViewport v-slot="{ pinActions }" label="文件版本列表">
       <el-table v-loading="versionsLoading" :data="versions" row-key="id" size="small">
         <el-table-column label="版本" width="90">
           <template #default="{ row }">
@@ -737,7 +928,7 @@
         <el-table-column prop="remark" label="备注" min-width="120" show-overflow-tooltip>
           <template #default="{ row }">{{ row.remark || '-' }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="100" :fixed="pinActions ? 'right' : false">
           <template #default="{ row }">
             <el-button
               link
@@ -751,6 +942,7 @@
           </template>
         </el-table-column>
       </el-table>
+      </TableViewport>
       <template #footer>
         <el-button @click="versionsDialogVisible = false">关闭</el-button>
       </template>
@@ -759,8 +951,11 @@
 </template>
 
 <script setup lang="ts">
-import { Back, Delete, Document, Download, FolderAdd, Refresh, Search, Upload } from '@element-plus/icons-vue';
+import { ArrowDown, Back, Delete, Document, Download, FolderAdd, FolderOpened, MoreFilled, Refresh, Search, Upload } from '@element-plus/icons-vue';
+import { useElementSize } from '@vueuse/core';
+import TableViewport from '@/components/TableViewport.vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
+import type { TableInstance } from 'element-plus';
 import { computed, nextTick, onMounted, onBeforeUnmount, reactive, ref, toRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
@@ -782,6 +977,13 @@ const route = useRoute();
 const router = useRouter();
 const loading = ref(false);
 const foldersLoading = ref(false);
+const filesError = ref(false);
+const foldersError = ref(false);
+const folderPaneOpen = ref(false);
+const fileTable = ref<TableInstance>();
+const filesMain = ref<globalThis.HTMLElement>();
+const { width: filesMainWidth } = useElementSize(filesMain);
+const pinFileActions = computed(() => filesMainWidth.value >= 720);
 let readGeneration = 0;
 let readController: globalThis.AbortController | undefined;
 let targetController: globalThis.AbortController | undefined;
@@ -1140,6 +1342,8 @@ async function reload(): Promise<void> {
   const options = { signal: controller.signal };
   const current = () => generation === readGeneration && projectId === selectedProjectId.value && !controller.signal.aborted;
   loading.value = true;
+  filesError.value = false;
+  foldersError.value = false;
   // Each panel commits independently. Slow directory services never hold up files.
   if (projectId && !isRecycleBin.value) {
     foldersLoading.value = true;
@@ -1148,7 +1352,7 @@ async function reload(): Promise<void> {
     }).catch(() => {});
     void fileApi.listFolderTree(projectId, options).then(result => {
       if (current()) folderTree.value = result;
-    }).catch(() => {}).finally(() => { if (current()) foldersLoading.value = false; });
+    }).catch(() => { if (current()) foldersError.value = true; }).finally(() => { if (current()) foldersLoading.value = false; });
     void folderPublicApi.list(projectId, options).then(result => {
       if (current()) folderPublicPaths.value = new Set(result.filter(item => item.isPublic).map(item => item.folderPath || ''));
     }).catch(() => {});
@@ -1168,7 +1372,7 @@ async function reload(): Promise<void> {
     storageSummaryError.value = false;
     void fetchStorageSummaries(result.items, controller.signal, current).catch(() => { if (current()) storageSummaryError.value = true; });
   } catch {
-    // Consume rejected reads so Vue event handlers do not produce page errors.
+    if (current()) filesError.value = true;
   } finally {
     if (current()) loading.value = false;
   }
@@ -2375,9 +2579,20 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.upload-results { margin: 18px 0; padding: 16px; background: var(--el-fill-color-light); border: 1px solid var(--el-border-color-lighter); border-radius: 12px; }
-.upload-results > p { font-size: 12px; line-height: 1.7; }
-.upload-results .el-pagination { margin-top: 12px; }
+.upload-results {
+  margin: 18px 0;
+  padding: 16px;
+  background: var(--el-fill-color-light);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 12px;
+}
+.upload-results > p {
+  font-size: 12px;
+  line-height: 1.7;
+}
+.upload-results .el-pagination {
+  margin-top: 12px;
+}
 .hidden-input {
   display: none;
 }
@@ -2390,15 +2605,17 @@ onBeforeUnmount(() => {
 }
 
 .files-layout.has-folder {
-  grid-template-columns: 240px minmax(0, 1fr);
+  grid-template-columns: 200px minmax(0, 1fr);
 }
 
 .folder-pane {
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
-  padding: 10px;
-  min-height: 360px;
+  padding-inline-end: 16px;
+  border-inline-end: 1px solid var(--color-border);
   background: var(--el-fill-color-blank);
+}
+
+.folder-toggle.el-button {
+  display: none;
 }
 
 .folder-pane-head {
@@ -2414,7 +2631,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 8px;
   width: 100%;
-  padding-right: 4px;
+  padding-inline-end: 4px;
 }
 
 .folder-count {
@@ -2431,10 +2648,30 @@ onBeforeUnmount(() => {
   margin-bottom: 10px;
 }
 
-@media (max-width: 960px) {
+@container admin-page (max-width: 50rem) {
   .files-layout,
   .files-layout.has-folder {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .folder-pane {
+    padding: 0 0 12px;
+    border: 0;
+    border-block-end: 1px solid var(--color-border);
+  }
+  .folder-pane-head {
+    margin: 0;
+  }
+  .folder-pane-title {
+    display: none;
+  }
+  .folder-toggle.el-button {
+    display: inline-flex;
+  }
+  .folder-directory:not(.is-open) {
+    display: none;
+  }
+  .folder-directory {
+    padding-block-start: 12px;
   }
 }
 
@@ -2471,7 +2708,6 @@ onBeforeUnmount(() => {
   white-space: normal;
 }
 
-
 .upload-options {
   display: flex;
   flex-wrap: wrap;
@@ -2487,15 +2723,17 @@ onBeforeUnmount(() => {
 
 .drop-zone {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
+  gap: 16px;
+  width: 100%;
+  padding: 16px 20px;
   margin-top: 12px;
-  min-height: 120px;
+  min-height: 82px;
+  text-align: start;
+  font-family: inherit;
   border: 1px dashed var(--el-border-color);
   border-radius: 10px;
-  background: var(--el-fill-color-blank);
+  background: var(--el-fill-color-light);
   color: var(--el-text-color-regular);
   cursor: pointer;
   transition:
@@ -2504,14 +2742,14 @@ onBeforeUnmount(() => {
     color 0.15s ease;
 }
 
-.drop-zone:hover,
+.drop-zone:not(:disabled):hover,
 .drop-zone.is-dragging {
   border-color: var(--el-color-primary);
   background: var(--el-color-primary-light-9);
   color: var(--el-color-primary);
 }
 
-.drop-zone.is-disabled {
+.drop-zone:disabled {
   cursor: not-allowed;
   opacity: 0.6;
 }
@@ -2764,10 +3002,190 @@ onBeforeUnmount(() => {
   margin-left: 6px;
 }
 
-@media (max-width: 900px) {
+@container admin-page (max-width: 50rem) {
   .share-form-grid,
   .share-form-grid-wide {
     grid-template-columns: 1fr;
+  }
+}
+
+.file-search .filters {
+  gap: 10px;
+}
+.file-search .filter-keyword {
+  width: auto;
+  flex: 1 1 180px;
+}
+.file-search .filter-project {
+  width: 220px;
+  max-width: 100%;
+}
+.file-search-button.el-button {
+  padding-inline: 12px;
+}
+.file-refresh-button.el-button {
+  width: 34px;
+  flex: none;
+  padding: 0;
+}
+.file-search .advanced-filters {
+  margin-top: 14px;
+  border-bottom: 0;
+}
+.file-search :deep(.el-collapse-item__header) {
+  min-height: 30px;
+  height: auto;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.file-search :deep(.el-collapse-item__wrap) {
+  border-bottom: 0;
+}
+.file-search :deep(.el-collapse-item__content) {
+  padding-bottom: 0;
+  padding-top: 12px;
+}
+.file-search :deep(.el-date-editor) {
+  max-width: 100%;
+}
+.folder-toggle.el-button {
+  gap: 6px;
+  height: auto;
+  min-height: 36px;
+  padding-inline: 0;
+}
+.folder-toggle .expanded {
+  transform: rotate(180deg);
+}
+.folder-toggle :deep(> span) {
+  gap: 6px;
+}
+.folder-pane-title {
+  font-size: 13px;
+}
+.folder-hint {
+  margin-block: 20px 0;
+  font-size: 11px;
+  line-height: 1.7;
+}
+.folder-node {
+  min-width: 0;
+  align-items: center;
+}
+.folder-node > span:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.folder-pane :deep(.el-tree-node__content) {
+  min-height: 36px;
+  height: auto;
+}
+.folder-pane :deep(.el-tree) {
+  --el-tree-node-content-height: 36px;
+}
+.folder-node .el-button {
+  min-width: 24px;
+  min-height: 24px;
+}
+.file-list-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  margin-block-start: 16px;
+}
+.file-list-heading > div {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.file-list-heading h2 {
+  font-size: 15px;
+  margin: 0;
+  font-weight: 650;
+}
+.file-list-heading span {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.file-bulk-actions {
+  margin-block-start: 14px;
+  padding: 12px;
+  background: var(--color-primary-soft);
+  border-radius: var(--radius-control);
+}
+.files-error {
+  margin-block-start: 12px;
+}
+.upload-settings {
+  border-top: 0;
+}
+.upload-settings :deep(.el-collapse-item__header) {
+  height: auto;
+  min-height: 34px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.upload-settings :deep(.el-collapse-item__content) {
+  padding-bottom: 14px;
+}
+.upload-strategy {
+  width: min(100%, 320px);
+}
+.upload-replace-target {
+  width: min(100%, 360px);
+}
+.upload-options {
+  margin-top: 6px;
+}
+.drop-copy {
+  display: grid;
+  gap: 5px;
+}
+.table-scroll-hint {
+  margin-block: 10px 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.drop-title {
+  line-height: 1.5;
+}
+.drop-subtitle {
+  line-height: 1.5;
+}
+.files-main .breadcrumb-row {
+  overflow-x: auto;
+}
+.files-main .el-breadcrumb {
+  display: flex;
+  width: max-content;
+  max-width: 100%;
+  flex-wrap: wrap;
+  row-gap: 6px;
+  line-height: 1.5;
+}
+.pagination-row {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+@container admin-page (max-width: 30rem) {
+  .file-search .filter-project {
+    width: 100%;
+  }
+  .file-search .filter-keyword {
+    flex-basis: 110px;
+  }
+  .drop-zone {
+    padding: 14px;
+    gap: 12px;
+  }
+  .pagination-row {
+    justify-content: flex-start;
   }
 }
 </style>

@@ -27,7 +27,7 @@ function context() {
 }
 const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json', ...headers } });
 function fakeProvider(downloadDomain = 'download-fixture.aliyuncs.com', uploadDomain = 'upload-fixture.aliyuncs.com') {
-  const remote = new Map(); let nextId = 0, refreshes = 0, creates = 0, forbidden = false, emptyDelete = false, status = 'CONFIRMED';
+  const remote = new Map(), moves = [], deletes = []; let nextId = 0, refreshes = 0, creates = 0, forbidden = false, emptyDelete = false, status = 'CONFIRMED';
   const transport = async (input, init = {}) => {
     const url = new URL(input), body = typeof init.body === 'string' && init.body.startsWith('{') ? JSON.parse(init.body) : {};
     if (url.pathname === '/v2/oauth/authorize') return new Response('', { headers: { 'set-cookie': 'SESSIONID=fixture; Path=/; Secure; HttpOnly' } });
@@ -67,14 +67,21 @@ function fakeProvider(downloadDomain = 'download-fixture.aliyuncs.com', uploadDo
       return json({ ...item, upload_id: `upload-${nextId}`, part_info_list: (body.part_info_list || []).map(x => ({ ...x, upload_url: `https://${uploadDomain}/${file_id}` })) }, 201);
     }
     const item = remote.get(body.file_id);
-    if (url.pathname === '/v2/file/delete') { remote.delete(body.file_id); return emptyDelete ? new Response(null, { status: 204 }) : json({}); }
+    if (url.pathname === '/v2/file/delete') { deletes.push(body.file_id); remote.delete(body.file_id); return emptyDelete ? new Response(null, { status: 204 }) : json({}); }
     if (!item) return json({ code: 'NotFound.File' }, 404);
+    if (url.pathname === '/v3/file/move') {
+      assert.equal(body.drive_id, 'drive-one');
+      assert.equal(body.check_name_mode, 'refuse');
+      assert.equal(remote.get(body.to_parent_file_id)?.type, 'folder');
+      if ([...remote.values()].some(entry => entry.file_id !== item.file_id && entry.parent_file_id === body.to_parent_file_id && entry.name === item.name)) return json({ code: 'AlreadyExist.File' }, 409);
+      moves.push({ ...body }); item.parent_file_id = body.to_parent_file_id; return json(item);
+    }
     if (url.pathname === '/v2/file/get') return json(item);
     if (url.pathname === '/v2/file/complete') { item.status = 'available'; return json(item); }
     if (url.pathname === '/v2/file/get_download_url') return json({ url: `https://${downloadDomain}/${body.file_id}` });
     throw new Error(`unexpected route ${url.pathname}`);
   };
-  return { transport, remote, get refreshes() { return refreshes; }, get creates() { return creates; }, setForbidden(value) { forbidden = value; }, setEmptyDelete(value) { emptyDelete = value; }, setStatus(value) { status = value; } };
+  return { transport, remote, moves, deletes, get refreshes() { return refreshes; }, get creates() { return creates; }, setForbidden(value) { forbidden = value; }, setEmptyDelete(value) { emptyDelete = value; }, setStatus(value) { status = value; } };
 }
 async function login(adapter) {
   const session = await adapter.startLogin();
@@ -82,6 +89,136 @@ async function login(adapter) {
   assert.equal(result.status, 'CONFIRMED');
   return { session, account: result.account };
 }
+
+test('remote files can be listed across deployments without local object mappings and read with integrity checks', async () => {
+  const state = context(), remote = fakeProvider();
+  const adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'cloud', provider: 'ALIYUN_DRIVE', name: 'cloud', config: { accountId: account.accountId, driveId: 'drive-one', rootFolderId: 'root' } };
+  const bytes = Buffer.from('existing remote content');
+  remote.remote.set('folder', { file_id: 'folder', parent_file_id: 'root', name: '来自另一台服务器', type: 'folder', status: 'available' });
+  remote.remote.set('legacy', { file_id: 'legacy', parent_file_id: 'folder', name: '原有文件.txt', type: 'file', status: 'available', size: bytes.length, content_hash: crypto.createHash('sha1').update(bytes).digest('hex'), bytes });
+  const root = await adapter.listRemoteFiles(config, {});
+  assert.equal(root.items[0].name, '来自另一台服务器');
+  const page = await adapter.listRemoteFiles(config, { parentId: 'folder' });
+  assert.equal(page.items[0].name, '原有文件.txt');
+  const read = await adapter.readRemoteFile(config, 'legacy');
+  const chunks = [];
+  for await (const chunk of read.stream) chunks.push(Buffer.from(chunk));
+  assert.deepEqual(Buffer.concat(chunks), bytes);
+  assert.equal(read.name, '原有文件.txt');
+  remote.remote.get('legacy').bytes = Buffer.from('changed');
+  const damaged = await adapter.readRemoteFile(config, 'legacy');
+  await assert.rejects(async () => { for await (const _ of damaged.stream) { /* consume */ } }, /校验|大小/);
+});
+
+test('remote reads cannot escape configured folder, accept malformed IDs or expose provider URLs', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'cloud', provider: 'ALIYUN_DRIVE', name: 'cloud', config: { accountId: account.accountId, driveId: 'drive-one', rootFolderId: 'allowed' } };
+  remote.remote.set('allowed', { file_id: 'allowed', parent_file_id: 'root', name: 'allowed', type: 'folder', status: 'available' });
+  remote.remote.set('outside', { file_id: 'outside', parent_file_id: 'root', name: 'outside', type: 'folder', status: 'available' });
+  remote.remote.set('other', { file_id: 'other', parent_file_id: 'outside', name: 'private', type: 'file', status: 'available', size: 1 });
+  await assert.rejects(adapter.listRemoteFiles(config, { parentId: 'outside' }), /目录|范围/);
+  await assert.rejects(adapter.readRemoteFile(config, 'other'), /目录|范围/);
+  await assert.rejects(adapter.listRemoteFiles(config, { parentId: '../outside' }), /标识/);
+  assert.equal((await adapter.listRemoteFiles(config, {})).parentId, 'allowed');
+});
+
+test('new uploads keep portable names readable on a fresh deployment and remove their description with the object', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'cloud', provider: 'ALIYUN_DRIVE', name: 'cloud', config: { accountId: account.accountId, driveId: 'drive-one', rootFolderId: 'root' } };
+  const bytes = Buffer.from('portable content'), key = 'project/original/version.txt';
+  await adapter.upload(config, { key, buffer: bytes, originalName: '完整名称.txt', mimeType: 'text/plain' });
+  const folder = [...remote.remote.values()].find(item => item.type === 'folder');
+  const metadata = [...remote.remote.values()].find(item => item.name.endsWith('.ufm.json'));
+  assert.ok(metadata, 'portable metadata is uploaded beside the immutable object');
+  for (const stateKey of [...state.values.keys()]) if (stateKey.startsWith('object-') || stateKey.startsWith('folder-')) state.values.delete(stateKey);
+  const other = plugin().createAdapter(state, remote.transport);
+  const page = await other.listRemoteFiles(config, { parentId: folder.file_id });
+  assert.equal(page.items.length, 1);
+  assert.equal(page.items[0].originalName, '完整名称.txt');
+  assert.equal(page.items[0].storageKey, key);
+  assert.equal((await other.readRemoteFile(config, page.items[0].id)).name, '完整名称.txt');
+  await adapter.remove(config, key);
+  assert.equal([...remote.remote.values()].filter(item => item.type === 'file').length, 0);
+});
+
+test('remote downloads reject oversized objects before fetching their content', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'cloud', provider: 'ALIYUN_DRIVE', name: 'cloud', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  remote.remote.set('huge', { file_id: 'huge', parent_file_id: 'root', name: 'huge', type: 'file', status: 'available', size: 4096, content_hash: 'f'.repeat(40) });
+  await assert.rejects(adapter.readRemoteFile(config, 'huge', { maxBytes: 100 }), /大小上限/);
+});
+
+test('remote reads honor the host transfer deadline instead of a fixed two-minute timeout', async () => {
+  const state = context(), remote = fakeProvider();
+  const adapter = plugin().createAdapter(state, remote.transport), { account } = await login(adapter);
+  const config = { id: 'deadline', provider: 'ALIYUN_DRIVE', name: 'deadline', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const bytes = Buffer.from('slow transport');
+  remote.remote.set('slow', { file_id: 'slow', parent_file_id: 'root', type: 'file', name: 'slow.txt', status: 'available', size: bytes.length, content_hash: crypto.createHash('sha1').update(bytes).digest('hex'), bytes });
+  const timeout = AbortSignal.timeout, deadlines = [];
+  AbortSignal.timeout = milliseconds => { deadlines.push(milliseconds); return timeout(milliseconds); };
+  try {
+    const read = await adapter.readRemoteFile(config, 'slow', { timeoutMs: 123456 });
+    for await (const _ of read.stream) { /* consume */ }
+    assert.equal(deadlines.at(-1), 123456);
+  } finally { AbortSignal.timeout = timeout; }
+});
+
+test('retrying identical immutable bytes with a changed display name keeps its first portable description', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'rename', provider: 'ALIYUN_DRIVE', name: 'rename', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'immutable-version', buffer: Buffer.from('same bytes'), originalName: '原始名称.txt', mimeType: 'text/plain' };
+  await adapter.upload(config, params);
+  const count = remote.creates;
+  await adapter.upload(config, { ...params, originalName: '后来显示的名称.txt', mimeType: 'application/octet-stream' });
+  assert.equal(remote.creates, count);
+  for (const key of [...state.values.keys()]) if (key.startsWith('object-') || key.startsWith('folder-')) state.values.delete(key);
+  await plugin().createAdapter(state, remote.transport).upload(config, { ...params, originalName: '另一部署使用的名称.txt' });
+  assert.equal(remote.creates, count, 'fresh mappings verify and preserve the existing description');
+  const folder = [...remote.remote.values()].find(item => item.type === 'folder');
+  const page = await adapter.listRemoteFiles(config, { parentId: folder.file_id });
+  assert.equal(page.items[0].originalName, '原始名称.txt');
+});
+
+test('portable descriptions work across a page boundary and invalid names never replace object names', async () => {
+  const state = context(), remote = fakeProvider();
+  let paged = false, denyDescription = false;
+  const transport = async (url, init = {}) => {
+    const parsed = new URL(url);
+    const body = typeof init.body === 'string' && init.body.startsWith('{') ? JSON.parse(init.body) : {};
+    const description = [...remote.remote.values()].find(item => item.name.endsWith('.ufm.json'));
+    if (denyDescription && parsed.pathname === '/v2/file/get_download_url' && body.file_id === description?.file_id) return json({ code: 'Forbidden' }, 403);
+    if (paged && parsed.pathname === '/v2/file/list') {
+      const entries = [...remote.remote.values()].filter(item => item.parent_file_id === body.parent_file_id).sort((a, b) => a.name.localeCompare(b.name));
+      return json({ items: entries.slice(body.marker ? 1 : 0, body.marker ? 2 : 1), next_marker: !body.marker && entries.length > 1 ? 'page-2' : '' });
+    }
+    return remote.transport(url, init);
+  };
+  const adapter = plugin().createAdapter(state, transport), { account } = await login(adapter);
+  const config = { id: 'paged', provider: 'ALIYUN_DRIVE', name: 'paged', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  await adapter.upload(config, { key: 'paged-key', buffer: Buffer.from('bounded description'), originalName: '跨页名称.txt', mimeType: 'text/plain' });
+  const folder = [...remote.remote.values()].find(item => item.type === 'folder');
+  paged = true;
+  const first = await adapter.listRemoteFiles(config, { parentId: folder.file_id });
+  assert.equal(first.items[0].originalName, '跨页名称.txt');
+  assert.equal(first.nextCursor, 'page-2');
+  assert.deepEqual((await adapter.listRemoteFiles(config, { parentId: folder.file_id, cursor: first.nextCursor })).items, []);
+  denyDescription = true;
+  await assert.rejects(adapter.listRemoteFiles(config, { parentId: folder.file_id }), /Forbidden|403|权限/);
+  denyDescription = false;
+  const description = [...remote.remote.values()].find(item => item.name.endsWith('.ufm.json'));
+  const metadata = JSON.parse(description.bytes.toString()); metadata.originalName = '../../other.txt';
+  description.bytes = Buffer.from(JSON.stringify(metadata)); description.size = description.bytes.length;
+  description.content_hash = crypto.createHash('sha1').update(description.bytes).digest('hex');
+  const safe = await adapter.listRemoteFiles(config, { parentId: folder.file_id });
+  assert.equal(safe.items[0].originalName, undefined);
+  assert.equal((await adapter.readRemoteFile(config, safe.items[0].id)).name, safe.items[0].name);
+});
 
 test('QR login keeps credentials server-side, handles scanned/canceled/expired sessions and survives restart', async () => {
   const state = context(), remote = fakeProvider();
@@ -180,7 +317,8 @@ test('disk uploads read all chunks across a part boundary and reject changed sou
     assert.deepEqual(object.bytes, bytes);
     assert.equal(object.part_info_list.length, 2);
     await assert.rejects(adapter.uploadFile(config, { ...params, key: 'bad-key', checksum: '0'.repeat(64) }), /SHA256/);
-    assert.equal([...remote.remote.values()].filter(item => item.type === 'file').length, 1);
+    assert.equal([...remote.remote.values()].filter(item => item.type === 'file' && !item.name.endsWith('.ufm.json')).length, 1);
+    assert.equal([...remote.remote.values()].some(item => item.name === crypto.createHash('sha256').update('bad-key').digest('hex')), false);
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -229,7 +367,8 @@ test('resumes a persisted upload when remote metadata reports zero bytes until c
   failPart = false;
   const creates = remote.creates;
   await adapter.upload(config, params);
-  assert.equal(remote.creates, creates);
+  assert.equal(remote.creates, creates + 1, 'only the portable description is created after the upload resumes');
+  assert.equal([...remote.remote.values()].filter(item => item.type === 'file' && !item.name.endsWith('.ufm.json')).length, 1);
   assert.deepEqual(object.bytes, params.buffer);
   assert.equal(object.status, 'available');
 });
@@ -245,4 +384,241 @@ test('multipart upload accepts actual aliyundrive.net data hosts and rejects loo
       assert.deepEqual([...remote.remote.values()].find(item => item.type === 'file').bytes, params.buffer);
     } else await assert.rejects(adapter.upload(config, params), /传输地址无效/);
   }
+});
+
+function forgetObjectMappings(state) {
+  for (const key of [...state.values.keys()]) if (!key.startsWith('account-')) state.values.delete(key);
+}
+const checksumOf = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+
+test('project uploads use readable isolated root directories and hide validated project markers', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'projects', provider: 'ALIYUN_DRIVE', name: 'projects', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const first = { id: 'project-one', name: '设计/方案\\测试:*?"<>| .', refreshToken: 'marker-must-never-store-this' }, second = { id: 'project-two', name: first.name };
+  await adapter.upload(config, { key: 'first-project-key', buffer: Buffer.from('first'), originalName: '原图.txt', mimeType: 'text/plain', project: first, folderPath: '素材/草案' });
+  await adapter.upload(config, { key: 'second-project-key', buffer: Buffer.from('second'), originalName: '原图.txt', mimeType: 'text/plain', project: second, folderPath: '' });
+  const folders = [...remote.remote.values()].filter(item => item.type === 'folder');
+  assert.equal(folders.length, 2);
+  assert.equal(new Set(folders.map(item => item.name)).size, 2, 'same display names must not merge projects');
+  for (const folder of folders) {
+    assert.equal(folder.parent_file_id, 'root');
+    assert.match(folder.name, /^设计_方案_测试/);
+    assert.ok(!/[\\/:*?"<>|\x00-\x1f]/.test(folder.name));
+    const marker = [...remote.remote.values()].find(item => item.parent_file_id === folder.file_id && item.name === '.ufm-project.json');
+    assert.ok(marker, 'a portable project identity is stored in the folder');
+    assert.ok(marker.bytes.length <= 16 * 1024);
+    assert.ok(!/accessToken|refreshToken|privateKey/.test(marker.bytes.toString()));
+    const entries = await adapter.listRemoteFiles(config, { parentId: folder.file_id });
+    assert.equal(entries.items.length, 1);
+    assert.equal(entries.items[0].originalName, '原图.txt');
+    assert.equal(entries.items[0].project.id, JSON.parse(marker.bytes).project.id);
+    assert.ok(entries.items[0].folderPath === '素材/草案' || entries.items[0].folderPath === '');
+  }
+});
+
+test('project renames reuse their original folder after mapping loss without uploading another object', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'rename-project', provider: 'ALIYUN_DRIVE', name: 'rename', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'rename-project-key', buffer: Buffer.from('keep immutable bytes'), originalName: '首次名称.txt', mimeType: 'text/plain', project: { id: 'stable-id', name: '原项目名称' }, folderPath: '文档' };
+  await adapter.upload(config, params);
+  const folder = [...remote.remote.values()].find(item => item.type === 'folder'), creates = remote.creates;
+  forgetObjectMappings(state);
+  await plugin().createAdapter(state, remote.transport).upload(config, { ...params, originalName: '后来的名称.txt', project: { id: 'stable-id', name: '新项目名称' } });
+  assert.equal(remote.creates, creates, 'renaming a project must not create folders, content, or a second description');
+  assert.equal([...remote.remote.values()].filter(item => item.type === 'folder').length, 1);
+  const page = await adapter.listRemoteFiles(config, { parentId: folder.file_id });
+  assert.equal(page.items.length, 1);
+  assert.ok(page.items[0].project, 'the portable listing exposes project identity');
+  assert.equal(page.items[0].project.id, 'stable-id');
+  assert.equal(page.items[0].originalName, '首次名称.txt');
+});
+
+test('a verified legacy retry moves content and its description to a project with the same immutable identity', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'organize', provider: 'ALIYUN_DRIVE', name: 'organize', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const bytes = Buffer.from('legacy to organize'), params = { key: 'legacy-organize', buffer: bytes, originalName: '旧对象.txt', mimeType: 'text/plain' };
+  await adapter.upload(config, params);
+  const files = [...remote.remote.values()].filter(item => item.type === 'file'), ids = files.map(item => item.file_id);
+  forgetObjectMappings(state);
+  await plugin().createAdapter(state, remote.transport).upload(config, { ...params, project: { id: 'organize-project', name: '待归档项目' }, folderPath: '历史' });
+  const project = [...remote.remote.values()].find(item => item.type === 'folder' && item.name.startsWith('待归档项目'));
+  assert.ok(project);
+  assert.deepEqual(remote.moves.map(item => item.file_id).sort(), ids.sort());
+  assert.equal(remote.deletes.length, 0, 'organization must not delete cloud objects');
+  for (const file of files) assert.equal(file.parent_file_id, project.file_id);
+  assert.deepEqual(files.find(item => !item.name.endsWith('.ufm.json')).bytes, bytes);
+  const page = await adapter.listRemoteFiles(config, { parentId: project.file_id });
+  assert.equal(page.items[0].storageKey, params.key);
+  assert.equal(page.items[0].project.id, 'organize-project');
+  forgetObjectMappings(state);
+  const fresh = plugin().createAdapter(state, remote.transport);
+  assert.equal(await fresh.objectExists(config, params.key), true);
+  await fresh.verifyBackup(config, { key: params.key, size: bytes.length, checksum: checksumOf(bytes) });
+  await fresh.remove(config, params.key);
+  assert.ok(ids.every(id => !remote.remote.has(id)));
+  assert.equal(remote.remote.has(project.file_id), true);
+});
+
+test('failed project moves are visible and a later retry completes a partially moved legacy pair', async () => {
+  const state = context(), remote = fakeProvider(); let failDescriptionMove = true;
+  const transport = async (url, init = {}) => {
+    if (new URL(url).pathname === '/v3/file/move') {
+      const body = JSON.parse(init.body);
+      if (remote.remote.get(body.file_id)?.name.endsWith('.ufm.json') && failDescriptionMove) return json({ code: 'Forbidden' }, 403);
+    }
+    return remote.transport(url, init);
+  };
+  const adapter = plugin().createAdapter(state, transport), { account } = await login(adapter);
+  const config = { id: 'failed-move', provider: 'ALIYUN_DRIVE', name: 'move', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'failed-move-key', buffer: Buffer.from('retry migration'), originalName: '旧文件.txt', mimeType: 'text/plain' };
+  await adapter.upload(config, params);
+  const organized = { ...params, project: { id: 'retry-project', name: '重试项目' } };
+  await assert.rejects(adapter.upload(config, organized), /Forbidden|403|权限/);
+  assert.equal(remote.deletes.length, 0);
+  failDescriptionMove = false; forgetObjectMappings(state);
+  await plugin().createAdapter(state, transport).upload(config, organized);
+  const project = [...remote.remote.values()].find(item => item.type === 'folder' && item.name.startsWith('重试项目'));
+  assert.equal([...remote.remote.values()].filter(item => item.parent_file_id === project.file_id && item.type === 'file').length, 3);
+  assert.equal(remote.moves.length, 2);
+});
+
+test('fresh lookup rejects duplicate immutable names across managed project and legacy directories', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'duplicate', provider: 'ALIYUN_DRIVE', name: 'duplicate', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'duplicate-key', buffer: Buffer.from('ambiguous'), originalName: 'same.txt', mimeType: 'text/plain' };
+  await adapter.upload(config, params);
+  await adapter.upload(config, { key: 'separate', buffer: Buffer.from('other'), originalName: 'other.txt', mimeType: 'text/plain', project: { id: 'separate-project', name: '独立项目' } });
+  const object = [...remote.remote.values()].find(item => item.name === checksumOf(params.key));
+  const project = [...remote.remote.values()].find(item => item.type === 'folder' && item.name.startsWith('独立项目'));
+  assert.ok(project, 'project-scoped writes must create an isolated directory');
+  remote.remote.set('duplicate-object', { ...object, file_id: 'duplicate-object', parent_file_id: project.file_id });
+  forgetObjectMappings(state);
+  await assert.rejects(adapter.objectExists(config, params.key), /重复|歧义/);
+  await assert.rejects(adapter.remove(config, params.key), /重复|歧义/);
+  assert.equal(remote.deletes.length, 0);
+});
+
+test('unsafe project metadata and forged folders cannot redirect uploads or remote display paths', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'safe-path', provider: 'ALIYUN_DRIVE', name: 'safe', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'safe-key', buffer: Buffer.from('safe content'), originalName: 'safe.txt', mimeType: 'text/plain', project: { id: 'safe-project', name: '../项目' } };
+  for (const folderPath of ['../outside', '/absolute', 'a/../b', 'a\\b', 'a\0b']) await assert.rejects(adapter.upload(config, { ...params, folderPath }), /路径|目录/);
+  await assert.rejects(adapter.upload(config, { ...params, project: { id: '', name: '项目' } }), /项目/);
+  assert.equal(remote.creates, 0, 'reject unsafe upload context before any cloud write');
+  await adapter.upload(config, { ...params, folderPath: 'safe/child' });
+  const project = [...remote.remote.values()].find(item => item.type === 'folder');
+  const description = [...remote.remote.values()].find(item => item.name.endsWith('.ufm.json'));
+  const value = JSON.parse(description.bytes); value.folderPath = '../../escape';
+  description.bytes = Buffer.from(JSON.stringify(value)); description.size = description.bytes.length; description.content_hash = crypto.createHash('sha1').update(description.bytes).digest('hex');
+  const page = await adapter.listRemoteFiles(config, { parentId: project.file_id });
+  assert.equal(page.items[0].originalName, undefined);
+  assert.equal(page.items[0].folderPath, undefined);
+  const marker = [...remote.remote.values()].find(item => item.name === '.ufm-project.json');
+  marker.bytes = Buffer.from(JSON.stringify({ version: 1, kind: 'ufm-project', project: { id: 'other', name: 'forged' } }));
+  marker.size = marker.bytes.length; marker.content_hash = crypto.createHash('sha1').update(marker.bytes).digest('hex');
+  forgetObjectMappings(state);
+  const before = remote.creates;
+  await assert.rejects(adapter.upload(config, params), /目录|标记|项目/);
+  assert.equal(remote.creates, before, 'a conflicting folder is not adopted or overwritten');
+});
+
+test('project descriptions remain readable with a different local account identity on the same cloud root', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport);
+  const { account } = await login(adapter);
+  const config = { id: 'portable-project', provider: 'ALIYUN_DRIVE', name: 'portable', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'portable-project-key', buffer: Buffer.from('portable project'), originalName: '跨部署名称.txt', mimeType: 'text/plain', project: { id: 'portable-project', name: '跨部署项目' }, folderPath: '共享资料' };
+  await adapter.upload(config, params);
+  const folder = [...remote.remote.values()].find(item => item.type === 'folder');
+  const freshState = context(), fresh = plugin().createAdapter(freshState, remote.transport), other = await login(fresh);
+  assert.notEqual(other.account.accountId, account.accountId);
+  const otherConfig = { ...config, config: { ...config.config, accountId: other.account.accountId } };
+  const page = await fresh.listRemoteFiles(otherConfig, { parentId: folder.file_id });
+  assert.equal(page.items[0].originalName, '跨部署名称.txt');
+  assert.equal(page.items[0].folderPath, '共享资料');
+  await fresh.verifyBackup(otherConfig, { key: params.key, size: params.buffer.length, checksum: checksumOf(params.buffer) });
+  await fresh.upload(otherConfig, params);
+  assert.equal([...remote.remote.values()].filter(item => item.type === 'folder').length, 1);
+});
+
+test('verified project backups use metadata only with warm state', async () => {
+  const state = context(), remote = fakeProvider(); let forbidContent = false;
+  const transport = (url, init) => {
+    if (forbidContent && (new URL(url).hostname.startsWith('download-') || new URL(url).pathname.includes('get_download_url'))) throw new Error('Unexpected content download');
+    return remote.transport(url, init);
+  };
+  const adapter = plugin().createAdapter(state, transport), { account } = await login(adapter);
+  const config = { id: 'warm-project', provider: 'ALIYUN_DRIVE', name: 'warm', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'warm-project-key', buffer: Buffer.from('warm project'), originalName: 'warm.txt', mimeType: 'text/plain', project: { id: 'warm-project', name: '已验证项目' } };
+  await adapter.upload(config, params);
+  forbidContent = true;
+  await adapter.verifyBackup(config, { key: params.key, size: params.buffer.length, checksum: checksumOf(params.buffer) });
+});
+
+test('project uploads can retry without project context after state loss while keeping the original description', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport), { account } = await login(adapter);
+  const config = { id: 'without-project', provider: 'ALIYUN_DRIVE', name: 'without', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'without-project-key', buffer: Buffer.from('keep original context'), originalName: 'original.txt', mimeType: 'text/plain', project: { id: 'without-project', name: '保留项目' } };
+  await adapter.upload(config, params);
+  forgetObjectMappings(state);
+  const creates = remote.creates;
+  await adapter.upload(config, { ...params, project: undefined, originalName: 'later.txt' });
+  assert.equal(remote.creates, creates);
+});
+
+test('a partially uploaded legacy object is organized when resumed with verified project context', async () => {
+  const state = context(), remote = fakeProvider(); let failPart = true;
+  const transport = (url, init) => {
+    if (new URL(url).hostname === 'upload-fixture.aliyuncs.com' && failPart) return json({ code: 'PartRejected' }, 400);
+    if (new URL(url).pathname === '/v2/file/get_upload_url') {
+      const body = JSON.parse(init.body);
+      return json({ part_info_list: body.part_info_list.map(part => ({ ...part, upload_url: `https://upload-fixture.aliyuncs.com/${body.file_id}` })) });
+    }
+    return remote.transport(url, init);
+  };
+  const adapter = plugin().createAdapter(state, transport), { account } = await login(adapter);
+  const config = { id: 'resume-project', provider: 'ALIYUN_DRIVE', name: 'resume', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'resume-project-key', buffer: Buffer.from('resuming to project'), originalName: 'resume.txt', mimeType: 'text/plain' };
+  await assert.rejects(adapter.upload(config, params));
+  failPart = false;
+  await adapter.upload(config, { ...params, project: { id: 'resume-project', name: '继续上传项目' } });
+  const project = [...remote.remote.values()].find(item => item.type === 'folder' && item.name.startsWith('继续上传项目'));
+  const object = [...remote.remote.values()].find(item => item.name === checksumOf(params.key));
+  assert.equal(object.parent_file_id, project.file_id);
+  assert.equal(remote.moves.length, 1);
+});
+
+test('fresh lookup rejects repeated cursors and bound violations instead of deleting outside the configured root', async () => {
+  const state = context(), remote = fakeProvider(); let loop = false;
+  const transport = (url, init) => {
+    if (loop && new URL(url).pathname === '/v2/file/list') return json({ items: [], next_marker: 'repeated' });
+    return remote.transport(url, init);
+  };
+  const adapter = plugin().createAdapter(state, transport), { account } = await login(adapter);
+  const config = { id: 'ancestry', provider: 'ALIYUN_DRIVE', name: 'ancestry', config: { accountId: account.accountId, driveId: 'drive-one', rootFolderId: 'allowed' } };
+  remote.remote.set('allowed', { file_id: 'allowed', name: 'allowed', type: 'folder', status: 'available', parent_file_id: 'root' });
+  await adapter.upload(config, { key: 'ancestry-key', buffer: Buffer.from('inside only'), originalName: 'inside.txt', mimeType: 'text/plain', project: { id: 'ancestry-project', name: '范围项目' } });
+  const project = [...remote.remote.values()].find(item => item.type === 'folder' && item.name.startsWith('范围项目'));
+  project.parent_file_id = 'root';
+  await assert.rejects(adapter.remove(config, 'ancestry-key'), /范围|目录/);
+  assert.equal(remote.deletes.length, 0);
+  project.parent_file_id = 'allowed'; forgetObjectMappings(state); loop = true;
+  await assert.rejects(adapter.objectExists(config, 'ancestry-key'), /分页|游标/);
+});
+
+test('a fresh login can verify and remove legacy objects by key without the former local account identity', async () => {
+  const state = context(), remote = fakeProvider(), adapter = plugin().createAdapter(state, remote.transport), { account } = await login(adapter);
+  const config = { id: 'portable-legacy', provider: 'ALIYUN_DRIVE', name: 'legacy', config: { accountId: account.accountId, driveId: 'drive-one' } };
+  const params = { key: 'portable-legacy-key', buffer: Buffer.from('legacy portable object'), originalName: 'legacy.txt', mimeType: 'text/plain' };
+  await adapter.upload(config, params);
+  const fresh = plugin().createAdapter(context(), remote.transport), other = await login(fresh);
+  const otherConfig = { ...config, config: { ...config.config, accountId: other.account.accountId } };
+  assert.equal(await fresh.objectExists(otherConfig, params.key), true);
+  await fresh.verifyBackup(otherConfig, { key: params.key, size: params.buffer.length, checksum: checksumOf(params.buffer) });
+  await fresh.remove(otherConfig, params.key);
+  assert.equal([...remote.remote.values()].filter(item => item.type === 'file').length, 0);
 });

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 
+import { BackupModule } from '../backup/backup.module';
 import { ProjectsModule } from '../projects/projects.module';
 import { SearchModule } from '../search/search.module';
 import { SettingsModule } from '../settings/settings.module';
@@ -22,9 +23,11 @@ import { ShareIpAbuseService } from './share-ip-abuse.service';
 import { UploadCredentialController } from './upload-credential.controller';
 import { UploadCredentialService } from './upload-credential.service';
 import { UploadCredentialGuard } from './guards/upload-credential.guard';
+import { RemoteFilesController } from './remote-files.controller';
+import { RemoteFilesService } from './remote-files.service';
 
 @Module({
-  imports: [ProjectsModule, SettingsModule, StorageModule, TasksModule, SearchModule, AccessStatsModule],
+  imports: [ProjectsModule, SettingsModule, StorageModule, TasksModule, SearchModule, AccessStatsModule, BackupModule],
   controllers: [
     FilesController,
     PublicFilesController,
@@ -36,6 +39,7 @@ import { UploadCredentialGuard } from './guards/upload-credential.guard';
     PublicFolderSharesController,
     ShareIpAbuseController,
     DownloadStatsController,
+    RemoteFilesController,
   ],
   providers: [
     FilesService,
@@ -47,6 +51,7 @@ import { UploadCredentialGuard } from './guards/upload-credential.guard';
     ShareIpAbuseService,
     DownloadStatsService,
     FolderManagerService,
+    RemoteFilesService,
   ],
   exports: [
     FilesService,

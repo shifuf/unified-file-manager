@@ -1,90 +1,97 @@
 <template>
   <el-container class="admin-shell">
-    <el-aside class="admin-sidebar" width="232px">
-      <div class="brand">
-        <div class="brand-mark">U</div>
-        <div>
-          <div class="brand-name">统一文件管理</div>
-          <div class="brand-subtitle">Multi Project Files</div>
-        </div>
-      </div>
-
-      <el-menu :default-active="activePath" class="side-menu" @select="handleMenuSelect">
-        <el-menu-item v-for="item in menuItems" :key="item.path" :index="item.path">
-          <el-icon><component :is="item.icon" /></el-icon>
-          <span>{{ item.label }}</span>
-        </el-menu-item>
-      </el-menu>
+    <a class="skip-link" href="#main-content" @click.prevent="focusMain">跳到主要内容</a>
+    <el-aside class="admin-sidebar" width="var(--sidebar-width)">
+      <AdminNavigation :groups="menuGroups" :active-path="activePath" :version="versionCheck" />
     </el-aside>
 
     <el-container class="admin-content">
-      <el-header class="admin-header" height="64px">
+      <el-header class="admin-header" height="var(--admin-header-height)">
         <div class="header-left">
-          <el-button class="mobile-menu-button" :icon="MenuIcon" circle @click="mobileMenuVisible = true" />
+          <el-button
+            ref="mobileMenuButton"
+            class="mobile-menu-button"
+            :icon="MenuIcon"
+            aria-label="打开导航"
+            aria-haspopup="dialog"
+            :aria-expanded="mobileMenuVisible"
+            @click="mobileMenuVisible = true"
+          />
+          <el-breadcrumb
+            class="header-breadcrumb"
+            :separator-icon="ArrowRight"
+            aria-label="当前位置"
+          >
+            <el-breadcrumb-item class="workspace-crumb">管理控制台</el-breadcrumb-item>
+            <el-breadcrumb-item v-if="route.name === 'project-detail'" :to="{ path: '/projects' }">项目管理</el-breadcrumb-item>
+            <el-breadcrumb-item>{{ currentPageTitle }}</el-breadcrumb-item>
+          </el-breadcrumb>
         </div>
         <div class="header-right">
-          <el-popover placement="bottom-end" :width="360" trigger="click" @show="loadNotifications">
-            <template #reference>
-              <el-badge :value="unreadCount || undefined" :hidden="!unreadCount" class="notify-badge">
-                <el-button circle>通</el-button>
-              </el-badge>
+          <AdminNotifications />
+          <el-dropdown trigger="click" placement="bottom-end" @command="handleAccountCommand">
+            <el-button
+              class="account-trigger"
+              :aria-label="`账号菜单，${accountName}`"
+              :title="accountName"
+            >
+              <span class="account-avatar" aria-hidden="true">{{ avatarLetter }}</span>
+              <span class="account-name">{{ accountName }}</span>
+              <el-icon class="account-chevron" aria-hidden="true"><ArrowDown /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item disabled>
+                  {{ authStore.currentUser?.totpEnabled ? '二次验证已启用' : '二次验证未启用' }}
+                </el-dropdown-item>
+                <el-dropdown-item command="security" :icon="Key" divided>账号安全</el-dropdown-item>
+                <el-dropdown-item command="logout" :icon="SwitchButton">退出登录</el-dropdown-item>
+              </el-dropdown-menu>
             </template>
-            <div class="notify-panel">
-              <div class="notify-head">
-                <strong>通知</strong>
-                <el-button link type="primary" @click="markAllRead">全部已读</el-button>
-              </div>
-              <div v-if="notifications.length === 0" class="muted notify-empty">暂无通知</div>
-              <div
-                v-for="item in notifications"
-                :key="item.id"
-                class="notify-item"
-                :class="{ unread: !item.readAt }"
-                @click="openNotification(item)"
-              >
-                <div class="notify-title">{{ item.title }}</div>
-                <div v-if="item.body" class="notify-body">{{ item.body }}</div>
-                <div class="notify-time">{{ formatNotifyTime(item.createdAt) }}</div>
-              </div>
-            </div>
-          </el-popover>
-          <el-tooltip v-if="versionCheck" :content="versionTooltip" placement="bottom">
-            <el-tag v-if="versionCheck.updateAvailable" type="warning">发现新版本 {{ versionCheck.latestVersion }}</el-tag>
-            <el-tag v-else-if="versionCheck.state === 'available'" type="success">已是最新版本</el-tag>
-            <el-tag v-else-if="versionCheck.state === 'unavailable'" type="info">版本检查暂不可用</el-tag>
-          </el-tooltip>
-          <span class="user-name">{{ authStore.currentUser?.displayName }}</span>
-          <el-tag :type="authStore.currentUser?.totpEnabled ? 'success' : 'info'">
-            2FA {{ authStore.currentUser?.totpEnabled ? '已启用' : '未启用' }}
-          </el-tag>
-          <el-button :icon="Key" @click="openSecurityDialog">账号安全</el-button>
-          <el-button :icon="SwitchButton" @click="logout">退出</el-button>
+          </el-dropdown>
         </div>
       </el-header>
 
-      <el-main ref="mainContent" class="admin-main" @scroll="updateMainScroll">
-        <router-view />
+      <el-main
+        id="main-content"
+        ref="mainContent"
+        class="admin-main"
+        tabindex="-1"
+        aria-label="主要内容"
+        @scroll="updateMainScroll"
+      >
+        <div class="admin-page-frame">
+          <router-view />
+        </div>
       </el-main>
-      <el-button v-show="mainScrollTop > 240" class="back-to-top" type="primary" :icon="Top" aria-label="返回顶部" title="返回顶部" @click="scrollToTop">返回顶部</el-button>
+      <el-button
+        v-show="mainScrollTop > 240"
+        class="back-to-top"
+        type="primary"
+        :icon="Top"
+        aria-label="返回顶部"
+        @click="scrollToTop"
+        >返回顶部</el-button>
     </el-container>
 
-    <el-drawer v-model="mobileMenuVisible" direction="ltr" :with-header="false" size="280px" class="mobile-menu-drawer">
-      <div class="mobile-sidebar">
-        <div class="brand">
-          <div class="brand-mark">U</div>
-          <div>
-            <div class="brand-name">统一文件管理</div>
-            <div class="brand-subtitle">Multi Project Files</div>
-          </div>
-        </div>
-
-        <el-menu :default-active="activePath" class="side-menu" @select="handleMenuSelect">
-          <el-menu-item v-for="item in menuItems" :key="item.path" :index="item.path">
-            <el-icon><component :is="item.icon" /></el-icon>
-            <span>{{ item.label }}</span>
-          </el-menu-item>
-        </el-menu>
-      </div>
+    <el-drawer
+      v-model="mobileMenuVisible"
+      :direction="textDirection === 'rtl' ? 'rtl' : 'ltr'"
+      :with-header="false"
+      title="后台导航"
+      size="min(288px, 90%)"
+      body-class="mobile-navigation-body"
+      class="mobile-menu-drawer"
+      @closed="restoreMenuFocus"
+    >
+      <AdminNavigation
+        :groups="menuGroups"
+        :active-path="activePath"
+        :version="versionCheck"
+        closable
+        @select="handleMenuSelect"
+        @close="mobileMenuVisible = false"
+      />
     </el-drawer>
 
     <el-dialog v-model="securityDialogVisible" title="账号安全" width="620px">
@@ -97,10 +104,20 @@
         </div>
         <el-form label-position="top" class="password-form">
           <el-form-item label="当前密码">
-            <el-input v-model="passwordForm.currentPassword" type="password" show-password autocomplete="current-password" />
+            <el-input
+              v-model="passwordForm.currentPassword"
+              type="password"
+              show-password
+              autocomplete="current-password"
+            />
           </el-form-item>
           <el-form-item label="新密码">
-            <el-input v-model="passwordForm.newPassword" type="password" show-password autocomplete="new-password" />
+            <el-input
+              v-model="passwordForm.newPassword"
+              type="password"
+              show-password
+              autocomplete="new-password"
+            />
           </el-form-item>
           <el-button type="primary" :loading="passwordLoading" @click="changePassword">修改密码</el-button>
         </el-form>
@@ -110,7 +127,9 @@
         <div class="security-status">
           <div>
             <div class="section-title">二次验证</div>
-            <div class="muted">兼容 Google Authenticator、Microsoft Authenticator 等 TOTP 应用。</div>
+            <div class="muted">
+              兼容 Google Authenticator、Microsoft Authenticator 等 TOTP 应用。
+            </div>
           </div>
           <el-tag :type="authStore.currentUser?.totpEnabled ? 'success' : 'info'">
             {{ authStore.currentUser?.totpEnabled ? '已启用' : '未启用' }}
@@ -158,50 +177,97 @@
           </div>
           <el-form label-position="top" class="totp-form">
             <el-form-item label="Authenticator 验证码">
-              <el-input v-model="totpCode" maxlength="6" inputmode="numeric" placeholder="6 位数字" />
+              <el-input
+                v-model="totpCode"
+                maxlength="6"
+                inputmode="numeric"
+                placeholder="6 位数字"
+              />
             </el-form-item>
-            <el-button type="primary" :loading="totpLoading" :disabled="!totpSetup" @click="enableTotp">
+            <el-button
+              type="primary"
+              :loading="totpLoading"
+              :disabled="!totpSetup"
+              @click="enableTotp"
+            >
               验证并启用
             </el-button>
           </el-form>
         </template>
 
         <template v-else>
-          <el-alert type="warning" show-icon :closable="false" title="关闭二次验证前需要输入当前 Authenticator 验证码。" />
+          <el-alert
+            type="warning"
+            show-icon
+            :closable="false"
+            title="关闭二次验证前需要输入当前 Authenticator 验证码。"
+          />
           <el-form label-position="top" class="totp-form">
             <el-form-item label="Authenticator 验证码">
-              <el-input v-model="totpCode" maxlength="6" inputmode="numeric" placeholder="6 位数字" />
+              <el-input
+                v-model="totpCode"
+                maxlength="6"
+                inputmode="numeric"
+                placeholder="6 位数字"
+              />
             </el-form-item>
             <el-button type="danger" :loading="totpLoading" @click="disableTotp">验证并关闭</el-button>
           </el-form>
         </template>
 
         <el-divider />
-        <div class="security-status">
-          <div>
-            <div class="section-title">登录会话</div>
-            <div class="muted">可吊销其他设备上的会话。</div>
+        <section v-loading="sessionsLoading" class="sessions-section" aria-labelledby="login-sessions-title">
+          <div class="security-status">
+            <h3 id="login-sessions-title" class="section-title">登录会话</h3>
+            <el-button size="small" :loading="sessionsLoading" @click="loadSessions">刷新会话</el-button>
           </div>
-          <el-button size="small" @click="loadSessions">刷新</el-button>
-        </div>
-        <el-table v-loading="sessionsLoading" :data="sessions" size="small" row-key="id">
-          <el-table-column label="设备" min-width="180" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.userAgent || '-' }}</template>
-          </el-table-column>
-          <el-table-column prop="ip" label="IP" width="120" />
-          <el-table-column label="当前" width="70">
-            <template #default="{ row }">
-              <el-tag v-if="row.current" size="small" type="success">是</el-tag>
-              <span v-else class="muted">否</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="" width="70">
-            <template #default="{ row }">
-              <el-button v-if="!row.current" link type="danger" @click="revokeSession(row.id)">吊销</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-        <el-button style="margin-top: 8px" @click="revokeOtherSessions">吊销其他会话</el-button>
+          <p class="session-help muted">
+            浏览器和其他客户端的历史登录会保留到退出或到期。同一 IP 可能有多个会话，过期和已退出的会话不会显示。
+          </p>
+          <p v-if="!sessionsLoading && !hasCurrentSession" class="session-unconfirmed" role="status">
+            暂时无法确认当前会话，请刷新后重试。
+          </p>
+          <ul class="session-list" aria-label="登录会话">
+            <li v-for="session in sessions" :key="session.id" class="session-card">
+              <div class="session-heading">
+                <h4 class="session-device-label">{{ sessionDeviceLabel(session.userAgent) }}</h4>
+                <el-tag size="small" :type="session.current ? 'success' : 'info'">
+                  {{ session.current ? '当前会话' : '其他会话' }}
+                </el-tag>
+              </div>
+              <dl class="session-metadata">
+                <div>
+                  <dt>IP 地址</dt>
+                  <dd>{{ session.ip || '未知' }}</dd>
+                </div>
+                <div>
+                  <dt>登录时间</dt>
+                  <dd><time :datetime="session.createdAt">{{ sessionTime(session.createdAt) }}</time></dd>
+                </div>
+                <div>
+                  <dt>到期时间</dt>
+                  <dd><time :datetime="session.expiresAt">{{ sessionTime(session.expiresAt) }}</time></dd>
+                </div>
+              </dl>
+              <details class="session-details">
+                <summary>浏览器信息</summary>
+                <p class="session-user-agent">{{ session.userAgent || '客户端未提供浏览器信息。' }}</p>
+              </details>
+              <div v-if="!session.current" class="session-actions">
+                <el-button
+                  size="small"
+                  :disabled="!hasCurrentSession || sessionsLoading || sessionsRevoking"
+                  @click="revokeSession(session.id)"
+                >退出此会话</el-button>
+              </div>
+            </li>
+          </ul>
+          <el-button
+            :loading="sessionsRevoking"
+            :disabled="!hasCurrentSession || !hasOtherSessions || sessionsLoading"
+            @click="revokeOtherSessions"
+          >退出其他会话</el-button>
+        </section>
       </div>
     </el-dialog>
   </el-container>
@@ -209,69 +275,86 @@
 
 <script setup lang="ts">
 import {
-  Connection,
-  DataAnalysis,
-  Delete,
-  Files,
-  Folder,
-  FolderOpened,
-  Guide,
+  ArrowDown,
+  ArrowRight,
   Key,
-  Link,
-  List,
   Menu as MenuIcon,
-  Memo,
-  Monitor,
-  Setting,
   SwitchButton,
   Top,
-  Warning,
 } from '@element-plus/icons-vue';
+import { useMediaQuery, useTextDirection } from '@vueuse/core';
 import { ElMessage } from 'element-plus';
 import { toDataURL } from 'qrcode';
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { authApi, notificationApi, sessionApi, versionApi, type TotpSetupResult, type VersionCheckResult } from '@/api/modules';
+import {
+  authApi,
+  sessionApi,
+  versionApi,
+  type TotpSetupResult,
+  type VersionCheckResult,
+} from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import { copyText } from '@/utils/io';
 
+import AdminNavigation from './AdminNavigation.vue';
+import AdminNotifications from './AdminNotifications.vue';
+import { adminNavigation } from './admin-navigation';
+
 const versionCheck = ref<VersionCheckResult | null>(null);
-const versionTooltip = computed(() => versionCheck.value
-  ? `当前版本 ${versionCheck.value.currentVersion} · 最新版本 ${versionCheck.value.latestVersion ?? '未知'}`
-  : '版本检查');
 
 const route = useRoute();
 const router = useRouter();
 const mainContent = ref<{ $el: globalThis.HTMLElement } | null>(null);
 const mainScrollTop = ref(0);
-function updateMainScroll(event: Event): void { mainScrollTop.value = (event.target as globalThis.HTMLElement).scrollTop; }
-function scrollToTop(): void {
-  mainContent.value?.$el.scrollTo({ top: 0, behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+const mobileMenuButton = ref<{ $el: globalThis.HTMLButtonElement } | null>(null);
+const compactNavigation = useMediaQuery('(max-width: 56rem)');
+const textDirection = useTextDirection({ observe: true });
+const previousTitle = document.title;
+let navigatedFromMenu = false;
+const versionController = new globalThis.AbortController();
+function focusMain(): void {
+  if (!securityDialogVisible.value && !mobileMenuVisible.value) {
+    mainContent.value?.$el.focus({ preventScroll: true });
+  }
 }
-watch(() => route.path, async () => {
-  await nextTick();
-  mainContent.value?.$el.scrollTo({ top: 0, behavior: 'instant' });
-  mainScrollTop.value = 0;
-});
+function restoreMenuFocus(): void {
+  if (navigatedFromMenu) focusMain();
+  else mobileMenuButton.value?.$el.focus({ preventScroll: true });
+  navigatedFromMenu = false;
+}
+function updateMainScroll(event: Event): void {
+  mainScrollTop.value = (event.target as globalThis.HTMLElement).scrollTop;
+}
+function scrollToTop(): void {
+  mainContent.value?.$el.scrollTo({
+    top: 0,
+    behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+  });
+}
+watch(
+  () => route.path,
+  async () => {
+    await nextTick();
+    mainContent.value?.$el.scrollTo({ top: 0, behavior: 'instant' });
+    mainScrollTop.value = 0;
+    focusMain();
+  },
+);
 const authStore = useAuthStore();
 const securityDialogVisible = ref(false);
 const mobileMenuVisible = ref(false);
+watch(compactNavigation, (compact) => {
+  if (!compact && mobileMenuVisible.value) {
+    navigatedFromMenu = true;
+    mobileMenuVisible.value = false;
+  }
+});
 const totpLoading = ref(false);
 const passwordLoading = ref(false);
 const totpCode = ref('');
 const totpSetup = ref<TotpSetupResult | null>(null);
-const unreadCount = ref(0);
-const notifications = ref<
-  Array<{
-    id: string;
-    title: string;
-    body?: string | null;
-    href?: string | null;
-    readAt?: string | null;
-    createdAt: string;
-  }>
->([]);
 const sessions = ref<
   Array<{
     id: string;
@@ -283,42 +366,43 @@ const sessions = ref<
   }>
 >([]);
 const sessionsLoading = ref(false);
-let notifyTimer: ReturnType<typeof setInterval> | undefined;
+const sessionsRevoking = ref(false);
+const hasCurrentSession = computed(() => sessions.value.some((session) => session.current));
+const hasOtherSessions = computed(() => sessions.value.some((session) => !session.current));
 const totpQrCodeUrl = ref('');
 const passwordForm = reactive({
   currentPassword: '',
   newPassword: '',
 });
 const activePath = computed(() => (route.path.startsWith('/projects/') ? '/projects' : route.path));
-const menuItems = computed(() => {
-  const items = [
-    { path: '/dashboard', label: '概览', icon: DataAnalysis },
-    { path: '/projects', label: '项目管理', icon: Folder },
-    { path: '/files', label: '文件管理', icon: Files },
-    { path: '/recycle-bin', label: '回收站', icon: Delete },
-    { path: '/shares', label: '分享管理', icon: Link },
-    { path: '/developer-integration', label: '开发对接', icon: Guide },
-    { path: '/storage-configs', label: '存储配置', icon: Connection },
-    { path: '/tasks', label: '任务中心', icon: List },
-    { path: '/webhooks', label: '出站 Webhook', icon: Link },
-  ];
-
-  if (authStore.isSuperAdmin) {
-    items.push(
-      { path: '/audit-logs', label: '日志审计', icon: Memo },
-      { path: '/share-ip-abuse', label: 'IP 防刷', icon: Warning },
-      { path: '/system-health', label: '系统健康', icon: Monitor },
-      { path: '/backups', label: '备份管理', icon: FolderOpened },
-      { path: '/settings', label: '系统设置', icon: Setting },
-    );
-  }
-
-  return items;
-});
+const menuGroups = computed(() =>
+  adminNavigation.filter((group) => !group.adminOnly || authStore.isSuperAdmin),
+);
+const currentPageTitle = computed(() =>
+  route.name === 'project-detail'
+    ? '项目详情'
+    : menuGroups.value
+        .flatMap((group) => group.items)
+        .find((item) => item.path === activePath.value)?.label || '管理控制台',
+);
+const accountName = computed(() => authStore.currentUser?.displayName || '管理员');
+const avatarLetter = computed(() => Array.from(accountName.value)[0]);
+watch(
+  currentPageTitle,
+  (title) => {
+    document.title = title + ' · 统一文件管理';
+  },
+  { immediate: true },
+);
 
 function handleMenuSelect(path: string): void {
+  navigatedFromMenu = route.path !== path;
   mobileMenuVisible.value = false;
-  void router.push({ path });
+}
+
+function handleAccountCommand(command: string): void {
+  if (command === 'security') openSecurityDialog();
+  else if (command === 'logout') logout();
 }
 
 function openSecurityDialog(): void {
@@ -327,40 +411,6 @@ function openSecurityDialog(): void {
   totpQrCodeUrl.value = '';
   securityDialogVisible.value = true;
   void loadSessions();
-}
-
-function formatNotifyTime(value?: string): string {
-  return value ? new Date(value).toLocaleString() : '-';
-}
-
-async function loadNotifications(): Promise<void> {
-  try {
-    const [list, count] = await Promise.all([
-      notificationApi.list({ page: 1, pageSize: 10 }),
-      notificationApi.unreadCount(),
-    ]);
-    notifications.value = list.items;
-    unreadCount.value = count.count;
-  } catch {
-    // Best-effort notification poll; failures are non-fatal.
-  }
-}
-
-async function markAllRead(): Promise<void> {
-  await notificationApi.markRead({ all: true });
-  unreadCount.value = 0;
-  notifications.value = notifications.value.map((item) => ({ ...item, readAt: item.readAt || new Date().toISOString() }));
-}
-
-async function openNotification(item: { id: string; href?: string | null; readAt?: string | null }): Promise<void> {
-  if (!item.readAt) {
-    await notificationApi.markRead({ ids: [item.id] });
-    item.readAt = new Date().toISOString();
-    unreadCount.value = Math.max(0, unreadCount.value - 1);
-  }
-  if (item.href) {
-    void router.push(item.href);
-  }
 }
 
 async function loadSessions(): Promise<void> {
@@ -373,15 +423,52 @@ async function loadSessions(): Promise<void> {
 }
 
 async function revokeSession(id: string): Promise<void> {
-  await sessionApi.revoke(id);
-  ElMessage.success('会话已吊销。');
-  await loadSessions();
+  if (!hasCurrentSession.value || sessionsRevoking.value) return;
+  sessionsRevoking.value = true;
+  try {
+    await sessionApi.revoke(id);
+    ElMessage.success('已退出此会话。');
+    await loadSessions();
+  } finally {
+    sessionsRevoking.value = false;
+  }
 }
 
 async function revokeOtherSessions(): Promise<void> {
-  const result = await sessionApi.revokeOthers();
-  ElMessage.success(`已吊销 ${result.revoked} 个其他会话。`);
-  await loadSessions();
+  if (!hasCurrentSession.value || sessionsRevoking.value) return;
+  sessionsRevoking.value = true;
+  try {
+    await sessionApi.revokeOthers();
+    ElMessage.success('已退出其他会话，当前会话继续保留。');
+    await loadSessions();
+  } finally {
+    sessionsRevoking.value = false;
+  }
+}
+
+function sessionDeviceLabel(userAgent?: string | null): string {
+  if (!userAgent) return '未识别的客户端';
+  const browserPatterns = [
+    ['Microsoft Edge', /Edg(?:A|iOS)?\/(\d+)/],
+    ['Opera', /(?:OPR|Opera)\/(\d+)/],
+    ['Firefox', /(?:Firefox|FxiOS)\/(\d+)/],
+    ['Chrome', /(?:Chrome|CriOS)\/(\d+)/],
+    ['Safari', /Version\/(\d+).*Safari\//],
+  ] as const;
+  const browser = browserPatterns.find(([, pattern]) => pattern.test(userAgent));
+  if (!browser) return userAgent;
+  const version = browser[1].exec(userAgent)?.[1];
+  const platform = /Android/.test(userAgent) ? 'Android'
+    : /iPhone|iPad|iPod/.test(userAgent) ? 'iOS'
+      : /Windows/.test(userAgent) ? 'Windows'
+        : /Macintosh|Mac OS X/.test(userAgent) ? 'macOS'
+          : /Linux/.test(userAgent) ? 'Linux' : '';
+  return `${browser[0]} ${version}${platform ? ` · ${platform}` : ''}`;
+}
+
+function sessionTime(value: string): string {
+  const time = new Date(value);
+  return Number.isNaN(time.getTime()) ? '未知' : time.toLocaleString('zh-CN', { hour12: false });
 }
 
 async function setupTotp(): Promise<void> {
@@ -467,31 +554,51 @@ function logout(): void {
 onMounted(async () => {
   await authStore.loadProfile();
   if (authStore.currentUser?.role === 'SUPER_ADMIN') {
-    try { versionCheck.value = await versionApi.check(); } catch { /* configured source may be offline */ }
+    try {
+      versionCheck.value = await versionApi.check({
+        signal: versionController.signal,
+        _silent: true,
+      });
+    } catch {
+      /* configured source may be offline */
+    }
   }
-  await loadNotifications();
   if (authStore.currentUser?.mustChangePassword) {
     ElMessage.warning('管理员要求修改密码后才能继续使用。');
     openSecurityDialog();
   }
-  notifyTimer = setInterval(() => {
-    void loadNotifications();
-  }, 45_000);
 });
 
 onBeforeUnmount(() => {
-  if (notifyTimer) {
-    clearInterval(notifyTimer);
-  }
+  versionController.abort();
+  document.title = previousTitle;
 });
-
 </script>
 
 <style scoped>
 .admin-shell {
+  --admin-header-height: 64px;
+  --admin-control-size: 36px;
+  --admin-gutter: clamp(24px, 2.4vw, 40px);
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 3000;
+  inset-block-start: 8px;
+  inset-inline-start: 12px;
+  transform: translateY(-160%);
+  padding: 10px 16px;
+  border-radius: var(--radius-control);
+  background: var(--color-foreground);
+  color: #fff;
+}
+
+.skip-link:focus {
+  transform: none;
 }
 
 .admin-content {
@@ -502,148 +609,127 @@ onBeforeUnmount(() => {
 }
 
 .admin-sidebar {
-  flex-shrink: 0;
+  flex: none;
   height: 100%;
-  overflow-y: auto;
-  border-right: 1px solid var(--color-border);
-  background: #ffffff;
-}
-
-.mobile-sidebar {
-  min-height: 100%;
-  background: #ffffff;
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: 64px;
-  padding: 0 18px;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.brand-mark {
-  display: grid;
-  width: 36px;
-  height: 36px;
-  place-items: center;
-  border-radius: 8px;
-  color: #ffffff;
-  background: var(--color-primary);
-  font-weight: 700;
-}
-
-.brand-name {
-  font-size: 15px;
-  font-weight: 700;
-}
-
-.brand-subtitle {
-  margin-top: 2px;
-  color: #64748b;
-  font-size: 12px;
-}
-
-.side-menu {
-  border-right: 0;
+  overflow: hidden;
+  border-inline-end: 1px solid var(--color-border);
 }
 
 .admin-header {
-  flex-shrink: 0;
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  border-bottom: 1px solid var(--color-border);
-  background: #ffffff;
+  gap: 12px;
+  padding-inline: var(--admin-gutter);
+  border-block-end: 1px solid var(--color-border);
+  background: var(--color-surface);
 }
 
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.mobile-menu-button {
-  display: none;
-}
-
-.notify-badge {
-  margin-right: 4px;
-}
-
-.notify-panel {
-  max-height: 420px;
-  overflow: auto;
-}
-
-.notify-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.notify-item {
-  padding: 8px 0;
-  border-bottom: 1px solid var(--color-border);
-  cursor: pointer;
-}
-
-.notify-item.unread .notify-title {
-  font-weight: 700;
-}
-
-.notify-title {
-  font-size: 13px;
-}
-
-.notify-body {
-  margin-top: 2px;
-  color: #64748b;
-  font-size: 12px;
-  line-height: 1.4;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.notify-empty {
-  padding: 24px 0;
-  text-align: center;
-  color: #94a3b8;
-  font-size: 13px;
-}
-
-.notify-time {
-  margin-top: 2px;
-  color: #94a3b8;
-  font-size: 12px;
-}
-
+.header-left,
 .header-right {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 12px;
 }
 
-.user-name {
-  color: #334155;
-  font-size: 14px;
+.header-left {
+  flex: 1;
+}
+
+.header-right {
+  flex: none;
+}
+
+.mobile-menu-button.el-button {
+  display: none;
+  width: var(--admin-control-size);
+  height: var(--admin-control-size);
+  flex: none;
+  padding: 0;
+  font-size: 19px;
+}
+
+.header-breadcrumb {
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.header-breadcrumb :deep(.el-breadcrumb__item:last-child .el-breadcrumb__inner) {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.account-trigger.el-button {
+  display: flex;
+  height: var(--admin-control-size);
+  gap: 9px;
+  padding: 3px 9px 3px 4px;
+  color: var(--color-text);
+}
+
+.account-trigger :deep(> span) {
+  gap: 9px;
+}
+
+.account-avatar {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  place-items: center;
+  border: 1px solid #d8e4fc;
+  border-radius: 6px;
+  background: var(--color-primary-soft);
+  color: var(--color-primary-strong);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.account-name {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-chevron {
+  color: var(--color-text-secondary);
+  font-size: 12px;
 }
 
 .admin-main {
-  min-height: 0;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  padding: 20px;
+  scroll-padding-block: 24px;
+  padding: var(--admin-gutter);
+  padding-block-end: max(var(--admin-gutter), env(safe-area-inset-bottom));
+  outline: none;
 }
 
-.back-to-top { position: fixed; right: 24px; bottom: 24px; z-index: 20; box-shadow: 0 3px 12px #0002; }
+.admin-page-frame {
+  container: admin-page / inline-size;
+  width: 100%;
+  max-width: 1600px;
+  min-width: 0;
+  margin-inline: auto;
+}
+
+.back-to-top {
+  position: fixed;
+  inset-inline-end: 24px;
+  inset-block-end: max(24px, env(safe-area-inset-bottom));
+  z-index: 20;
+  box-shadow: 0 4px 14px #12213820;
+}
+
+:deep(.mobile-navigation-body) {
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+}
 
 .security-panel {
   display: grid;
@@ -655,6 +741,111 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
+}
+
+.sessions-section {
+  container: login-sessions / inline-size;
+  min-width: 0;
+}
+
+.sessions-section .section-title {
+  margin-block: 0;
+  font-size: 15px;
+}
+
+.session-help,
+.session-unconfirmed {
+  margin-block: 10px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.session-unconfirmed {
+  color: var(--color-text-secondary);
+}
+
+.session-list {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.session-card {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.session-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.session-device-label {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.session-heading .el-tag {
+  flex: none;
+}
+
+.session-metadata {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+  margin-block: 14px 10px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.session-metadata dt {
+  color: var(--color-text-secondary);
+}
+
+.session-metadata dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-details {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.session-details summary {
+  width: fit-content;
+  color: var(--color-primary-strong);
+  cursor: pointer;
+}
+
+.session-user-agent {
+  margin-block: 8px 0;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.session-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-block-start: 12px;
+}
+
+@container login-sessions (max-width: 25rem) {
+  .session-metadata {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .section-title {
@@ -724,39 +915,74 @@ onBeforeUnmount(() => {
   max-width: 420px;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 56rem) {
+  .admin-shell {
+    --admin-control-size: 40px;
+    --admin-gutter: 20px;
+  }
+
   .admin-sidebar {
     display: none;
   }
 
   .admin-header {
-    align-items: flex-start;
-    height: auto !important;
-    padding: 12px;
-    flex-direction: column;
+    min-height: var(--admin-header-height);
+    height: auto;
+    padding-top: env(safe-area-inset-top);
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
   }
 
-  .header-left {
-    width: 100%;
-  }
-
-  .mobile-menu-button {
+  .mobile-menu-button.el-button {
     display: inline-flex;
-    flex: 0 0 auto;
   }
 
-  .header-right {
-    align-items: stretch;
-    width: 100%;
-    flex-wrap: wrap;
+  .workspace-crumb {
+    display: none;
   }
+
+}
+
+@media (max-width: 36rem) {
+  .admin-header {
+    gap: 8px;
+    padding-inline: 12px;
+  }
+
+  .header-left,
+  .header-right {
+    gap: 8px;
+  }
+
+  .header-breadcrumb :deep(.el-breadcrumb__separator) {
+    margin-inline: 5px;
+  }
+
+  .header-breadcrumb :deep(.el-breadcrumb__item) {
+    font-size: 12px;
+  }
+
+  .account-trigger.el-button {
+    width: var(--admin-control-size);
+    justify-content: center;
+    padding: 0;
+  }
+
+  .account-name,
+  .account-chevron {
+    display: none;
+  }
+
+  .admin-shell { --admin-gutter: 14px; }
+
+  .admin-main { padding-block-start: 20px; }
 
   .secret-line {
     flex-direction: column;
   }
 
   .totp-bind {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>

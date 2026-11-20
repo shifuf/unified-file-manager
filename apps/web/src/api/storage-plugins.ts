@@ -8,7 +8,7 @@ export interface StoragePluginManifest {
   apiVersion: number;
   description?: string;
   fields: StoragePluginField[];
-  capabilities: { directUpload?: boolean; usage?: boolean; authentication?: boolean; backupOnly?: boolean };
+  capabilities: { directUpload?: boolean; usage?: boolean; authentication?: boolean; backupOnly?: boolean; remoteFiles?: boolean };
   builtin?: boolean;
   available?: boolean;
   error?: string;

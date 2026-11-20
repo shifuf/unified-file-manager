@@ -27,6 +27,7 @@
 
     <section class="surface">
       <div class="surface-body">
+        <TableViewport v-slot="{ pinActions }" label="分享 IP 记录">
         <el-table v-loading="loading" :data="rows" row-key="id" size="small" empty-text="暂无 IP 记录">
           <el-table-column prop="ip" label="IP" min-width="140" />
           <el-table-column prop="downloadCount" label="下载次数" width="100" />
@@ -48,13 +49,14 @@
           <el-table-column label="最近限流" min-width="160">
             <template #default="{ row }">{{ formatTime(row.lastRateLimitedAt) }}</template>
           </el-table-column>
-          <el-table-column label="操作" width="220" fixed="right">
+          <el-table-column label="操作" width="220" :fixed="pinActions ? 'right' : false">
             <template #default="{ row }">
               <el-button link type="warning" @click="openBanDialog(row)">拉黑</el-button>
               <el-button v-if="row.banned" link type="primary" @click="unban(row.ip)">解除</el-button>
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
 
         <div class="pager">
           <el-pagination
@@ -102,6 +104,7 @@
 import { Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { shareIpAbuseApi, type ShareIpStatRow } from '@/api/modules';
 

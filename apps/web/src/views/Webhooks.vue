@@ -19,6 +19,7 @@
           <el-button :icon="Refresh" @click="load">刷新</el-button>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="Webhook 列表">
         <el-table v-loading="loading" :data="items" row-key="id">
           <el-table-column prop="name" label="名称" min-width="160" />
           <el-table-column prop="url" label="URL" min-width="260" show-overflow-tooltip />
@@ -37,7 +38,7 @@
               <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '启用' : '停用' }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="240" fixed="right">
+          <el-table-column label="操作" width="240" :fixed="pinActions ? 'right' : false">
             <template #default="{ row }">
               <el-button link type="primary" @click="testHook(row.id)">测试</el-button>
               <el-button link type="primary" @click="openDeliveries(row)">投递</el-button>
@@ -46,6 +47,7 @@
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
       </div>
     </section>
 
@@ -106,6 +108,7 @@
 import { Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { projectApi } from '@/api/modules';
 import { http } from '@/api/http';

@@ -11,6 +11,7 @@
     </div>
     <section
       v-loading="summaryPanel.loading"
+      class="overview-summary"
       aria-label="关键指标"
       :aria-busy="summaryPanel.loading"
     >
@@ -20,16 +21,16 @@
       </div>
       <div v-if="summaryPanel.data" class="dashboard-metrics">
         <div class="metric">
-          <div class="metric-label">项目总数 / 启用</div>
+          <div class="metric-label">项目总数</div>
           <div class="metric-value">
-            {{ summaryPanel.data.projects.total
-            }}<span class="metric-secondary"> / {{ summaryPanel.data.projects.enabled }}</span>
+            {{ summaryPanel.data.projects.total.toLocaleString() }}
           </div>
+          <div class="metric-note">{{ summaryPanel.data.projects.enabled }} 个项目已启用</div>
         </div>
         <div class="metric">
           <div class="metric-label">有效文件</div>
-          <div class="metric-value">{{ summaryPanel.data.files.active }}</div>
-          <div class="metric-note">未删除的 ACTIVE 文件</div>
+          <div class="metric-value">{{ summaryPanel.data.files.active.toLocaleString() }}</div>
+          <div class="metric-note">所有项目中的有效文件</div>
         </div>
         <div class="metric">
           <div class="metric-label">源文件逻辑体积</div>
@@ -51,17 +52,19 @@
           </div>
           <div class="metric-note">含历史、派生及回收中对象</div>
         </div>
-        <div class="metric">
+      </div>
+      <div v-if="summaryPanel.data" class="status-strip">
+        <div class="status-metric">
           <div class="metric-label">启用存储</div>
           <div class="metric-value">{{ summaryPanel.data.storage.enabled }}</div>
           <router-link class="metric-note" to="/storage-configs">查看存储配置</router-link>
         </div>
-        <div class="metric">
+        <div class="status-metric">
           <div class="metric-label">待同步副本</div>
           <div class="metric-value">{{ summaryPanel.data.replicas.pending }}</div>
           <div class="metric-note">PENDING / SYNCING</div>
         </div>
-        <div class="metric">
+        <div class="status-metric">
           <div class="metric-label">失败 / 缺失副本</div>
           <div
             class="metric-value"
@@ -71,7 +74,7 @@
           </div>
           <div class="metric-note">FAILED / MISSING</div>
         </div>
-        <div class="metric">
+        <div class="status-metric">
           <div class="metric-label">运行中 / 失败任务</div>
           <div class="metric-value">
             {{ summaryPanel.data.tasks.running
@@ -92,88 +95,140 @@
           更新于 {{ formatDate(summaryPanel.data.updatedAt) }}。</span>
       </p>
     </section>
-    <section
-      v-loading="trendPanel.loading"
-      class="surface dashboard-surface"
-      aria-labelledby="trends-title"
-      :aria-busy="trendPanel.loading"
-    >
-      <div class="panel-heading">
-        <div>
-          <h2 id="trends-title">下载请求趋势</h2>
-          <p>Asia/Shanghai 日期，含 Range 传输请求。</p>
-        </div>
-        <el-radio-group
-          v-model="days"
-          size="small"
-          aria-label="下载趋势时间范围"
-          @change="loadTrends"
-          ><el-radio-button :value="7">最近 7 天</el-radio-button><el-radio-button :value="30">最近 30 天</el-radio-button></el-radio-group>
-      </div>
-      <div v-if="trendPanel.error" class="panel-error" role="alert">
-        {{ trendPanel.error
-        }}<el-button link type="primary" @click="loadTrends">重试趋势</el-button>
-      </div>
-      <template v-if="trendPanel.data">
-        <div class="trend-totals">
-          <span>下载请求 <strong>{{ totalRequests }}</strong></span><span>传输流量
-            <strong :title="`${totalTrendBytes} 字节`">{{
-              formatBytes(totalTrendBytes)
-            }}</strong></span>
-        </div>
-        <p v-if="totalRequests === 0" class="empty-message">这段时间没有下载请求。</p>
-        <div class="chart-grid">
-          <figure v-for="chart in trendCharts" :key="chart.id" class="trend-chart">
-            <figcaption>
-              {{ chart.label }}<span>{{ chart.peakLabel }}</span>
-            </figcaption>
-            <svg
-              viewBox="0 0 600 160"
-              role="img"
-              :aria-label="`${chart.label}，${trendPanel.data.items.length} 天，${chart.peakLabel}。下方可展开每日明细。`"
-              preserveAspectRatio="none"
-            >
-              <path d="M 12 140 H 588 M 12 80 H 588 M 12 20 H 588" class="chart-gridline" />
-              <path :d="chart.area" :class="['chart-area', chart.id]" />
-              <polyline :points="chart.points" :class="['chart-line', chart.id]" />
-            </svg>
-            <div class="chart-axis">
-              <span>{{ trendPanel.data.items[0]?.day }}</span><span>{{ trendPanel.data.items.at(-1)?.day }}</span>
-            </div>
-          </figure>
-        </div>
-        <details class="trend-details">
-          <summary>查看每日请求数和流量</summary>
-          <div class="table-scroll">
-            <table class="numbers-table">
-              <caption class="sr-only">
-                上海日期下载请求与流量明细
-              </caption>
-              <thead>
-                <tr>
-                  <th scope="col">日期</th>
-                  <th scope="col">请求数</th>
-                  <th scope="col">流量</th>
-                  <th scope="col">字节</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="item in trendPanel.data.items" :key="item.day">
-                  <th scope="row">{{ item.day }}</th>
-                  <td>{{ item.requests }}</td>
-                  <td>{{ formatBytes(item.bytes) }}</td>
-                  <td class="mono">{{ item.bytes }}</td>
-                </tr>
-              </tbody>
-            </table>
+    <div class="overview-columns">
+      <section
+        v-loading="trendPanel.loading"
+        class="surface dashboard-surface"
+        aria-labelledby="trends-title"
+        :aria-busy="trendPanel.loading"
+      >
+        <div class="panel-heading">
+          <div>
+            <h2 id="trends-title">下载请求趋势</h2>
+            <p>Asia/Shanghai 日期，含 Range 传输请求。</p>
           </div>
-        </details>
-        <p class="data-note">
-          下载请求数与分享计次独立。更新于 {{ formatDate(trendPanel.data.updatedAt) }}。
+          <el-radio-group
+            v-model="days"
+            size="small"
+            aria-label="下载趋势时间范围"
+            @change="loadTrends"
+            ><el-radio-button :value="7">最近 7 天</el-radio-button><el-radio-button :value="30">最近 30 天</el-radio-button></el-radio-group>
+        </div>
+        <div v-if="trendPanel.error" class="panel-error" role="alert">
+          {{ trendPanel.error
+          }}<el-button link type="primary" @click="loadTrends">重试趋势</el-button>
+        </div>
+        <template v-if="trendPanel.data">
+          <div class="trend-totals">
+            <span>下载请求 <strong>{{ totalRequests }}</strong></span><span>传输流量
+              <strong :title="`${totalTrendBytes} 字节`">{{
+                formatBytes(totalTrendBytes)
+              }}</strong></span>
+          </div>
+          <p v-if="totalRequests === 0" class="empty-message">这段时间没有下载请求。</p>
+          <div class="chart-grid">
+            <figure v-for="chart in trendCharts" :key="chart.id" class="trend-chart">
+              <figcaption>
+                {{ chart.label }}<span>{{ chart.peakLabel }}</span>
+              </figcaption>
+              <svg
+                viewBox="0 0 600 160"
+                role="img"
+                :aria-label="`${chart.label}，${trendPanel.data.items.length} 天，${chart.peakLabel}。下方可展开每日明细。`"
+                preserveAspectRatio="none"
+              >
+                <path d="M 12 140 H 588 M 12 80 H 588 M 12 20 H 588" class="chart-gridline" />
+                <path :d="chart.area" :class="['chart-area', chart.id]" />
+                <polyline :points="chart.points" :class="['chart-line', chart.id]" />
+              </svg>
+              <div class="chart-axis">
+                <span>{{ trendPanel.data.items[0]?.day }}</span><span>{{
+                  trendPanel.data.items.at(-1)?.day
+                }}</span>
+              </div>
+            </figure>
+          </div>
+          <details class="trend-details">
+            <summary>查看每日请求数和流量</summary>
+            <div class="table-scroll">
+              <table class="numbers-table">
+                <caption class="sr-only">
+                  上海日期下载请求与流量明细
+                </caption>
+                <thead>
+                  <tr>
+                    <th scope="col">日期</th>
+                    <th scope="col">请求数</th>
+                    <th scope="col">流量</th>
+                    <th scope="col">字节</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in trendPanel.data.items" :key="item.day">
+                    <th scope="row">{{ item.day }}</th>
+                    <td>{{ item.requests }}</td>
+                    <td>{{ formatBytes(item.bytes) }}</td>
+                    <td class="mono">{{ item.bytes }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </details>
+          <p class="data-note">
+            下载请求数与分享计次独立。更新于 {{ formatDate(trendPanel.data.updatedAt) }}。
+          </p>
+        </template>
+        <p v-else-if="!trendPanel.error" class="empty-message">正在读取下载趋势…</p>
+      </section>
+      <section
+        v-loading="activityPanel.loading"
+        class="surface dashboard-surface exceptions-panel"
+        :aria-busy="activityPanel.loading"
+        aria-labelledby="exceptions-title"
+      >
+        <div class="panel-heading">
+          <div>
+            <h2 id="exceptions-title">待处理事项</h2>
+            <p>优先查看异常与可回收文件。</p>
+          </div>
+        </div>
+        <div v-if="activityPanel.error" class="panel-error" role="alert">
+          {{ activityPanel.error
+          }}<el-button link type="primary" @click="loadActivity">重试活动与项目</el-button>
+        </div>
+        <template v-if="activityPanel.data"><div class="exception-links">
+            <router-link to="/tasks"><span>失败任务</span><strong>{{ summaryPanel.data?.tasks.failed ?? '—' }}</strong></router-link><router-link to="/recycle-bin"><span>回收站文件</span><strong>{{ activityPanel.data.exceptions.recycleFiles }}</strong></router-link><router-link to="/backups"><span>最近失败备份</span><strong>{{
+                activityPanel.data.backup.lastFailed
+                  ? formatDate(activityPanel.data.backup.lastFailed.createdAt)
+                  : '无记录'
+              }}</strong></router-link>
+          </div>
+          <h3 class="subheading">失败或缺失副本最多的项目</h3>
+          <ul v-if="activityPanel.data.exceptions.replicaProjects.length" class="activity-list">
+            <li
+              v-for="project in activityPanel.data.exceptions.replicaProjects"
+              :key="project.projectId"
+            >
+              <router-link :to="`/projects/${project.projectId}`">{{
+                project.projectName
+              }}</router-link><strong class="danger-text">{{ project.failedOrMissing }} 条</strong>
+            </li>
+          </ul>
+          <p v-else class="empty-message">没有失败或缺失的副本记录。</p>
+          <h3 class="subheading">最近失败任务</h3>
+          <ul v-if="activityPanel.data.exceptions.failedTasks.length" class="activity-list">
+            <li v-for="task in activityPanel.data.exceptions.failedTasks" :key="task.id">
+              <router-link :to="task.projectId ? `/projects/${task.projectId}` : '/tasks'">{{
+                task.title
+              }}</router-link><span>{{ formatDate(task.createdAt) }}</span>
+            </li>
+          </ul>
+          <p v-else class="empty-message">没有失败任务记录。</p></template>
+        <p v-else class="empty-message">
+          {{ activityPanel.error ? '待处理事项加载失败。' : '正在读取待处理事项…' }}
         </p>
-      </template>
-      <p v-else-if="!trendPanel.error" class="empty-message">正在读取下载趋势…</p>
-    </section>
+      </section>
+    </div>
     <section
       v-loading="storagePanel.loading"
       class="surface dashboard-surface"
@@ -257,50 +312,7 @@
         }}。健康结果是历史检查，供应商用量未知时保持未知。
       </p>
     </section>
-    <div v-if="activityPanel.error" class="panel-error" role="alert">
-      {{ activityPanel.error
-      }}<el-button link type="primary" @click="loadActivity">重试活动与项目</el-button>
-    </div>
     <div v-loading="activityPanel.loading" class="activity-grid" :aria-busy="activityPanel.loading">
-      <section class="surface dashboard-surface" aria-labelledby="exceptions-title">
-        <div class="panel-heading">
-          <div>
-            <h2 id="exceptions-title">待处理事项</h2>
-            <p>优先查看异常与可回收文件。</p>
-          </div>
-        </div>
-        <template v-if="activityPanel.data"><div class="exception-links">
-            <router-link to="/tasks"><span>失败任务</span><strong>{{ summaryPanel.data?.tasks.failed ?? '—' }}</strong></router-link><router-link to="/recycle-bin"><span>回收站文件</span><strong>{{ activityPanel.data.exceptions.recycleFiles }}</strong></router-link><router-link to="/backups"><span>最近失败备份</span><strong>{{
-                activityPanel.data.backup.lastFailed
-                  ? formatDate(activityPanel.data.backup.lastFailed.createdAt)
-                  : '无记录'
-              }}</strong></router-link>
-          </div>
-          <h3 class="subheading">失败或缺失副本最多的项目</h3>
-          <ul v-if="activityPanel.data.exceptions.replicaProjects.length" class="activity-list">
-            <li
-              v-for="project in activityPanel.data.exceptions.replicaProjects"
-              :key="project.projectId"
-            >
-              <router-link :to="`/projects/${project.projectId}`">{{
-                project.projectName
-              }}</router-link><strong class="danger-text">{{ project.failedOrMissing }} 条</strong>
-            </li>
-          </ul>
-          <p v-else class="empty-message">没有失败或缺失的副本记录。</p>
-          <h3 class="subheading">最近失败任务</h3>
-          <ul v-if="activityPanel.data.exceptions.failedTasks.length" class="activity-list">
-            <li v-for="task in activityPanel.data.exceptions.failedTasks" :key="task.id">
-              <router-link :to="task.projectId ? `/projects/${task.projectId}` : '/tasks'">{{
-                task.title
-              }}</router-link><span>{{ formatDate(task.createdAt) }}</span>
-            </li>
-          </ul>
-          <p v-else class="empty-message">没有失败任务记录。</p></template>
-        <p v-else class="empty-message">
-          {{ activityPanel.error ? '待处理事项加载失败。' : '正在读取待处理事项…' }}
-        </p>
-      </section>
       <section class="surface dashboard-surface" aria-labelledby="backup-title">
         <div class="panel-heading">
           <div>
@@ -386,9 +398,9 @@
             <span class="rank-number">{{ index + 1 }}</span>
             <div class="rank-main">
               <div class="rank-caption">
-                <router-link :to="`/projects/${project.id}`">{{ project.name }}</router-link><strong :title="`${project.sourceBytes} 字节`">{{
-                  formatBytes(project.sourceBytes)
-                }}</strong>
+                <router-link :to="`/projects/${project.id}`">{{ project.name }}</router-link><strong
+                  :title="`${project.sourceBytes} 字节`"
+                  >{{ formatBytes(project.sourceBytes) }}</strong>
               </div>
               <div class="rank-track" aria-hidden="true">
                 <div :style="{ width: `${rankWidth(project.sourceBytes)}%` }"></div>
@@ -679,6 +691,78 @@ function rankWidth(bytes: string): number {
 .dashboard-page {
   min-width: 0;
 }
+.overview-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1.9fr) minmax(280px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.status-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+  padding: 18px 20px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+}
+.status-metric {
+  min-width: 0;
+}
+.status-metric .metric-value {
+  margin-top: 6px;
+  font-size: 23px;
+}
+.status-metric .metric-note {
+  font-size: 11px;
+}
+.status-metric .metric-secondary {
+  font-size: 0.8em;
+}
+.dashboard-metrics > .metric:first-child {
+  background: var(--color-primary-soft);
+  border-color: var(--el-color-primary-light-8);
+}
+.dashboard-metrics > .metric:first-child .metric-value {
+  color: var(--color-primary-strong);
+}
+.overview-summary > .data-note {
+  margin: 9px 0 0;
+}
+.overview-columns .data-note:last-child {
+  margin-bottom: 0;
+}
+.overview-columns .empty-message {
+  padding-block: 14px;
+}
+.overview-columns .activity-list li {
+  flex-wrap: wrap;
+}
+.overview-columns .activity-list li > span {
+  font-size: 11px;
+}
+.exceptions-panel .subheading {
+  margin-top: 20px;
+}
+.metric-value {
+  letter-spacing: -0.025em;
+}
+.dashboard-metrics .metric-value {
+  font-size: clamp(26px, 2.4vw, 34px);
+}
+.dashboard-metrics .metric-note {
+  line-height: 1.6;
+}
+.dashboard-metrics .metric-label {
+  line-height: 1.5;
+}
+.dashboard-metrics .metric {
+  padding: 20px;
+}
+.dashboard-metrics .byte-value {
+  font-size: clamp(24px, 2.2vw, 32px);
+}
 .header-actions {
   display: flex;
   flex-wrap: wrap;
@@ -690,7 +774,7 @@ function rankWidth(bytes: string): number {
 .dashboard-metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 14px;
+  gap: 16px;
 }
 .metric {
   min-width: 0;
@@ -731,7 +815,8 @@ function rankWidth(bytes: string): number {
 }
 .panel-heading h2 {
   margin: 0;
-  font-size: 17px;
+  font-size: 16px;
+  font-weight: 650;
 }
 .panel-heading p {
   margin: 6px 0 0;
@@ -927,7 +1012,6 @@ function rankWidth(bytes: string): number {
   display: flex;
   justify-content: flex-end;
   margin-top: 18px;
-  overflow-x: auto;
   padding-bottom: 5px;
 }
 .pagination-wrap :deep(.el-pagination) {
@@ -937,8 +1021,8 @@ function rankWidth(bytes: string): number {
 }
 .activity-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
 }
 .exception-links {
   display: grid;
@@ -1091,15 +1175,23 @@ function rankWidth(bytes: string): number {
   white-space: nowrap;
   border: 0;
 }
-@media (max-width: 1100px) {
-  .storage-grid {
+@container admin-page (max-width: 68rem) {
+  .storage-grid,
+  .activity-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .overview-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
-@media (max-width: 760px) {
-  .dashboard-metrics {
+@container admin-page (max-width: 46rem) {
+  .dashboard-metrics,
+  .status-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
+    gap: 16px;
+  }
+  .dashboard-metrics .metric {
+    padding: 16px;
   }
   .activity-grid,
   .chart-grid {
@@ -1118,15 +1210,24 @@ function rankWidth(bytes: string): number {
     flex-wrap: wrap;
   }
 }
-@media (max-width: 450px) {
+@container admin-page (max-width: 30rem) {
   .storage-grid {
     grid-template-columns: minmax(0, 1fr);
   }
   .dashboard-surface {
     padding: 12px;
   }
-  .metric {
+  .dashboard-metrics .metric {
     padding: 14px 12px;
+  }
+  .status-strip {
+    padding: 16px;
+  }
+  .dashboard-metrics .metric-value {
+    font-size: 26px;
+  }
+  .dashboard-metrics .byte-value {
+    font-size: 22px;
   }
   .metric-label {
     font-size: 11px;

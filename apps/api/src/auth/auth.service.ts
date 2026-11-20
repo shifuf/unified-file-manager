@@ -461,22 +461,23 @@ export class AuthService {
   }
 
   async listSessions(user: RequestUser, currentRefreshToken?: string) {
-    const currentHash = currentRefreshToken ? this.hashToken(currentRefreshToken) : null;
+    const now = Date.now();
     const rows = await this.prisma.refreshToken.findMany({
       where: {
         userId: user.id,
         revokedAt: null,
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: new Date(now) },
       },
       orderBy: { createdAt: 'desc' },
     });
+    const currentId = rows.find((row) => this.isCurrentSession(row, currentRefreshToken, now))?.id;
     const devices = new Map<string, (typeof rows)[number]>();
     for (const row of rows) {
       const key = JSON.stringify([row.ip, row.userAgent]);
-      if (!devices.has(key) || row.tokenHash === currentHash) devices.set(key, row);
+      if (!devices.has(key) || row.id === currentId) devices.set(key, row);
     }
     return [...devices.values()]
-      .sort((a, b) => Number(b.tokenHash === currentHash) - Number(a.tokenHash === currentHash) || b.createdAt.getTime() - a.createdAt.getTime())
+      .sort((a, b) => Number(b.id === currentId) - Number(a.id === currentId) || b.createdAt.getTime() - a.createdAt.getTime())
       .slice(0, 50)
       .map((row) => ({
         id: row.id,
@@ -484,8 +485,17 @@ export class AuthService {
         userAgent: row.userAgent,
         createdAt: row.createdAt,
         expiresAt: row.expiresAt,
-        current: currentHash ? row.tokenHash === currentHash : false,
+        current: row.id === currentId,
       }));
+  }
+
+  private isCurrentSession(
+    row: { id: string; tokenHash: string; replacedById: string | null },
+    refreshToken: string | undefined,
+    now: number,
+  ): boolean {
+    if (!refreshToken) return false;
+    return row.tokenHash === this.hashToken(refreshToken) || this.rotationGraceToken(refreshToken, row, now) !== null;
   }
 
   async revokeSession(user: RequestUser, sessionId: string): Promise<{ success: boolean }> {
@@ -510,14 +520,33 @@ export class AuthService {
   }
 
   async revokeOtherSessions(user: RequestUser, currentRefreshToken?: string): Promise<{ success: boolean; revoked: number }> {
-    const currentHash = currentRefreshToken ? this.hashToken(currentRefreshToken) : null;
-    const result = await this.prisma.refreshToken.updateMany({
-      where: {
-        userId: user.id,
-        revokedAt: null,
-        ...(currentHash ? { tokenHash: { not: currentHash } } : {}),
-      },
-      data: { revokedAt: new Date() },
+    if (!currentRefreshToken) {
+      throw new BadRequestException('无法确认当前登录会话，请刷新页面后重试。');
+    }
+    const result = await this.prisma.$transaction(async (tx) => {
+      // Use the same lock as refresh so its rotation cannot change the session being preserved.
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM \`User\` WHERE id = ${user.id} FOR UPDATE`);
+      const now = Date.now();
+      const tokenHash = this.hashToken(currentRefreshToken);
+      const candidates = await tx.refreshToken.findMany({
+        where: {
+          userId: user.id,
+          revokedAt: null,
+          expiresAt: { gt: new Date(now) },
+          OR: [
+            { tokenHash },
+            { replacedById: { startsWith: 'rotate:', endsWith: `:${tokenHash}` } },
+          ],
+        },
+      });
+      const current = candidates.find((row) => this.isCurrentSession(row, currentRefreshToken, now));
+      if (!current) {
+        throw new BadRequestException('无法确认当前登录会话，请刷新页面后重试。');
+      }
+      return tx.refreshToken.updateMany({
+        where: { userId: user.id, revokedAt: null, id: { not: current.id } },
+        data: { revokedAt: new Date(now) },
+      });
     });
     await this.auditService.write({
       action: AuditAction.SESSION_REVOKE,

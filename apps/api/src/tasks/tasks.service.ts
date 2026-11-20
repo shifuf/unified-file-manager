@@ -222,7 +222,10 @@ export class TasksService {
           failures: [],
         } as Prisma.InputJsonObject
       : replicaRetry
-        ? { ...originalDetail, cursor: String(originalDetail.cursor ?? ''), retriedFromTaskId: task.id }
+        ? typeof originalDetail.targetConfigId === 'string'
+          ? { ...originalDetail, phase: 'SCANNING', cursor: '', scanned: 0, queued: 0, rescanRequested: false, retryReplicas: true,
+              replicaTotal: 0, replicaReady: 0, replicaPending: 0, replicaFailed: 0, retriedFromTaskId: task.id }
+          : { ...originalDetail, cursor: String(originalDetail.cursor ?? ''), retriedFromTaskId: task.id }
         : { retriedFromTaskId: task.id, originalDetail: task.detail };
     const retried = await this.prisma.task.create({
       data: {

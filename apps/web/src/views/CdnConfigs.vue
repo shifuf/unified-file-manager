@@ -25,13 +25,16 @@
         <p class="muted">本地存储由系统提供。其他存储需先上传安装插件，再创建存储配置。</p>
         <p class="muted">插件会在服务器运行代码，请仅安装你信任的开发者提供的插件包。</p>
         <el-alert v-if="pluginLoadError" type="error" :closable="false" :title="pluginLoadError" />
+        <TableViewport label="存储插件列表">
         <el-table :data="remotePlugins" row-key="id">
           <el-table-column prop="name" label="插件" min-width="170" />
           <el-table-column prop="id" label="标识" min-width="160" />
           <el-table-column prop="version" label="版本" width="110" />
           <el-table-column label="能力" min-width="230">
             <template #default="{ row }">
-              <span>上传 / 下载 / 删除</span>
+              <el-tag v-if="row.capabilities.backupOnly" size="small" type="info">备份存储</el-tag>
+              <span>{{ row.capabilities.backupOnly ? '上传备份' : '上传 / 下载 / 删除' }}</span>
+              <el-tag v-if="row.capabilities.remoteFiles" size="small">云端浏览 / 拉取</el-tag>
               <el-tag v-if="row.capabilities.directUpload" size="small">支持签名直传</el-tag>
               <el-tag v-if="row.capabilities.usage" size="small">平台用量</el-tag>
               <el-tag v-if="row.available === false" type="danger" size="small">加载失败</el-tag>
@@ -47,6 +50,7 @@
           </el-table-column>
           <template #empty>尚未安装远程存储插件</template>
         </el-table>
+        </TableViewport>
       </div>
     </section>
 
@@ -56,6 +60,7 @@
           <el-button :icon="Refresh" @click="reload">刷新</el-button>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="存储配置列表">
         <el-table v-loading="loading" :data="configs" row-key="id" class="data-table">
           <el-table-column prop="name" label="配置名称" min-width="180" />
           <el-table-column prop="provider" label="平台" width="120">
@@ -68,9 +73,12 @@
           <el-table-column label="可使用项目" min-width="220">
             <template #default="{ row }">
               <div v-if="row.projects?.length" class="assigned-project-tags">
-                <el-tag v-for="project in row.projects" :key="project.id" :type="project.current ? 'success' : 'info'">
+                <el-tag v-for="project in row.projects.slice(0, 3)" :key="project.id" :type="project.current ? 'success' : 'info'">
                   {{ project.name }}{{ project.current ? ' · 当前' : '' }}
                 </el-tag>
+                <el-button v-if="row.projects.length > 3" link type="primary" @click="projectSummaryConfig = row">
+                  查看全部 {{ row.projects.length }} 个项目
+                </el-button>
               </div>
               <span v-else class="muted">未分配项目</span>
             </template>
@@ -145,12 +153,28 @@
               <span v-else class="muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="320">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="320">
             <template #default="{ row }">
               <div class="table-actions">
                 <el-button link type="primary" :loading="testingConfigId === row.id" @click="testConfig(row)">
                   测试
                 </el-button>
+                <el-button
+                  v-if="authStore.isSuperAdmin && pluginFor(row.provider)?.capabilities.remoteFiles"
+                  link
+                  type="primary"
+                  :disabled="!row.enabled || pluginFor(row.provider)?.available === false"
+                  @click="remoteConfig = row; remoteVisible = true"
+                >
+                  云端文件
+                </el-button>
+                <el-button
+                  v-if="authStore.isSuperAdmin && row.provider === 'ALIYUN_DRIVE' && pluginFor(row.provider)?.capabilities.remoteFiles"
+                  link
+                  type="primary"
+                  :disabled="!row.enabled || pluginFor(row.provider)?.available === false"
+                  @click="projectSyncConfig = row; projectSyncVisible = true"
+                >上传同步</el-button>
                 <el-button
                   v-if="supportsUsage(row.provider)"
                   link
@@ -183,10 +207,17 @@
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
       </div>
     </section>
 
-    <el-dialog v-model="dialogVisible" :title="editingConfig ? '编辑存储配置' : '新建存储配置'" width="680px" destroy-on-close>
+    <el-dialog
+      v-model="dialogVisible"
+      :title="editingConfig ? '编辑存储配置' : '新建存储配置'"
+      width="680px"
+      class="storage-config-dialog"
+      destroy-on-close
+    >
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
         <el-form-item label="平台" prop="provider">
           <el-select v-model="form.provider" :disabled="Boolean(editingConfig)" style="width: 100%" @change="fillTemplate">
@@ -227,25 +258,44 @@
               <div v-if="field.description" class="field-help">{{ field.description }}</div>
             </el-form-item>
           </div>
-          <div class="config-help">{{ currentHelp.description }}</div>
+          <div v-if="currentHelp.description" class="config-help">{{ currentHelp.description }}</div>
+          <div v-if="pluginFor(form.provider)?.capabilities.backupOnly && pluginFor(form.provider)?.capabilities.remoteFiles" class="field-help">备份存储不参与自动下载；管理员可在“云端文件”中浏览、下载或拉取文件。</div>
         </div>
         <div v-if="form.provider !== 'LOCAL'" class="config-section">
-          <div class="config-section-title">容量与流量限额</div>
-          <div class="config-field-grid">
-            <el-form-item label="优先级（数字越小越优先）"><el-input-number v-model="form.priority" :min="0" :max="100000" /></el-form-item>
-            <el-form-item label="启用空间限制"><el-switch v-model="form.storageLimitEnabled" /></el-form-item>
-            <el-form-item label="暂停上传阈值 (%)"><el-input-number v-model="form.failoverThresholdPercent" :disabled="!form.storageLimitEnabled" :min="1" :max="100" /></el-form-item>
-            <el-form-item label="空间上限 (GiB)"><el-input-number v-model="form.storageQuotaGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
-            <el-form-item label="手动已用空间基准 (GiB)"><el-input-number v-model="form.manualStorageUsedGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
-            <el-form-item label="启用流量限制"><el-switch v-model="form.trafficLimitEnabled" /></el-form-item>
-            <el-form-item label="流量额度模式"><el-segmented v-model="form.trafficQuotaMode" :options="[{ label: '每月重置', value: 'MONTHLY' }, { label: '固定额度', value: 'FIXED' }]" /></el-form-item>
-            <el-form-item :label="form.trafficQuotaMode === 'MONTHLY' ? '每月流量额度 (GiB)' : '固定流量额度 (GiB)'" :required="form.trafficLimitEnabled"><el-input-number v-model="form.trafficQuotaGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
-            <el-form-item label="已用流量校正 (GiB)"><el-input-number v-model="form.manualTrafficUsedGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
-          </div>
-          <el-checkbox v-model="form.autoFailover">达到阈值后自动切换新上传目标</el-checkbox>
-          <div class="field-help">空间基准优先使用手动值，未填写时取平台回报，并计入后续上传。达到阈值或空间不足时暂停云上传，文件保存在本地兜底。</div>
-          <div class="field-help">{{ form.trafficQuotaMode === 'MONTHLY' ? '每月 1 日北京时间 00:00 重置已用流量。' : '固定额度不自动重置，可手动调整总额或已用量。' }} 流量不足时暂停该存储上传和下载，自动尝试其他存储或本地。关闭限制停止扣减并保留计数。</div>
-          <div class="field-help">启用后按本系统实际从云端读取的字节扣减，包含下载、同步和完整性校验；分段下载可能先读取整个文件进行校验，不等同于云平台账单。未修改已用量时，保存会保留期间新增的计数。</div>
+          <div class="config-section-title">高级配置</div>
+          <el-collapse v-model="advancedSections" class="config-advanced">
+            <el-collapse-item name="routing" title="上传优先级与自动切换">
+              <el-form-item label="优先级（数字越小越优先）"><el-input-number v-model="form.priority" :min="0" :max="100000" /></el-form-item>
+              <el-checkbox v-model="form.autoFailover">达到阈值后自动切换新上传目标</el-checkbox>
+            </el-collapse-item>
+            <el-collapse-item name="storage">
+              <template #title>
+                <span class="advanced-section-title">空间限制 <el-tag :type="form.storageLimitEnabled ? 'success' : 'info'" size="small">{{ form.storageLimitEnabled ? '已启用' : '未启用' }}</el-tag></span>
+              </template>
+              <el-form-item label="启用空间限制"><el-switch v-model="form.storageLimitEnabled" aria-label="启用空间限制" /></el-form-item>
+              <div v-if="form.storageLimitEnabled" class="config-field-grid">
+                <el-form-item label="暂停上传阈值 (%)"><el-input-number v-model="form.failoverThresholdPercent" :min="1" :max="100" /></el-form-item>
+                <el-form-item label="空间上限 (GiB)"><el-input-number v-model="form.storageQuotaGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+                <el-form-item label="手动已用空间基准 (GiB)"><el-input-number v-model="form.manualStorageUsedGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+              </div>
+              <div class="field-help">空间基准优先使用手动值，未填写时取平台回报，并计入后续上传。达到阈值或空间不足时暂停云上传，文件保存在本地兜底。</div>
+            </el-collapse-item>
+            <el-collapse-item name="traffic">
+              <template #title>
+                <span class="advanced-section-title">流量限制 <el-tag :type="form.trafficLimitEnabled ? 'success' : 'info'" size="small">{{ form.trafficLimitEnabled ? '已启用' : '未启用' }}</el-tag></span>
+              </template>
+              <el-form-item label="启用流量限制"><el-switch v-model="form.trafficLimitEnabled" aria-label="启用流量限制" /></el-form-item>
+              <template v-if="form.trafficLimitEnabled">
+                <div class="config-field-grid">
+                  <el-form-item label="流量额度模式"><el-segmented v-model="form.trafficQuotaMode" :options="[{ label: '每月重置', value: 'MONTHLY' }, { label: '固定额度', value: 'FIXED' }]" /></el-form-item>
+                  <el-form-item :label="form.trafficQuotaMode === 'MONTHLY' ? '每月流量额度 (GiB)' : '固定流量额度 (GiB)'" :required="form.trafficLimitEnabled"><el-input-number v-model="form.trafficQuotaGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+                  <el-form-item label="已用流量校正 (GiB)"><el-input-number v-model="form.manualTrafficUsedGiB" :min="0" :max="8388607" :precision="6" clearable :value-on-clear="null" /></el-form-item>
+                </div>
+                <div class="field-help">{{ form.trafficQuotaMode === 'MONTHLY' ? '每月 1 日北京时间 00:00 重置已用流量。' : '固定额度不自动重置，可手动调整总额或已用量。' }} 流量不足时暂停该存储上传和下载，自动尝试其他存储或本地。关闭限制停止扣减并保留计数。</div>
+                <div class="field-help">启用后按本系统实际从云端读取的字节扣减，包含下载、同步和完整性校验；分段下载可能先读取整个文件进行校验，不等同于云平台账单。未修改已用量时，保存会保留期间新增的计数。</div>
+              </template>
+            </el-collapse-item>
+          </el-collapse>
         </div>
       </el-form>
 
@@ -286,6 +336,22 @@
           </div>
         </div>
       </template>
+    </el-dialog>
+
+    <StorageRemoteFiles v-model="remoteVisible" :config="remoteConfig" />
+    <StorageProjectSync v-model="projectSyncVisible" :config="projectSyncConfig" />
+
+    <el-dialog :model-value="Boolean(projectSummaryConfig)" title="可使用项目" width="560px" @update:model-value="projectSummaryConfig = null">
+      <p class="assignment-description">{{ projectSummaryConfig?.name }} · 共 {{ projectSummaryConfig?.projects?.length || 0 }} 个项目</p>
+      <el-scrollbar max-height="56dvh" always>
+        <ul class="assigned-project-list">
+          <li v-for="project in projectSummaryConfig?.projects || []" :key="project.id" class="assigned-project-list-item">
+            <span>{{ project.name }}</span>
+            <el-tag v-if="project.current" size="small" type="success">当前存储</el-tag>
+          </li>
+        </ul>
+      </el-scrollbar>
+      <template #footer><el-button @click="projectSummaryConfig = null">关闭</el-button></template>
     </el-dialog>
 
     <el-dialog v-model="assignmentDialogVisible" title="分配项目" width="560px">
@@ -359,11 +425,14 @@
 import { Connection, Plus, Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
 import { computed, onMounted, reactive, ref } from 'vue';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { cdnApi, projectApi } from '@/api/modules';
 import { storagePluginsApi, type StoragePluginManifest } from '@/api/storage-plugins';
 import { useAuthStore } from '@/stores/auth';
 import StoragePluginAuth from '@/components/StoragePluginAuth.vue';
+import StorageRemoteFiles from '@/components/StorageRemoteFiles.vue';
+import StorageProjectSync from '@/components/StorageProjectSync.vue';
 import type { CdnConfig, CdnProvider, Project, StorageHealthResult, StorageUsageResult } from '@/types';
 import { limitFormValues, storageLimitPayload, storageSpaceView } from '@/utils/storage-limit-form';
 import { buildPluginConfigValues, collectPluginConfigValues, type PluginConfigValue } from '@/utils/storage-plugin-form';
@@ -383,6 +452,10 @@ const usageLoadingId = ref('');
 const usageByConfigId = ref<Record<string, StorageUsageResult>>({});
 const projects = ref<Project[]>([]);
 const configs = ref<CdnConfig[]>([]);
+const remoteConfig = ref<CdnConfig | null>(null);
+const remoteVisible = ref(false);
+const projectSyncConfig = ref<CdnConfig | null>(null);
+const projectSyncVisible = ref(false);
 const healthDialogVisible = ref(false);
 const healthResult = ref<StorageHealthResult | null>(null);
 const canCreateConfig = computed(() => authStore.isSuperAdmin);
@@ -390,9 +463,11 @@ const assignmentDialogVisible = ref(false);
 const assignmentLoading = ref(false);
 const assignmentSubmitting = ref(false);
 const assignmentConfig = ref<CdnConfig | null>(null);
+const projectSummaryConfig = ref<CdnConfig | null>(null);
 const assignedProjectIds = ref<string[]>([]);
 const currentAssignmentProjectIds = ref<string[]>([]);
 const dialogVisible = ref(false);
+const advancedSections = ref<string[]>([]);
 const editingConfig = ref<CdnConfig | null>(null);
 const draftTesting = ref(false);
 const draftTestResult = ref<StorageHealthResult | null>(null);
@@ -624,6 +699,7 @@ function openCreateDialog(): void {
   initialConnectionKey.value = '';
   form.configValues = buildConfigValues(form.provider);
   resetDraftTest();
+  advancedSections.value = [];
   dialogVisible.value = true;
 }
 
@@ -645,6 +721,7 @@ function openEditDialog(config: CdnConfig): void {
   initialConnectionKey.value = connectionFingerprint.value;
   initialLimitValues.value = limitFormValues(config);
   resetDraftTest();
+  advancedSections.value = [];
   dialogVisible.value = true;
 }
 
@@ -858,7 +935,6 @@ onMounted(reload);
 </script>
 
 <style scoped>
-.plugin-panel { margin-bottom: 20px; }
 .data-table {
   margin-top: 14px;
 }
@@ -869,8 +945,35 @@ onMounted(reload);
   gap: 6px;
 }
 
+.assigned-project-tags :deep(.el-tag) {
+  max-width: 100%;
+  height: auto;
+  padding-block: 2px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.assigned-project-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.assigned-project-list-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .assignment-description {
   margin-top: 0;
+  overflow-wrap: anywhere;
   color: #64748b;
   line-height: 1.6;
 }
@@ -878,6 +981,18 @@ onMounted(reload);
 .assignment-projects {
   display: grid;
   gap: 8px;
+}
+
+.assignment-projects :deep(.el-checkbox) {
+  height: auto;
+  margin-inline-end: 0;
+  white-space: normal;
+}
+
+.assignment-projects :deep(.el-checkbox__label) {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .config-summary {
@@ -940,6 +1055,39 @@ onMounted(reload);
   margin-bottom: 0;
 }
 
+.config-field-grid :deep(.el-form-item__content) {
+  min-width: 0;
+}
+
+.config-field-grid :deep(.el-input-number),
+.config-field-grid :deep(.el-select) {
+  max-width: 100%;
+}
+
+.advanced-section-title {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.config-advanced :deep(.el-collapse-item__header) {
+  min-height: 48px;
+  height: auto;
+  padding-block: 8px;
+  line-height: 1.5;
+}
+
+.config-advanced :deep(.el-checkbox) {
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+}
+
+.config-advanced :deep(.el-checkbox__label) {
+  white-space: normal;
+}
+
 .field-help {
   width: 100%;
   margin-top: 6px;
@@ -950,6 +1098,7 @@ onMounted(reload);
 
 .dialog-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -958,6 +1107,27 @@ onMounted(reload);
 .dialog-footer-right {
   display: flex;
   gap: 8px;
+  margin-inline-start: auto;
+}
+
+:global(.el-dialog.storage-config-dialog) {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 32px);
+  margin-block: 16px;
+}
+
+:global(.storage-config-dialog .el-dialog__header),
+:global(.storage-config-dialog .el-dialog__footer) {
+  flex-shrink: 0;
+}
+
+:global(.storage-config-dialog .el-dialog__body) {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-inline: 2px 10px;
+  scrollbar-gutter: stable;
 }
 
 .draft-test-panel {

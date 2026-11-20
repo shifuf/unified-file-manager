@@ -6,11 +6,13 @@ import type { PluginContext, StorageAdapter } from '@ufm/storage-plugin-sdk';
 import { DriveClient, stateKey, type Transport } from './client';
 import { DriveAuth } from './auth';
 import { DriveObjects } from './objects';
+import { DriveRemoteFiles } from './remote-files';
 
 export function createAdapter(context?: PluginContext, transport: Transport = fetch): StorageAdapter {
   const unavailable = async (): Promise<never> => { throw new Error('此插件需要宿主提供加密账号状态，请升级宿主后重试。'); };
   const state: PluginContext = context ?? { getState: unavailable, setState: unavailable, withLock: unavailable };
   const client = new DriveClient(state, transport), auth = new DriveAuth(client), objects = new DriveObjects(client);
+  const remote = new DriveRemoteFiles(client, objects);
   return {
     provider: 'ALIYUN_DRIVE',
     startLogin: accountId => auth.startLogin(accountId), pollLogin: sessionId => auth.pollLogin(sessionId), cancelLogin: sessionId => auth.cancelLogin(sessionId),
@@ -33,5 +35,7 @@ export function createAdapter(context?: PluginContext, transport: Transport = fe
     getDownloadTarget: (config, key, range) => objects.getDownloadTarget(config, key, range),
     remove: (config, key) => objects.remove(config, key),
     getUsage: config => objects.getUsage(config),
+    listRemoteFiles: (config, options) => remote.list(config, options),
+    readRemoteFile: (config, id, options) => remote.read(config, id, options),
   };
 }

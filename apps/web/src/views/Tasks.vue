@@ -32,6 +32,7 @@
           <span class="muted">仅可勾选已完成、失败或已取消的任务，删除只清理任务记录。</span>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="任务列表">
         <el-table ref="taskTable" v-loading="loading || deleting" :data="pageResult.items" row-key="id" class="data-table" @selection-change="handleSelectionChange">
           <el-table-column type="selection" width="48" :selectable="canDeleteTask" />
           <el-table-column prop="title" label="任务" min-width="200" />
@@ -53,7 +54,7 @@
           <el-table-column label="创建时间" min-width="170">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="170">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="170">
             <template #default="{ row }">
               <el-button link type="primary" @click="openDetail(row)">详情</el-button>
               <el-button v-if="row.type === 'STORAGE_MIGRATION' && row.status === 'RUNNING'" link type="warning" @click="pauseTask(row)">暂停</el-button>
@@ -64,6 +65,7 @@
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
 
         <div class="pagination-row">
           <el-pagination
@@ -120,6 +122,7 @@ import { Delete, Refresh } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus';
 import { onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { projectApi, taskApi } from '@/api/modules';
 import type { PageResult, Project, TaskItem } from '@/types';

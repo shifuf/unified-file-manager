@@ -1,4 +1,5 @@
 import type { Readable } from 'node:stream';
+import type { StorageRemotePage, StorageRemoteRead } from '@ufm/storage-plugin-sdk';
 
 type CdnProvider = string;
 
@@ -9,11 +10,18 @@ export type RuntimeCdnConfig = {
   config: Record<string, unknown>;
 };
 
+export type StorageProjectIdentity = {
+  id: string;
+  name: string;
+};
+
 export type StorageUploadParams = {
   key: string;
   buffer: Buffer;
   mimeType: string;
   originalName: string;
+  project?: StorageProjectIdentity;
+  folderPath?: string;
 };
 
 /** A verified disk object for bounded-memory background replication. */
@@ -24,6 +32,8 @@ export type StorageUploadFileParams = {
   checksum: string;
   mimeType: string;
   originalName: string;
+  project?: StorageProjectIdentity;
+  folderPath?: string;
 };
 
 export type StorageObjectFingerprint = {
@@ -92,6 +102,10 @@ export type DirectUploadCredential = {
 
 export interface StorageAdapter {
   readonly provider: CdnProvider;
+
+  listRemoteFiles?(config: RuntimeCdnConfig, options: { parentId?: string; cursor?: string }): Promise<StorageRemotePage>;
+
+  readRemoteFile?(config: RuntimeCdnConfig, id: string, options?: { maxBytes?: number; timeoutMs?: number }): Promise<StorageRemoteRead>;
 
   verifyBackup?(config: RuntimeCdnConfig, params: { key: string; size: number; checksum: string }): Promise<void>;
 

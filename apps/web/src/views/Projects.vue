@@ -29,6 +29,7 @@
           <el-button :icon="Refresh" @click="loadProjects">刷新</el-button>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="项目列表">
         <el-table v-loading="loading" :data="projects" row-key="id" class="data-table">
           <el-table-column prop="name" label="项目名称" min-width="180">
             <template #default="{ row }">
@@ -67,7 +68,7 @@
           <el-table-column label="创建时间" min-width="170">
             <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="340">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="340">
             <template #default="{ row }">
               <div class="table-actions">
                 <template v-if="row.canManage">
@@ -81,6 +82,7 @@
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
       </div>
     </section>
 
@@ -190,6 +192,7 @@ import { Plus, Refresh, Search, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { fileApi, projectApi, webdavApi } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';

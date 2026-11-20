@@ -35,6 +35,7 @@ type ReplicaDelegate = {
   groupBy(args: Record<string, unknown>): Promise<Array<{ status: string; _count: { _all: number } }>>;
 };
 type VerifiedObject = { path: string; size: number; checksum: string; cleanup: () => Promise<void> };
+type ReplicaUploadMetadata = Pick<StorageUploadFileParams, 'mimeType' | 'originalName' | 'project' | 'folderPath'>;
 const RETRY_STATES = ['PENDING', 'FAILED', 'MISSING'];
 const LEASE_MS = 5 * 60_000;
 const BUFFER_LIMIT = 32 * 1024 * 1024;
@@ -86,10 +87,11 @@ export class ReplicaService {
     await object.cleanup();
   }
 
-  async recordLocalAndEnqueue(projectId: string, localConfigId: string, storageKey: string, size: bigint, checksum: string): Promise<void> {
+  async recordLocalAndEnqueue(projectId: string, localConfigId: string, storageKey: string, size: bigint, checksum: string, targetConfigId?: string): Promise<void> {
     await this.assertImmutable(projectId, storageKey, size, checksum);
     const clouds = await this.prisma.cdnConfig.findMany({
-      where: { enabled: true, provider: { not: CdnProvider.LOCAL }, projectId: null, projectBindings: { some: { projectId } } },
+      where: { enabled: true, provider: { not: CdnProvider.LOCAL }, projectId: null, projectBindings: { some: { projectId } },
+        ...(targetConfigId ? { id: targetConfigId } : {}) },
       orderBy: [{ priority: 'asc' }, { id: 'asc' }],
     });
     await this.prisma.$transaction(async tx => {
@@ -108,7 +110,7 @@ export class ReplicaService {
   }
 
   async materializeUploadedObject(projectId: string, configId: string, key: string, size: bigint | number | undefined,
-    checksum: string | null | undefined, mimeType: string, originalName: string): Promise<StorageUploadResult> {
+    checksum: string | null | undefined, mimeType: string, originalName: string, targetConfigId?: string): Promise<StorageUploadResult> {
     const config = await this.prisma.cdnConfig.findFirst({ where: { id: configId } });
     if (!config) throw new NotFoundException('原存储配置不存在。');
     const storageKey = normalizeKey(key);
@@ -121,7 +123,7 @@ export class ReplicaService {
         const verified = await this.readVerified(local, storageKey, BigInt(object.size), object.checksum);
         await verified.cleanup();
       }
-      await this.recordLocalAndEnqueue(projectId, local.id, storageKey, BigInt(object.size), object.checksum);
+      await this.recordLocalAndEnqueue(projectId, local.id, storageKey, BigInt(object.size), object.checksum, targetConfigId);
       return { cdnConfigId: local.id, storageKey, publicUrl: null, checksum: object.checksum, size: object.size };
     } finally { await object.cleanup(); }
   }
@@ -291,13 +293,14 @@ export class ReplicaService {
             source = await this.readVerified(this.runtime(row.config), row.storageKey, row.size);
           }
           const adapter = this.registry.adapter(row.config.provider);
+          const metadata = await this.metadataForReplica(row);
           if (corrupt && adapter.repairFile) {
             if (source.checksum !== row.checksum) throw new Error('对象 SHA256 校验失败。');
             const stored = await adapter.repairFile(this.runtime(row.config), { key: row.storageKey, path: source.path, size: source.size,
-              checksum: source.checksum, mimeType: 'application/octet-stream', originalName: row.storageKey.split('/').pop() || 'object' }, corrupt);
+              checksum: source.checksum, ...metadata }, corrupt);
             if (normalizeKey(stored.storageKey) !== normalizeKey(row.storageKey)) throw new Error('复制目标返回了不同的不可变 key。');
           } else {
-            uploadReservation = await this.uploadDisk(this.runtime(row.config), row.storageKey, source, 'application/octet-stream', row.storageKey.split('/').pop() || 'object');
+            uploadReservation = await this.uploadDisk(this.runtime(row.config), row.storageKey, source, metadata.mimeType, metadata.originalName, metadata);
           }
           await this.confirmStoredObject(this.runtime(row.config), row.storageKey, Number(row.size), source.checksum, uploadReservation?.verification);
           if (uploadReservation) await this.limits.finishUpload(uploadReservation, 'PRESENT');
@@ -328,6 +331,37 @@ export class ReplicaService {
     catch { this.logger.warn('副本队列续租失败，将由后续批次接管。'); }
   }
 
+  private async metadataForReplica(target: Pick<ReplicaRow, 'projectId' | 'storageKey'>): Promise<ReplicaUploadMetadata> {
+    const project = await this.prisma.project.findFirst({ where: { id: target.projectId }, select: { id: true, name: true } });
+    if (!project || typeof project.name !== 'string' || !project.name.trim()) {
+      throw new Error('副本所属项目资料不完整，等待修复后重试。');
+    }
+    const fallback = { mimeType: 'application/octet-stream', originalName: target.storageKey.split('/').pop() || 'object',
+      project: { id: target.projectId, name: project.name } };
+    // An immutable key may belong to the current head, an older version, or a
+    // derivative. Keep every lookup scoped to the replica's project and key.
+    const file = await this.prisma.managedFile.findFirst({
+      where: { projectId: target.projectId, storageKey: target.storageKey },
+      select: { mimeType: true, originalName: true, folderPath: true },
+    });
+    if (file) return { ...fallback, mimeType: file.mimeType || fallback.mimeType, originalName: file.originalName || fallback.originalName,
+      ...(typeof file.folderPath === 'string' ? { folderPath: file.folderPath } : {}) };
+    const version = await this.prisma.fileVersion.findFirst({
+      where: { storageKey: target.storageKey, file: { projectId: target.projectId } },
+      select: { mimeType: true, originalName: true, file: { select: { folderPath: true } } },
+    });
+    if (version) return { ...fallback, mimeType: version.mimeType || fallback.mimeType, originalName: version.originalName || fallback.originalName,
+      ...(typeof version.file?.folderPath === 'string' ? { folderPath: version.file.folderPath } : {}) };
+    const derivative = await this.prisma.fileDerivative.findFirst({
+      where: { storageKey: target.storageKey, file: { projectId: target.projectId } },
+      select: { mimeType: true, file: { select: { folderPath: true } } },
+    });
+    // Derivatives have no originalName; their source's MIME/name describe
+    // different bytes and must not be copied onto generated objects.
+    return { ...fallback, mimeType: derivative?.mimeType || fallback.mimeType,
+      ...(typeof derivative?.file?.folderPath === 'string' ? { folderPath: derivative.file.folderPath } : {}) };
+  }
+
   private async sourceForReplica(target: ReplicaRow): Promise<VerifiedObject> {
     const rows = await this.table().findMany({ where: { projectId: target.projectId, storageKey: target.storageKey, configId: { not: target.configId } }, include: { config: true } });
     // Backfill source rows start PENDING too. Actual bytes must pass verification
@@ -344,6 +378,50 @@ export class ReplicaService {
     });
     if (legacy?.cdnConfig && legacy.cdnConfigId !== target.configId && !this.isBackupOnly(legacy.cdnConfig.provider)) {
       return this.readVerified(this.runtime(legacy.cdnConfig), target.storageKey, target.size, target.checksum || legacy.checksum);
+    }
+    // A targeted scan intentionally omits the old account from queue targets.
+    // Resolve historical/generated object origins as read-only byte sources.
+    const version = await this.prisma.fileVersion.findFirst({
+      where: { storageKey: target.storageKey, file: { projectId: target.projectId, status: 'ACTIVE', deletedAt: null } },
+      select: { cdnConfigId: true, checksum: true },
+    });
+    if (version?.cdnConfigId && version.cdnConfigId !== target.configId) {
+      const config = await this.prisma.cdnConfig.findFirst({ where: { id: version.cdnConfigId } });
+      if (config && !this.isBackupOnly(config.provider)) {
+        return this.readVerified(this.runtime(config), target.storageKey, target.size, target.checksum || version.checksum);
+      }
+    }
+    const derivative = await this.prisma.fileDerivative.findFirst({
+      where: { storageKey: target.storageKey, status: 'READY', file: { projectId: target.projectId, status: 'ACTIVE', deletedAt: null } },
+      select: { file: { select: { cdnConfig: true } } },
+    });
+    const origin = derivative?.file.cdnConfig;
+    if (origin && origin.id !== target.configId && !this.isBackupOnly(origin.provider)) {
+      return this.readVerified(this.runtime(origin), target.storageKey, target.size, target.checksum);
+    }
+    // Segment keys are members of an HLS manifest, rather than derivative rows
+    // of their own. A prefix match alone cannot establish ownership.
+    const parts = target.storageKey.split('/').slice(0, -1);
+    const prefixes = parts.map((_, index) => parts.slice(0, index + 1).join('/'));
+    if (prefixes.length) {
+      let cursor = '';
+      do {
+        const manifests = await this.prisma.fileDerivative.findMany({ where: {
+          kind: 'HLS', status: 'READY', file: { projectId: target.projectId, status: 'ACTIVE', deletedAt: null },
+          OR: prefixes.map(prefix => ({ meta: { path: '$.segmentPrefix', equals: prefix } })),
+          ...(cursor ? { id: { gt: cursor } } : {}),
+        }, orderBy: { id: 'asc' }, take: 100, select: { id: true, meta: true, file: { select: { cdnConfig: true } } } });
+        for (const manifest of manifests) {
+          const meta = (manifest.meta && typeof manifest.meta === 'object' && !Array.isArray(manifest.meta) ? manifest.meta : {}) as Record<string, unknown>;
+          if (typeof meta.segmentPrefix !== 'string' || !Array.isArray(meta.files) ||
+            !meta.files.some(name => typeof name === 'string' && `${meta.segmentPrefix as string}/${name}` === target.storageKey)) continue;
+          const config = manifest.file.cdnConfig;
+          if (config && config.id !== target.configId && !this.isBackupOnly(config.provider)) {
+            return this.readVerified(this.runtime(config), target.storageKey, target.size, target.checksum);
+          }
+        }
+        cursor = manifests.length === 100 ? manifests[manifests.length - 1].id : '';
+      } while (cursor);
     }
     throw new NotFoundException('没有可验证的源副本，无法补齐目标对象。');
   }
@@ -410,15 +488,18 @@ export class ReplicaService {
     } finally { await this.limits.settleRead(ticket, 0n); }
   }
 
-  private async uploadDisk(config: RuntimeCdnConfig, key: string, object: VerifiedObject, mimeType: string, originalName: string): Promise<UploadReservation> {
+  private async uploadDisk(config: RuntimeCdnConfig, key: string, object: VerifiedObject, mimeType: string, originalName: string,
+    context: Pick<StorageUploadFileParams, 'project' | 'folderPath'> = {}): Promise<UploadReservation> {
     const adapter = this.registry.adapter(config.provider);
     if (!adapter.uploadFile && object.size > BUFFER_LIMIT) throw new Error('存储适配器未支持流式复制，超过 32MiB 的对象已保留本地等待重试。');
     const reservation = await this.limits.reserveUpload(config, object.size, key);
     try {
-      const params: StorageUploadFileParams = { key, path: object.path, size: object.size, checksum: object.checksum, mimeType, originalName };
+      const { project, folderPath } = context;
+      const identity = { ...(project ? { project } : {}), ...(folderPath !== undefined ? { folderPath } : {}) };
+      const params: StorageUploadFileParams = { key, path: object.path, size: object.size, checksum: object.checksum, mimeType, originalName, ...identity };
       const stored = adapter.uploadFile
         ? await adapter.uploadFile(config, params)
-        : await adapter.upload(config, { key, buffer: await readFile(object.path), mimeType, originalName });
+        : await adapter.upload(config, { key, buffer: await readFile(object.path), mimeType, originalName, ...identity });
       if (normalizeKey(stored.storageKey) !== normalizeKey(key)) throw new Error('复制目标返回了不同的不可变 key。');
       return reservation;
     } catch (error) {
@@ -434,7 +515,8 @@ export class ReplicaService {
     const object = await spoolVerifiedStream(downloaded.stream!, file.size, file.checksum);
     let reservation: UploadReservation | undefined;
     try {
-      reservation = await this.uploadDisk(this.runtime(target), file.storageKey, object, file.mimeType, file.originalName);
+      const metadata = await this.metadataForReplica(file);
+      reservation = await this.uploadDisk(this.runtime(target), file.storageKey, object, file.mimeType, file.originalName, metadata);
       await this.confirmStoredObject(this.runtime(target), file.storageKey, object.size, object.checksum, reservation.verification);
       await this.limits.finishUpload(reservation, 'PRESENT');
       await this.table().upsert({ where: { projectId_storageKey_configId: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id } },
@@ -528,10 +610,12 @@ export class ReplicaService {
     return { scanned: rows.length, ready, failed, nextCursor: rows.length === take ? rows[rows.length - 1].id : null };
   }
 
-  async ensureProjectReplicas(projectId: string, cursor?: string, requestedLimit = 20): Promise<Record<string, unknown>> {
+  async ensureProjectReplicas(projectId: string, cursor?: string, requestedLimit = 20, targetConfigId?: string): Promise<Record<string, unknown>> {
+    if (targetConfigId) await this.assertProjectSyncTarget(this.prisma, projectId, targetConfigId);
     const local = await this.getLocalStorage(projectId);
     const take = Math.min(50, Math.max(1, Math.floor(requestedLimit) || 20));
-    const configs = await this.prisma.cdnConfig.findMany({ where: { enabled: true, projectId: null, projectBindings: { some: { projectId } } } });
+    const configs = await this.prisma.cdnConfig.findMany({ where: { enabled: true, projectId: null, projectBindings: { some: { projectId } },
+      ...(targetConfigId ? { id: targetConfigId } : {}) } });
     await this.table().updateMany({ where: { projectId, configId: { in: configs.map(c => c.id) }, status: 'SKIPPED', leaseOwner: null },
       data: { status: 'PENDING', nextAttemptAt: new Date(), lastError: null } });
     const files = await this.prisma.managedFile.findMany({ where: { projectId, status: 'ACTIVE', ...(cursor ? { id: { gt: cursor } } : {}) },
@@ -554,13 +638,13 @@ export class ReplicaService {
         const indexed = await this.table().findFirst({ where: { projectId, storageKey: object.storageKey } });
         if (!indexed && object.size === undefined) {
           if (!object.configId) throw new NotFoundException('旧 HLS 对象缺少原存储配置。');
-          await this.materializeUploadedObject(projectId, object.configId, object.storageKey, undefined, null, 'application/octet-stream', object.storageKey.split('/').pop() || 'object');
+          await this.materializeUploadedObject(projectId, object.configId, object.storageKey, undefined, null, 'application/octet-stream', object.storageKey.split('/').pop() || 'object', targetConfigId);
           queued++;
           continue;
         }
         const size = indexed?.size ?? object.size!;
         const checksum = indexed?.checksum ?? object.checksum;
-        const configIds = [...new Set([local.id, ...configs.map(c => c.id), ...(object.configId ? [object.configId] : [])])];
+        const configIds = [...new Set([local.id, ...configs.map(c => c.id), ...(!targetConfigId && object.configId ? [object.configId] : [])])];
         const count = await this.prisma.$transaction(async tx => {
           await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
           const current = await tx.managedFile.findFirst({ where: { id: file.id, status: 'ACTIVE' }, select: { id: true } });
@@ -578,24 +662,62 @@ export class ReplicaService {
   async enqueueProject(projectId: string, cursor = '', client?: Prisma.TransactionClient): Promise<{ taskId: string }> {
     const enqueue = async (tx: Prisma.TransactionClient) => {
       await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
-      const existing = await tx.task.findFirst({ where: { projectId, type: 'STORAGE_REPLICA_SYNC', status: 'RUNNING' } });
-      if (existing) {
-        const detail = jsonRecord(existing.detail);
-        await tx.task.updateMany({ where: { id: existing.id, status: 'RUNNING' }, data: { detail: { ...detail, rescanRequested: true } } });
-        return { taskId: existing.id };
-      }
-      const task = await tx.task.create({ data: { projectId, type: 'STORAGE_REPLICA_SYNC', title: '存储副本补齐', status: 'RUNNING',
-        detail: { cursor, scanned: 0, queued: 0, rescanRequested: false }, progress: 0 } });
-      return { taskId: task.id };
+      return this.enqueueScan(tx, projectId, cursor);
     };
     return client ? enqueue(client) : this.prisma.$transaction(enqueue);
+  }
+
+  async enqueueProjectSync(projectId: string, targetConfigId: string, client?: Prisma.TransactionClient): Promise<{ taskId: string; requeued: number }> {
+    const enqueue = async (tx: Prisma.TransactionClient) => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
+      await this.assertProjectSyncTarget(tx, projectId, targetConfigId);
+      const now = new Date();
+      const result = await this.table(tx).updateMany({ where: { projectId, configId: targetConfigId,
+        status: { in: ['READY', 'FAILED', 'MISSING', 'SKIPPED', 'UNVERIFIED'] },
+        OR: [{ leaseOwner: null }, { leaseUntil: null }, { leaseUntil: { lte: now } }] },
+        data: { status: 'PENDING', nextAttemptAt: now, verifiedAt: null, lastError: null, leaseOwner: null, leaseUntil: null } });
+      return { ...await this.enqueueScan(tx, projectId, '', targetConfigId), requeued: result.count };
+    };
+    return client ? enqueue(client) : this.prisma.$transaction(enqueue);
+  }
+
+  private async assertProjectSyncTarget(client: Prisma.TransactionClient, projectId: string, configId: string): Promise<void> {
+    const config = await client.cdnConfig.findFirst({ where: { id: configId, enabled: true, projectId: null,
+      provider: { not: CdnProvider.LOCAL }, projectBindings: { some: { projectId } } }, select: { id: true } });
+    if (!config) throw new NotFoundException('目标存储已停用或未绑定此项目，请刷新后重试。');
+  }
+
+  private async enqueueScan(tx: Prisma.TransactionClient, projectId: string, cursor: string, targetConfigId?: string): Promise<{ taskId: string }> {
+    const tasks = await tx.task.findMany({ where: { projectId, type: 'STORAGE_REPLICA_SYNC', status: 'RUNNING' }, orderBy: { createdAt: 'asc' } });
+    const existing = tasks.find(task => jsonRecord(task.detail).targetConfigId === targetConfigId);
+    if (existing) {
+      const detail = jsonRecord(existing.detail);
+      await tx.task.updateMany({ where: { id: existing.id, status: 'RUNNING' }, data: { detail: { ...detail, rescanRequested: true } } });
+      return { taskId: existing.id };
+    }
+    const task = await tx.task.create({ data: { projectId, type: 'STORAGE_REPLICA_SYNC', title: targetConfigId ? '项目同步到云端' : '存储副本补齐', status: 'RUNNING',
+      detail: { cursor, scanned: 0, queued: 0, rescanRequested: false, ...(targetConfigId ? { targetConfigId, phase: 'SCANNING' } : {}) }, progress: 0 } });
+    return { taskId: task.id };
   }
 
   async processSyncBatch(owner: string): Promise<void> {
     const now = new Date();
     const claimable = { type: 'STORAGE_REPLICA_SYNC', status: 'RUNNING', OR: [{ leaseOwner: null }, { leaseOwner: owner }, { leaseUntil: { lte: now } }] };
-    const task = await this.prisma.task.findFirst({ where: claimable, orderBy: { createdAt: 'asc' } });
-    if (!task?.projectId) return;
+    // Poll waiting uploads without letting the oldest one monopolize scans.
+    // Updated timestamps rotate a bounded group when many projects are waiting.
+    const tasks = await this.prisma.task.findMany({ where: claimable, orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }], take: 10 });
+    for (const task of tasks) {
+      if (!task.projectId) continue;
+      const detail = jsonRecord(task.detail);
+      const waiting = typeof detail.targetConfigId === 'string' && detail.phase === 'AWAITING_REPLICAS';
+      await this.processSyncTask(task, owner, claimable);
+      if (!waiting) break;
+    }
+  }
+
+  private async processSyncTask(task: { id: string; projectId: string | null; detail: Prisma.JsonValue }, owner: string,
+    claimable: Record<string, unknown>): Promise<void> {
+    if (!task.projectId) return;
     const claimed = await this.prisma.task.updateMany({ where: { id: task.id, ...claimable }, data: { leaseOwner: owner, leaseUntil: new Date(Date.now() + LEASE_MS) } });
     if (claimed.count !== 1) return;
     const detail = jsonRecord(task.detail);
@@ -603,7 +725,21 @@ export class ReplicaService {
       data: { leaseUntil: new Date(Date.now() + LEASE_MS) } }).catch(() => this.logger.warn('副本扫描任务续租失败。')); }, 30_000);
     heartbeat.unref?.();
     try {
-      const result = await this.ensureProjectReplicas(task.projectId, typeof detail.cursor === 'string' ? detail.cursor : '', 20);
+      const targetConfigId = typeof detail.targetConfigId === 'string' ? detail.targetConfigId : undefined;
+      if (targetConfigId && detail.phase === 'AWAITING_REPLICAS') {
+        await this.checkSelectedReplicas(task.id, task.projectId, targetConfigId, owner);
+        return;
+      }
+      if (targetConfigId && detail.retryReplicas === true) {
+        await this.assertProjectSyncTarget(this.prisma, task.projectId, targetConfigId);
+        const now = new Date();
+        await this.table().updateMany({ where: { projectId: task.projectId, configId: targetConfigId,
+          status: { in: ['FAILED', 'MISSING', 'SKIPPED', 'UNVERIFIED'] },
+          OR: [{ leaseOwner: null }, { leaseUntil: null }, { leaseUntil: { lte: now } }] },
+          data: { status: 'PENDING', nextAttemptAt: now, verifiedAt: null, lastError: null, leaseOwner: null, leaseUntil: null } });
+      }
+      const result = await this.ensureProjectReplicas(task.projectId, typeof detail.cursor === 'string' ? detail.cursor : '', 20,
+        targetConfigId);
       const cursor = typeof result.nextCursor === 'string' ? result.nextCursor : '';
       await this.prisma.$transaction(async tx => {
         // Binding updates use this same project lock. Re-read the persisted
@@ -613,10 +749,12 @@ export class ReplicaService {
         if (!latest || latest.status !== 'RUNNING' || latest.leaseOwner !== owner) return;
         const latestDetail = jsonRecord(latest.detail);
         const rescan = !cursor && latestDetail.rescanRequested === true;
-        const running = Boolean(cursor) || rescan;
+        const scanning = Boolean(cursor) || rescan;
+        const running = scanning || Boolean(targetConfigId);
         await tx.task.updateMany({ where: { id: task.id, status: 'RUNNING', leaseOwner: owner }, data: {
-          detail: { cursor, scanned: (Number(detail.scanned) || 0) + Number(result.scanned), queued: (Number(detail.queued) || 0) + Number(result.queued),
-            rescanRequested: rescan ? false : latestDetail.rescanRequested === true },
+          detail: { ...latestDetail, cursor, scanned: (Number(detail.scanned) || 0) + Number(result.scanned), queued: (Number(detail.queued) || 0) + Number(result.queued),
+            rescanRequested: rescan ? false : latestDetail.rescanRequested === true,
+            ...(targetConfigId ? { phase: scanning ? 'SCANNING' : 'AWAITING_REPLICAS', retryReplicas: false } : {}) },
           status: running ? 'RUNNING' : 'COMPLETED', progress: running ? 0 : 100, finishedAt: running ? null : new Date(),
           leaseOwner: null, leaseUntil: null, error: null,
         } });
@@ -626,6 +764,58 @@ export class ReplicaService {
         status: 'FAILED', error: safeError(error), leaseOwner: null, leaseUntil: null, finishedAt: new Date(),
       } });
     } finally { clearInterval(heartbeat); }
+  }
+
+  private async checkSelectedReplicas(taskId: string, projectId: string, configId: string, owner: string): Promise<void> {
+    await this.assertProjectSyncTarget(this.prisma, projectId, configId);
+    const counts = { replicaTotal: 0, replicaReady: 0, replicaPending: 0, replicaFailed: 0 };
+    const checked = new Set<string>();
+    let cursor = '';
+    do {
+      // This is a read-only status snapshot of objects still needed by active
+      // files. Old orphan/recycled replicas must not hold this task open.
+      const files = await this.prisma.managedFile.findMany({ where: { projectId, status: 'ACTIVE', ...(cursor ? { id: { gt: cursor } } : {}) },
+        orderBy: { id: 'asc' }, take: 100, select: { id: true, storageKey: true, versions: { select: { storageKey: true } },
+          derivatives: { where: { status: 'READY' }, select: { storageKey: true, kind: true, status: true, meta: true } } } });
+      const keys = [...new Set(files.flatMap(file => [file.storageKey, ...file.versions.map(version => version.storageKey),
+        ...file.derivatives.filter(derivative => derivative.status === 'READY').flatMap(derivative => {
+          const meta = (derivative.meta && typeof derivative.meta === 'object' && !Array.isArray(derivative.meta) ? derivative.meta : {}) as Record<string, unknown>;
+          return [derivative.storageKey, ...(derivative.kind === 'HLS' && typeof meta.segmentPrefix === 'string' && Array.isArray(meta.files)
+            ? meta.files.filter((name): name is string => typeof name === 'string').map(name => `${meta.segmentPrefix as string}/${name}`) : [])];
+        })]))].filter(key => !checked.has(key));
+      for (let index = 0; index < keys.length; index += 200) {
+        const chunk = keys.slice(index, index + 200);
+        const rows = await this.table().findMany({ where: { projectId, configId, storageKey: { in: chunk } },
+          select: { storageKey: true, status: true, leaseOwner: true, leaseUntil: true } });
+        const byKey = new Map(rows.map(row => [row.storageKey, row]));
+        for (const key of chunk) {
+          checked.add(key); counts.replicaTotal++;
+          const row = byKey.get(key);
+          const leased = row?.leaseOwner && row.leaseUntil && row.leaseUntil > new Date();
+          if (leased) counts.replicaPending++;
+          else if (row?.status === 'READY') counts.replicaReady++;
+          else if (!row || ['FAILED', 'MISSING', 'SKIPPED', 'DELETING'].includes(row.status)) counts.replicaFailed++;
+          else counts.replicaPending++;
+        }
+      }
+      cursor = files.length === 100 ? files[files.length - 1].id : '';
+    } while (cursor);
+    await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${projectId} FOR UPDATE`;
+      const latest = await tx.task.findUnique({ where: { id: taskId } });
+      if (!latest || latest.status !== 'RUNNING' || latest.leaseOwner !== owner) return;
+      const detail = jsonRecord(latest.detail);
+      const rescan = detail.rescanRequested === true;
+      const status = rescan || counts.replicaPending > 0 ? 'RUNNING' : 'COMPLETED';
+      const failed = !rescan && counts.replicaFailed > 0;
+      await tx.task.updateMany({ where: { id: taskId, status: 'RUNNING', leaseOwner: owner }, data: {
+        detail: { ...detail, ...counts, ...(rescan ? { phase: 'SCANNING', cursor: '', rescanRequested: false } : {}) },
+        status: failed ? 'FAILED' : status,
+        progress: rescan ? 0 : !failed && status === 'COMPLETED' ? 100 : counts.replicaTotal ? Math.min(99, Math.floor(100 * counts.replicaReady / counts.replicaTotal)) : 0,
+        error: failed ? `所选云存储有 ${counts.replicaFailed} 个所需对象同步失败或缺失，请重试此任务。` : null,
+        finishedAt: !failed && status === 'RUNNING' ? null : new Date(), leaseOwner: null, leaseUntil: null,
+      } });
+    });
   }
 
   private runtime(config: CdnConfig): RuntimeCdnConfig {
@@ -682,6 +872,7 @@ function safeError(error: unknown): string {
     '复制目标返回了不同的不可变 key。', '存储适配器未支持流式复制，超过 32MiB 的对象已保留本地等待重试。',
     '存储已达到空间或流量阈值，等待用量恢复后重试。', '不可变存储对象内容冲突，请使用新的存储 key。',
     '不可变本地对象内容冲突，请使用新的存储 key。',
+    '副本所属项目资料不完整，等待修复后重试。',
   ]);
   return known.has(message) ? message : '存储连接或复制失败，请检查配置并重试。';
 }

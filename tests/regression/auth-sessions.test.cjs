@@ -313,3 +313,78 @@ test('LOGIN audit fits varchar255 and retains distinct identities from the full 
   assert.notEqual(logins[0].userAgent, logins[1].userAgent);
   assert.equal(f.active().length, 2);
 });
+
+test('a previous refresh cookie in the concurrency grace window still identifies the current session', async () => {
+  const f = await fixture(), initial = await f.login();
+  const currentId = f.active()[0].id;
+  await f.service.refresh(initial.refreshToken, device);
+  await f.login({ ...device, userAgent: 'Another browser on the same network' });
+  const sessions = await f.service.listSessions(f.user, initial.refreshToken);
+  assert.equal(sessions[0].id, currentId);
+  assert.equal(sessions[0].current, true);
+  assert.equal(sessions.filter((row) => row.current).length, 1);
+});
+
+test('exit other sessions with a concurrent previous cookie preserves the current replacement', async () => {
+  const f = await fixture(), initial = await f.login();
+  const currentId = f.active()[0].id;
+  const replacement = await f.service.refresh(initial.refreshToken, device);
+  const otherDevice = { ...device, userAgent: 'Another browser on the same network' };
+  const other = await f.login(otherDevice);
+  const result = await f.service.revokeOtherSessions(f.user, initial.refreshToken);
+  assert.equal(result.success, true);
+  assert.equal(result.revoked, 1);
+  assert.deepEqual(f.active().map((row) => row.id), [currentId]);
+  await f.service.refresh(replacement.refreshToken, device);
+  await assert.rejects(f.service.refresh(other.refreshToken, otherDevice), (error) => error.getStatus() === 401);
+});
+
+for (const token of [undefined, 'unknown-refresh-cookie']) {
+  test(`exit other sessions refuses an ${token ? 'unknown' : 'absent'} current cookie without changing any session`, async () => {
+    const f = await fixture();
+    await f.login();
+    await f.login({ ...device, userAgent: 'Another browser on the same network' });
+    const before = copy(f.rows);
+    await assert.rejects(f.service.revokeOtherSessions(f.user, token), (error) => error.getStatus() === 400);
+    assert.deepEqual(f.rows, before);
+    assert.equal(f.audits.filter((entry) => entry.action === 'SESSION_REVOKE').length, 0);
+  });
+}
+
+test('another account refresh cookie cannot authorize exit other sessions', async () => {
+  const f = await fixture(), current = await f.login();
+  const foreign = { ...copy(f.active()[0]), id: 'foreign-session', userId: 'another-account', tokenHash: digest('foreign-refresh-cookie') };
+  f.rows.push(foreign);
+  const before = copy(f.rows);
+  await assert.rejects(f.service.revokeOtherSessions(f.user, 'foreign-refresh-cookie'), (error) => error.getStatus() === 400);
+  assert.deepEqual(f.rows, before);
+  await f.service.refresh(current.refreshToken, device);
+});
+
+test('an expired grace cookie cannot mark a current session or exit other sessions', async (t) => {
+  const f = await fixture(), now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const initial = await f.login();
+  const replacement = await f.service.refresh(initial.refreshToken, device);
+  await f.login({ ...device, userAgent: 'Another browser on the same network' });
+  t.mock.method(Date, 'now', () => now + 6001);
+  const before = copy(f.rows);
+  assert.ok((await f.service.listSessions(f.user, initial.refreshToken)).every((row) => !row.current));
+  await assert.rejects(f.service.revokeOtherSessions(f.user, initial.refreshToken), (error) => error.getStatus() === 400);
+  assert.deepEqual(f.rows, before);
+  await f.service.refresh(replacement.refreshToken, device);
+});
+
+test('only active sessions appear and distinct client names at one IP remain visible', async () => {
+  const f = await fixture(), current = await f.login();
+  const historical = await f.login({ ...device, userAgent: 'UFM-Historical-Script' });
+  const sample = copy(f.active()[0]);
+  f.rows.push({ ...sample, id: 'expired-session', tokenHash: digest('expired'), userAgent: 'Expired browser', expiresAt: new Date(0) });
+  f.rows.push({ ...sample, id: 'revoked-session', tokenHash: digest('revoked'), userAgent: 'Revoked browser', revokedAt: new Date() });
+  const sessions = await f.service.listSessions(f.user, current.refreshToken);
+  assert.equal(sessions.length, 2);
+  assert.equal(sessions[0].current, true);
+  assert.equal(sessions[1].userAgent, 'UFM-Historical-Script');
+  assert.equal(sessions[1].current, false);
+  assert.ok(f.active().some((row) => row.tokenHash === digest(historical.refreshToken)));
+});

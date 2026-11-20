@@ -316,11 +316,12 @@ test('worker can verify an old current source without indexing or queueing the u
   const destination = config('cloud');
   let uploaded = false;
   const db = {
+    project: { findFirst: async () => ({ id: 'p1', name: 'fixture project' }) },
     cdnConfig: {
       findMany: async ({ where }) => { assert.equal(where.projectBindings.some.projectId, 'p1'); return [destination]; },
       findFirst: async ({ where }) => [source, destination].find(value => value.id === where.id) ?? null,
     },
-    managedFile: { findFirst: async ({ where }) => { assert.equal(where.projectId, 'p1'); assert.equal(where.storageKey, 'f1/current'); assert.equal(where.status, 'ACTIVE'); assert.equal(where.deletedAt, null); return { ...file('f1', 'p1'), cdnConfig: source }; } },
+    managedFile: { findFirst: async ({ where, include }) => { assert.equal(where.projectId, 'p1'); assert.equal(where.storageKey, 'f1/current'); if (include?.cdnConfig) { assert.equal(where.status, 'ACTIVE'); assert.equal(where.deletedAt, null); } return { ...file('f1', 'p1'), cdnConfig: source }; } },
     projectStorageBinding: { findMany: async () => [{ configId: 'cloud', config: destination }] },
     storageReplica: {
       findMany: async ({ where }) => [{ ...target, config: destination }].filter(value => matches(value, where)),

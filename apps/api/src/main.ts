@@ -22,6 +22,7 @@ async function bootstrap(): Promise<void> {
   ensureDatabaseUrl();
 
   const app = await NestFactory.create(AppModule, { cors: false, rawBody: true });
+  app.enableShutdownHooks(['SIGTERM', 'SIGINT']);
   const configService = app.get(ConfigService);
   // Optional. When unset, share/public URLs use the request Host; CORS reflects the caller.
   const webPublicUrl = getConfiguredPublicUrl((key) => configService.get<string>(key));

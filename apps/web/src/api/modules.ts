@@ -1082,7 +1082,7 @@ export const settingsApi = {
 };
 
 export const notificationApi = {
-  list(params?: { unreadOnly?: boolean; page?: number; pageSize?: number }) {
+  list(params?: { unreadOnly?: boolean; page?: number; pageSize?: number }, options: ReadOptions = {}) {
     return http.get<
       unknown,
       {
@@ -1100,6 +1100,7 @@ export const notificationApi = {
         pageSize: number;
       }
     >('/notifications', {
+      ...options,
       params: compactParams({
         unreadOnly: params?.unreadOnly ? '1' : undefined,
         page: params?.page,
@@ -1107,8 +1108,8 @@ export const notificationApi = {
       }),
     });
   },
-  unreadCount() {
-    return http.get<unknown, { count: number }>('/notifications/unread-count');
+  unreadCount(options: ReadOptions = {}) {
+    return http.get<unknown, { count: number }>('/notifications/unread-count', options);
   },
   markRead(payload: { ids?: string[]; all?: boolean }) {
     return http.post<unknown, { success: boolean }>('/notifications/read', payload);
@@ -1145,8 +1146,8 @@ export interface VersionCheckResult {
 }
 
 export const versionApi = {
-  check() {
-    return http.get<unknown, VersionCheckResult>('/version');
+  check(options: ReadOptions = {}) {
+    return http.get<unknown, VersionCheckResult>('/version', options);
   },
 };
 

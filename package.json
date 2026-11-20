@@ -32,6 +32,7 @@
     "backup:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/backup-full.ps1",
     "test": "npm run build:plugins && npm run test:regression && npm run test:plugins",
     "test:regression": "node --test --test-concurrency=4 tests/regression/*.test.cjs",
+    "test:acceptance:layout": "node tests/acceptance/admin-layout-ui.cjs",
     "test:acceptance:browser": "node tests/acceptance/browser.cjs",
     "test:acceptance:share-ui": "node tests/acceptance/public-share-ui.cjs",
     "test:acceptance:verify": "node tests/acceptance/verify-retained.cjs",

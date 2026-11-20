@@ -22,6 +22,7 @@ function matches(row, where = {}) {
     if (key === 'projectBindings') return !row.unbound;
     if (key === 'projectId_storageKey_configId') return matches(row, value);
     if (value && typeof value === 'object' && !(value instanceof Date)) {
+      if ('path' in value && 'equals' in value) return value.path.replace(/^\$\./, '').split('.').reduce((result, part) => result?.[part], row[key]) === value.equals;
       if ('in' in value) return value.in.includes(row[key]);
       if ('not' in value) return row[key] !== value.not;
       if ('lte' in value) return row[key] != null && row[key] <= value.lte;
@@ -33,7 +34,7 @@ function matches(row, where = {}) {
 }
 function fixture() {
   const configs = [config('local', 'LOCAL', 100), config('cloud-a', 'S3', 1), config('cloud-b', 'UPYUN', 2)];
-  const records = [], objects = new Map(), uploads = [], failedUploads = new Set();
+  const records = [], objects = new Map(), uploads = [], uploadContexts = [], failedUploads = new Set();
   let nextId = 1;
   const create = data => { const row = { id: String(nextId++), status: 'PENDING', attempts: 0,
     nextAttemptAt: new Date(0), leaseOwner: null, leaseUntil: null, lastError: null,
@@ -53,24 +54,127 @@ function fixture() {
   const db = { storageReplica: replica,
     cdnConfig: { findMany: async ({ where } = {}) => configs.filter(c => matches(c, where)), findFirst: async ({ where } = {}) => { const row = configs.find(c => matches(c, where)); return row ? { ...row } : null; },
       updateMany: async ({ where, data }) => { const found = configs.filter(c => matches(c, where)); for (const c of found) for (const [k, v] of Object.entries(data)) c[k] = v && typeof v === 'object' ? 'increment' in v ? c[k] + v.increment : c[k] - v.decrement : v; return { count: found.length }; } },
-    project: { findFirst: async () => ({ id: 'p', activeCdnConfigId: 'cloud-a', activeCdnConfig: configs[1] }), findMany: async()=>[] },
-    task:{findFirst:async({where})=>tasks.find(t=>matches(t,where))||null,findUnique:async({where})=>tasks.find(t=>matches(t,where))||null, create:async({data})=>{const t={id:`task${tasks.length}`,leaseOwner:null,leaseUntil:null,createdAt:new Date(),...data};tasks.push(t);return t;},updateMany:async({where,data})=>{const found=tasks.filter(t=>matches(t,where));for(const t of found)Object.assign(t,data);return{count:found.length};}},
+    project: { findFirst: async () => ({ id: 'p', name: '财务资料', activeCdnConfigId: 'cloud-a', activeCdnConfig: configs[1] }), findMany: async()=>[] },
+    task:{findMany:async({where,take=Infinity,orderBy})=>tasks.filter(t=>matches(t,where)).sort((a,b)=>{
+      for(const order of Array.isArray(orderBy)?orderBy:orderBy?[orderBy]:[])for(const[key,direction]of Object.entries(order)){if(a[key]<b[key])return direction==='asc'?-1:1;if(a[key]>b[key])return direction==='asc'?1:-1;}return 0;
+    }).slice(0,take),findFirst:async({where})=>tasks.find(t=>matches(t,where))||null,findUnique:async({where})=>tasks.find(t=>matches(t,where))||null, create:async({data})=>{const t={id:`task${tasks.length}`,leaseOwner:null,leaseUntil:null,createdAt:new Date(),updatedAt:new Date(),...data};tasks.push(t);return t;},updateMany:async({where,data})=>{const found=tasks.filter(t=>matches(t,where));for(const t of found)Object.assign(t,data,{updatedAt:new Date()});return{count:found.length};}},
     $queryRaw:async()=>[],
     managedFile: { findMany: async () => [], findFirst: async ({where}) => ({id:where.id,status:'ACTIVE'}) },
+    fileVersion: { findFirst: async () => null },
+    fileDerivative: { findFirst: async () => null, findMany: async () => [] },
     $transaction: async fn => fn(db),
   };
   const registry = { adapter: provider => ({
-    upload: async (c, p) => { uploads.push(c.id); if (failedUploads.has(c.id)) throw new Error('network unavailable'); objects.set(`${c.id}:${p.key}`, Buffer.from(p.buffer)); return { storageKey: p.key, publicUrl: 'https://cloud.invalid/secret' }; },
+    upload: async (c, p) => { uploads.push(c.id); uploadContexts.push({ configId: c.id, project: p.project, folderPath: p.folderPath }); if (failedUploads.has(c.id)) throw new Error('network unavailable'); objects.set(`${c.id}:${p.key}`, Buffer.from(p.buffer)); return { storageKey: p.key, publicUrl: 'https://cloud.invalid/secret' }; },
     getDownloadTarget: async (c, key) => { const data = objects.get(`${c.id}:${key}`); if (!data) throw new Error('object missing'); return { type: 'stream', stream: Readable.from([data]), contentLength: data.length }; },
     getDownloadUrl: async (c, key) => `https://cloud.invalid/${c.id}/${key}`,
     createDirectUpload: async () => ({ provider, uploadUrl: 'https://cloud.invalid/upload' }),
   }) };
   const service = new StorageService(configService, db, registry);
-  return { configs, records, objects, uploads, failedUploads, db, registry, service, tasks };
+  return { configs, records, objects, uploads, uploadContexts, failedUploads, db, registry, service, tasks };
 }
 async function collect(target) { assert.equal(target.type, 'stream'); const chunks = []; for await (const c of target.stream) chunks.push(Buffer.from(c)); return Buffer.concat(chunks); }
 function replicas(f) { const { ReplicaService } = require('../../apps/api/src/storage/replica.service.ts'); return new ReplicaService(configService, f.db, f.registry); }
 function row(f, configId, status = 'READY', key = 'p/object') { const r = { id: `r${f.records.length}`, projectId: 'p', configId, storageKey: key, size: BigInt(bytes.length), checksum: hash(bytes), status, attempts: 0, nextAttemptAt: new Date(0), leaseOwner: null, leaseUntil: null, verifiedAt: null }; f.records.push(r); return r; }
+
+function metadataFixture({ files = [], versions = [], derivatives = [] } = {}) {
+  const f = fixture(), uploads = [], repairs = [], base = f.registry.adapter;
+  f.db.managedFile.findFirst = async ({ where }) => files.find(file => matches(file, where)) ?? null;
+  f.db.fileVersion.findFirst = async ({ where }) => versions.find(version => matches(version, where)) ?? null;
+  f.db.fileDerivative.findFirst = async ({ where }) => derivatives.find(derivative => matches(derivative, where)) ?? null;
+  f.db.fileDerivative.findMany = async ({ where, take = Infinity }) => derivatives.filter(derivative => matches(derivative, where)).slice(0, take);
+  f.registry.adapter = provider => {
+    const adapter = base(provider);
+    const store = async (config, params, calls) => {
+      calls.push({ key: params.key, originalName: params.originalName, mimeType: params.mimeType,
+        ...(params.project ? { project: params.project } : {}), ...(params.folderPath !== undefined ? { folderPath: params.folderPath } : {}) });
+      return adapter.upload(config, { ...params, buffer: await require('node:fs/promises').readFile(params.path) });
+    };
+    return { ...adapter,
+      uploadFile: (config, params) => store(config, params, uploads),
+      ...(provider === 'LOCAL' ? {
+        getObjectFingerprint: async (config, key) => {
+          const data = f.objects.get(`${config.id}:${key}`);
+          return data ? { size: data.length, checksum: hash(data) } : null;
+        },
+        repairFile: (config, params) => store(config, params, repairs),
+      } : {}),
+    };
+  };
+  return { ...f, metadataUploads: uploads, metadataRepairs: repairs };
+}
+
+test('worker metadata: stream upload preserves the exact current file name and MIME within its project', async () => {
+  const key = 'p/7d9b7c8491e34b969430eeb56c9c322d';
+  const f = metadataFixture({ files: [
+    { projectId: 'other', storageKey: key, originalName: 'other-project.exe', mimeType: 'application/x-msdownload' },
+    { projectId: 'p', storageKey: key, originalName: '年度财务报告 2026.pdf', mimeType: 'application/pdf', folderPath: '报告/2026', status: 'ACTIVE', deletedAt: null },
+  ], versions: [{ storageKey: key, file: { projectId: 'p' }, originalName: 'old-name.txt', mimeType: 'text/plain' }] });
+  row(f, 'local', 'READY', key); const target = row(f, 'cloud-a', 'PENDING', key); f.objects.set(`local:${key}`, bytes);
+  assert.deepEqual(await replicas(f).runBatch('metadata-current'), { scanned: 1, ready: 1, failed: 0 });
+  assert.equal(target.status, 'READY');
+  assert.deepEqual(f.metadataUploads, [{ key, originalName: '年度财务报告 2026.pdf', mimeType: 'application/pdf', project: { id: 'p', name: '财务资料' }, folderPath: '报告/2026' }]);
+  assert.deepEqual(f.objects.get(`cloud-a:${key}`), bytes);
+});
+
+test('worker metadata: historical objects use their own version name and MIME rather than the current head', async () => {
+  const key = 'p/history-random-key';
+  const f = metadataFixture({ files: [{ projectId: 'p', storageKey: 'p/current-random-key', originalName: 'current.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }], versions: [
+    { storageKey: key, file: { projectId: 'other' }, originalName: 'other-project.exe', mimeType: 'application/x-msdownload' },
+    { storageKey: 'p/another-version', file: { projectId: 'p' }, originalName: 'unrelated.png', mimeType: 'image/png' },
+    { storageKey: key, file: { projectId: 'p', folderPath: '报告/历史' }, originalName: '历史报告.csv', mimeType: 'text/csv' },
+  ] });
+  row(f, 'local', 'READY', key); row(f, 'cloud-a', 'PENDING', key); f.objects.set(`local:${key}`, bytes);
+  assert.deepEqual(await replicas(f).runBatch('metadata-version'), { scanned: 1, ready: 1, failed: 0 });
+  assert.deepEqual(f.metadataUploads, [{ key, originalName: '历史报告.csv', mimeType: 'text/csv', project: { id: 'p', name: '财务资料' }, folderPath: '报告/历史' }]);
+});
+
+test('worker metadata: derivative objects keep their own MIME and key filename without inheriting the source name', async () => {
+  const key = 'p/derivatives/random-thumb.jpg';
+  const f = metadataFixture({ derivatives: [
+    { storageKey: key, file: { projectId: 'other' }, mimeType: 'video/mp4' },
+    { storageKey: key, file: { projectId: 'p', originalName: '课程录像.mp4', mimeType: 'video/mp4', folderPath: '培训' }, mimeType: 'image/jpeg' },
+  ] });
+  row(f, 'local', 'READY', key); row(f, 'cloud-a', 'PENDING', key); f.objects.set(`local:${key}`, bytes);
+  assert.deepEqual(await replicas(f).runBatch('metadata-derivative'), { scanned: 1, ready: 1, failed: 0 });
+  assert.deepEqual(f.metadataUploads, [{ key, originalName: 'random-thumb.jpg', mimeType: 'image/jpeg', project: { id: 'p', name: '财务资料' }, folderPath: '培训' }]);
+});
+
+test('worker metadata: missing file, version and derivative records retain the legacy fallback', async () => {
+  const key = 'p/orphan-object';
+  const f = metadataFixture(); row(f, 'local', 'READY', key); row(f, 'cloud-a', 'PENDING', key); f.objects.set(`local:${key}`, bytes);
+  assert.deepEqual(await replicas(f).runBatch('metadata-missing'), { scanned: 1, ready: 1, failed: 0 });
+  assert.deepEqual(f.metadataUploads, [{ key, originalName: 'orphan-object', mimeType: 'application/octet-stream', project: { id: 'p', name: '财务资料' } }]);
+});
+
+test('worker metadata: a metadata database error retries without uploading a misleading fallback name', async () => {
+  const f = metadataFixture(); row(f, 'local'); const target = row(f, 'cloud-a', 'PENDING'); f.objects.set('local:p/object', bytes);
+  f.db.managedFile.findFirst = async () => { throw new Error('metadata database temporarily unavailable'); };
+  assert.deepEqual(await replicas(f).runBatch('metadata-unavailable'), { scanned: 1, ready: 0, failed: 1 });
+  assert.equal(target.status, 'FAILED'); assert.equal(target.leaseOwner, null); assert.ok(target.nextAttemptAt > new Date());
+  assert.deepEqual(f.metadataUploads, []); assert.equal(f.objects.has('cloud-a:p/object'), false);
+});
+
+test('worker metadata: an unavailable project name retries without creating an unknown project folder', async () => {
+  for (const project of [null, { id: 'p', name: '' }, { id: 'p' }]) {
+    const f = metadataFixture(); row(f, 'local'); const target = row(f, 'cloud-a', 'PENDING'); f.objects.set('local:p/object', bytes);
+    f.db.project.findFirst = async () => project;
+    assert.deepEqual(await replicas(f).runBatch('project-unavailable'), { scanned: 1, ready: 0, failed: 1 });
+    assert.equal(target.status, 'FAILED'); assert.ok(target.nextAttemptAt > new Date());
+    assert.deepEqual(f.metadataUploads, []);
+  }
+});
+
+test('worker metadata: repairing a corrupted local copy uses the real name and MIME, including trashed files', async () => {
+  const key = 'p/repair-random-key';
+  const f = metadataFixture({ files: [{ projectId: 'p', storageKey: key, originalName: '回收站文档.txt', mimeType: 'text/plain', status: 'RECYCLED', deletedAt: new Date() }] });
+  const target = row(f, 'local', 'PENDING', key); row(f, 'cloud-a', 'READY', key);
+  f.objects.set(`local:${key}`, Buffer.alloc(bytes.length)); f.objects.set(`cloud-a:${key}`, bytes);
+  assert.deepEqual(await replicas(f).runBatch('metadata-repair'), { scanned: 1, ready: 1, failed: 0 });
+  assert.equal(target.status, 'READY');
+  assert.deepEqual(f.metadataRepairs, [{ key, originalName: '回收站文档.txt', mimeType: 'text/plain', project: { id: 'p', name: '财务资料' } }]);
+  assert.deepEqual(f.metadataUploads, []); assert.deepEqual(f.objects.get(`local:${key}`), bytes);
+});
 
 function backupFixture() {
   const f = fixture(); f.configs[1].provider = 'ALIYUN_DRIVE';
@@ -103,6 +207,7 @@ test('worker uploads and confirms a backup with metadata without reading cloud b
   await service.runBatch('backup-worker');
   assert.equal(target.status, 'READY'); assert.ok(target.verifiedAt);
   assert.deepEqual(f.uploads, ['cloud-a']); assert.ok(f.confirmations.length > 0);
+  assert.deepEqual(f.uploadContexts, [{ configId: 'cloud-a', project: { id: 'p', name: '财务资料' }, folderPath: undefined }]);
   assert.ok(!f.reads.includes('cloud-a'));
 });
 
@@ -114,6 +219,14 @@ test('manual copy and inspection confirm backup metadata without cloud content r
   await service.inspectProject('p'); assert.equal(target.status, 'READY'); assert.ok(!f.reads.includes('cloud-a'));
   f.objects.set('cloud-a:p/object', Buffer.alloc(bytes.length));
   await service.inspectProject('p'); assert.equal(target.status, 'FAILED');
+});
+
+test('manual cloud copy includes the current database project name and file folder in buffer uploads', async () => {
+  const f = backupFixture(); row(f, 'local'); f.objects.set('local:p/object', bytes);
+  f.db.managedFile.findFirst = async () => ({ projectId: 'p', storageKey: 'p/object', folderPath: '原始资料/年度' });
+  f.db.project.findFirst = async () => ({ id: 'p', name: '项目改名后' });
+  await replicas(f).copyToConfig({ projectId: 'p', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: '原始资料.txt' }, 'cloud-a');
+  assert.deepEqual(f.uploadContexts, [{ configId: 'cloud-a', project: { id: 'p', name: '项目改名后' }, folderPath: '原始资料/年度' }]);
 });
 
 test('a backup cannot be selected as the source for repairing other replicas or legacy versions', async () => {
@@ -423,4 +536,294 @@ test('inspection marks corrupted LOCAL failed and the worker safely restores it 
 test('enqueueProject can durably create the scan inside an existing binding transaction without nesting transactions',async()=>{
  const f=fixture(),service=replicas(f);f.db.$transaction=async()=>{throw new Error('nested transaction');};
  const result=await service.enqueueProject('p','',f.db);assert.equal(result.taskId,'task0');assert.equal(f.tasks[0].status,'RUNNING');
+});
+
+test('selected project sync requeues only that config ready objects without active leases and preserves other projects', async () => {
+  const f = fixture(), service = replicas(f);
+  const ready = row(f, 'cloud-a'); ready.lastError = 'old'; ready.verifiedAt = new Date();
+  const expired = row(f, 'cloud-a', 'READY', 'p/expired'); expired.leaseOwner = 'stale'; expired.leaseUntil = new Date(0);
+  const leased = row(f, 'cloud-a', 'READY', 'p/leased'); leased.leaseOwner = 'active'; leased.leaseUntil = new Date(Date.now() + 60000);
+  const failed = row(f, 'cloud-a', 'FAILED', 'p/failed');
+  const otherConfig = row(f, 'cloud-b'), local = row(f, 'local'), deleting = row(f, 'cloud-a', 'DELETING', 'p/deleting');
+  const otherProject = row(f, 'cloud-a', 'READY', 'other/object'); otherProject.projectId = 'other';
+  const result = await service.enqueueProjectSync('p', 'cloud-a');
+  assert.deepEqual(result, { taskId: 'task0', requeued: 3 });
+  for (const record of [ready, expired, failed]) {
+    assert.equal(record.status, 'PENDING'); assert.equal(record.verifiedAt, null); assert.equal(record.lastError, null);
+    assert.equal(record.leaseOwner, null); assert.equal(record.leaseUntil, null);
+  }
+  assert.equal(leased.status, 'READY'); assert.equal(otherConfig.status, 'READY'); assert.equal(local.status, 'READY');
+  assert.equal(deleting.status, 'DELETING'); assert.equal(otherProject.status, 'READY');
+  assert.equal(f.tasks[0].detail.targetConfigId, 'cloud-a');
+});
+
+test('selected project scans add only the target cloud plus the local safety copy', async () => {
+  const f = fixture(), service = replicas(f);
+  f.db.managedFile.findMany = async () => [{ id: 'file', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), cdnConfigId: 'cloud-b', versions: [], derivatives: [] }];
+  await service.enqueueProjectSync('p', 'cloud-a');
+  await service.processSyncBatch('target-worker');
+  assert.equal(f.tasks[0].status, 'RUNNING'); assert.equal(f.tasks[0].detail.phase, 'AWAITING_REPLICAS');
+  assert.deepEqual(f.records.map(record => record.configId).sort(), ['cloud-a', 'local']);
+});
+
+test('selected cloud scans do not fan out unindexed HLS safety-copy materialization to other clouds', async () => {
+  const f = fixture(), service = replicas(f);
+  const hlsKey = 'p/hls/master.m3u8';
+  f.db.managedFile.findMany = async () => [{ id: 'file', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), cdnConfigId: 'cloud-b', versions: [],
+    derivatives: [{ kind: 'HLS', storageKey: hlsKey, status: 'READY', size: 999n, meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts'] } }] }];
+  f.objects.set(`cloud-b:${hlsKey}`, Buffer.from('playlist')); f.objects.set('cloud-b:p/hls/720/segment.ts', Buffer.from('segment'));
+  await service.enqueueProjectSync('p', 'cloud-a');
+  await service.processSyncBatch('hls-target-worker');
+  assert.equal(f.tasks[0].status, 'RUNNING'); assert.equal(f.tasks[0].detail.phase, 'AWAITING_REPLICAS');
+  assert.equal(f.records.some(record => record.configId === 'cloud-b'), false);
+  assert.deepEqual(f.records.filter(record => record.storageKey === hlsKey).map(record => record.configId).sort(), ['cloud-a', 'local']);
+});
+
+test('selected scan checkpoints retain their cloud restriction across every page', async () => {
+  const f = fixture(), service = replicas(f);
+  const files = Array.from({ length: 23 }, (_, i) => ({ id: `f${String(i).padStart(3, '0')}`, storageKey: `p/object${i}`, size: 1n, checksum: null, cdnConfigId: 'cloud-b', versions: [], derivatives: [] }));
+  f.db.managedFile.findMany = async ({ where, take }) => files.filter(file => !where.id || file.id > where.id.gt).slice(0, take);
+  await service.enqueueProjectSync('p', 'cloud-a');
+  await service.processSyncBatch('first-target-worker');
+  assert.equal(f.tasks[0].status, 'RUNNING'); assert.equal(f.tasks[0].detail.targetConfigId, 'cloud-a');
+  await replicas(f).processSyncBatch('after-target-restart');
+  assert.equal(f.tasks[0].status, 'RUNNING'); assert.equal(f.tasks[0].detail.targetConfigId, 'cloud-a');
+  assert.equal(f.tasks[0].detail.phase, 'AWAITING_REPLICAS');
+  assert.equal(f.records.filter(record => record.configId === 'cloud-a').length, 23);
+  assert.equal(f.records.some(record => record.configId === 'cloud-b'), false);
+});
+
+test('target scans merge only their same config and remain distinct from whole project scans', async () => {
+  const f = fixture(), service = replicas(f);
+  const first = await service.enqueueProjectSync('p', 'cloud-a');
+  const repeated = await service.enqueueProjectSync('p', 'cloud-a');
+  const second = await service.enqueueProjectSync('p', 'cloud-b');
+  const wholeProject = await service.enqueueProject('p');
+  assert.equal(first.taskId, repeated.taskId);
+  assert.notEqual(second.taskId, first.taskId); assert.notEqual(wholeProject.taskId, first.taskId);
+  assert.equal(f.tasks.length, 3); assert.equal(f.tasks[0].detail.rescanRequested, true);
+  assert.equal(f.tasks[1].detail.targetConfigId, 'cloud-b'); assert.equal(f.tasks[2].detail.targetConfigId, undefined);
+});
+
+function activeFiles(f, files = [{ id: 'file', projectId: 'p', status: 'ACTIVE', deletedAt: null, storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), cdnConfigId: 'local', versions: [], derivatives: [] }]) {
+  f.db.managedFile.findMany = async ({ where = {}, take = Infinity } = {}) => files.filter(file => matches(file, where)).slice(0, take);
+  return files;
+}
+
+test('selected sync remains running after scanning and completes only after worker uploads the required cloud objects', async () => {
+  const f = backupFixture(), service = replicas(f); activeFiles(f); row(f, 'local'); f.objects.set('local:p/object', bytes);
+  let queueWrites = 0; const createMany = f.db.storageReplica.createMany;
+  f.db.storageReplica.createMany = async args => { queueWrites++; return createMany(args); };
+  await service.enqueueProjectSync('p', 'cloud-a');
+  const { ReplicaWorker } = require('../../apps/api/src/storage/replica.worker.ts');
+  const worker = new ReplicaWorker(configService, f.db, service);
+  try {
+    await worker.runOnce();
+    assert.equal(f.tasks[0].status, 'RUNNING'); assert.equal(f.tasks[0].detail.phase, 'AWAITING_REPLICAS'); assert.ok(f.tasks[0].progress < 100);
+    assert.equal(f.records.find(record => record.configId === 'cloud-a').status, 'READY');
+    const scanned = f.tasks[0].detail.scanned, queued = f.tasks[0].detail.queued, writes = queueWrites;
+    await worker.runOnce();
+    assert.equal(f.tasks[0].status, 'COMPLETED'); assert.equal(f.tasks[0].progress, 100); assert.ok(f.tasks[0].finishedAt);
+    assert.equal(f.tasks[0].detail.scanned, scanned); assert.equal(f.tasks[0].detail.queued, queued); assert.equal(queueWrites, writes);
+    assert.deepEqual(f.uploads, ['cloud-a']);
+  } finally { worker.onModuleDestroy(); }
+});
+
+test('awaiting selected replicas survives restart and pending or syncing status never repeats the scan counters', async () => {
+  const f = fixture(), service = replicas(f); activeFiles(f);
+  await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('scan');
+  const task = f.tasks[0], target = f.records.find(record => record.configId === 'cloud-a');
+  const counters = { scanned: task.detail.scanned, queued: task.detail.queued };
+  for (const state of ['PENDING', 'SYNCING', 'UNVERIFIED']) {
+    target.status = state;
+    await replicas(f).processSyncBatch('replacement');
+    assert.equal(task.status, 'RUNNING'); assert.equal(task.detail.phase, 'AWAITING_REPLICAS'); assert.ok(task.progress < 100);
+    assert.equal(task.detail.scanned, counters.scanned); assert.equal(task.detail.queued, counters.queued);
+  }
+  target.status = 'READY'; await replicas(f).processSyncBatch('replacement'); assert.equal(task.status, 'COMPLETED');
+});
+
+test('required target replica failure, absence or skipped status fails its selected task without exposing provider errors', async () => {
+  for (const state of ['FAILED', 'MISSING', 'SKIPPED', 'ABSENT']) {
+    const f = fixture(), service = replicas(f); activeFiles(f);
+    await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('scan');
+    const target = f.records.find(record => record.configId === 'cloud-a');
+    if (state === 'ABSENT') f.records.splice(f.records.indexOf(target), 1);
+    else { target.status = state; target.lastError = 'upstream https://cloud.invalid/private?token=secret'; }
+    await service.processSyncBatch('poll');
+    assert.equal(f.tasks[0].status, 'FAILED', state); assert.ok(f.tasks[0].error); assert.ok(f.tasks[0].finishedAt);
+    assert.equal(f.tasks[0].detail.replicaFailed, 1); assert.ok(f.tasks[0].progress < 100);
+    assert.doesNotMatch(f.tasks[0].error, /https:|token=|secret/);
+  }
+});
+
+test('selected task reflects a real worker upload failure on the next tick', async () => {
+  const f = backupFixture(), service = replicas(f); activeFiles(f); row(f, 'local'); f.objects.set('local:p/object', bytes); f.failedUploads.add('cloud-a');
+  await service.enqueueProjectSync('p', 'cloud-a');
+  const { ReplicaWorker } = require('../../apps/api/src/storage/replica.worker.ts');
+  const worker = new ReplicaWorker(configService, f.db, service);
+  try {
+    await worker.runOnce(); assert.equal(f.tasks[0].status, 'RUNNING');
+    await worker.runOnce(); assert.equal(f.tasks[0].status, 'FAILED'); assert.equal(f.tasks[0].detail.replicaFailed, 1);
+  } finally { worker.onModuleDestroy(); }
+});
+
+test('selected completion checks only currently required heads, history and derivative objects of that project and cloud', async () => {
+  const f = fixture(), service = replicas(f);
+  const files = activeFiles(f); files[0].versions.push({ storageKey: 'p/history' });
+  files[0].derivatives.push({ kind: 'THUMBNAIL', status: 'READY', storageKey: 'p/thumb.jpg' },
+    { kind: 'HLS', status: 'READY', storageKey: 'p/hls/master.m3u8', meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts'] } });
+  for (const key of ['p/object', 'p/history', 'p/thumb.jpg', 'p/hls/master.m3u8', 'p/hls/720/segment.ts']) row(f, 'cloud-a', 'READY', key);
+  row(f, 'cloud-a', 'FAILED', 'p/orphan'); row(f, 'cloud-b', 'FAILED'); const other = row(f, 'cloud-a', 'FAILED'); other.projectId = 'other';
+  files.push({ id: 'trashed', projectId: 'p', status: 'TRASHED', storageKey: 'p/trashed', versions: [], derivatives: [] }); row(f, 'cloud-a', 'FAILED', 'p/trashed');
+  f.tasks.push({ id: 'await', projectId: 'p', type: 'STORAGE_REPLICA_SYNC', status: 'RUNNING', progress: 0,
+    detail: { phase: 'AWAITING_REPLICAS', targetConfigId: 'cloud-a', scanned: 1, queued: 5 }, leaseOwner: null, leaseUntil: null, updatedAt: new Date(0) });
+  await service.processSyncBatch('poll');
+  assert.equal(f.tasks[0].status, 'COMPLETED'); assert.equal(f.tasks[0].detail.replicaReady, 5); assert.equal(f.tasks[0].detail.replicaFailed, 0);
+});
+
+test('awaiting selected task waits for historical and HLS segment bytes and for an active target lease', async () => {
+  const f = fixture(), service = replicas(f), files = activeFiles(f);
+  files[0].versions.push({ storageKey: 'p/history' });
+  files[0].derivatives.push({ kind: 'HLS', status: 'READY', storageKey: 'p/hls/master.m3u8', meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts'] } });
+  row(f, 'cloud-a'); const history = row(f, 'cloud-a', 'PENDING', 'p/history'); row(f, 'cloud-a', 'READY', 'p/hls/master.m3u8');
+  const segment = row(f, 'cloud-a', 'PENDING', 'p/hls/720/segment.ts');
+  f.tasks.push({ id: 'await', projectId: 'p', type: 'STORAGE_REPLICA_SYNC', status: 'RUNNING', progress: 0,
+    detail: { phase: 'AWAITING_REPLICAS', targetConfigId: 'cloud-a', scanned: 1, queued: 4 }, leaseOwner: null, leaseUntil: null, updatedAt: new Date(0) });
+  await service.processSyncBatch('poll'); assert.equal(f.tasks[0].status, 'RUNNING');
+  history.status = 'READY'; await service.processSyncBatch('poll'); assert.equal(f.tasks[0].status, 'RUNNING');
+  segment.status = 'READY'; segment.leaseOwner = 'active-upload'; segment.leaseUntil = new Date(Date.now() + 60_000);
+  await service.processSyncBatch('poll'); assert.equal(f.tasks[0].status, 'RUNNING');
+  segment.leaseOwner = null; segment.leaseUntil = null;
+  await service.processSyncBatch('poll'); assert.equal(f.tasks[0].status, 'COMPLETED');
+});
+
+test('waiting for selected replicas does not block a later whole-project scan in the same tick', async () => {
+  const f = fixture(), service = replicas(f); activeFiles(f);
+  await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('scan');
+  await service.enqueueProject('p');
+  f.tasks[0].updatedAt = new Date(0); f.tasks[1].updatedAt = new Date(1);
+  await service.processSyncBatch('scan-and-poll');
+  assert.equal(f.tasks[0].status, 'RUNNING'); assert.equal(f.tasks[0].detail.phase, 'AWAITING_REPLICAS');
+  assert.equal(f.tasks[1].status, 'COMPLETED'); assert.equal(f.tasks[1].detail.scanned, 1);
+});
+
+test('re-enqueueing an awaiting selected task starts one new scan then returns to waiting', async () => {
+  const f = fixture(), service = replicas(f); activeFiles(f);
+  await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('scan');
+  await service.enqueueProjectSync('p', 'cloud-a');
+  await service.processSyncBatch('rescan'); assert.equal(f.tasks[0].detail.phase, 'SCANNING');
+  await service.processSyncBatch('rescan'); assert.equal(f.tasks[0].detail.phase, 'AWAITING_REPLICAS');
+  const scanned = f.tasks[0].detail.scanned;
+  await service.processSyncBatch('poll'); assert.equal(f.tasks[0].detail.scanned, scanned);
+});
+
+test('targeted retry requeues failed replicas before scanning and completes after a successful upload', async () => {
+  const f = backupFixture(), service = replicas(f); activeFiles(f); row(f, 'local'); f.objects.set('local:p/object', bytes);
+  const target = row(f, 'cloud-a', 'FAILED'); target.nextAttemptAt = new Date(Date.now() + 3600_000);
+  f.tasks.push({ id: 'retry', projectId: 'p', type: 'STORAGE_REPLICA_SYNC', status: 'RUNNING', progress: 0,
+    detail: { phase: 'SCANNING', retryReplicas: true, targetConfigId: 'cloud-a', scanned: 0, queued: 0 }, leaseOwner: null, leaseUntil: null, updatedAt: new Date(0) });
+  const { ReplicaWorker } = require('../../apps/api/src/storage/replica.worker.ts');
+  const worker = new ReplicaWorker(configService, f.db, service);
+  try {
+    await worker.runOnce(); assert.equal(target.status, 'READY'); assert.equal(f.tasks[0].detail.retryReplicas, false);
+    await worker.runOnce(); assert.equal(f.tasks[0].status, 'COMPLETED'); assert.deepEqual(f.uploads, ['cloud-a']);
+  } finally { worker.onModuleDestroy(); }
+});
+
+test('targeted history sync reads an unindexed version original storage without queueing that storage as a target', async () => {
+  const key = 'p/history', current = { id: 'file', projectId: 'p', status: 'ACTIVE', deletedAt: null, storageKey: 'p/current', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: 'current.txt', cdnConfigId: 'cloud-b', derivatives: [] };
+  const version = { storageKey: key, size: BigInt(bytes.length), checksum: hash(bytes), cdnConfigId: 'cloud-b', originalName: '历史资料.csv', mimeType: 'text/csv', file: current };
+  current.versions = [version];
+  const f = metadataFixture({ files: [current], versions: [version] }), service = replicas(f); activeFiles(f, [current]);
+  current.cdnConfig = f.configs[2]; row(f, 'local', 'READY', 'p/current'); f.objects.set('local:p/current', bytes); f.objects.set(`cloud-b:${key}`, bytes);
+  await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('history-scan');
+  await service.runBatch('history-copy', 50); await service.processSyncBatch('history-status');
+  assert.equal(f.tasks[0].status, 'COMPLETED');
+  assert.deepEqual(f.objects.get(`local:${key}`), bytes); assert.deepEqual(f.objects.get(`cloud-a:${key}`), bytes);
+  assert.equal(f.records.some(record => record.configId === 'cloud-b'), false);
+  assert.equal(f.metadataUploads.find(upload => upload.key === key).originalName, '历史资料.csv');
+});
+
+test('targeted derivative sync reads its owning file original storage without queueing the source account', async () => {
+  const key = 'p/generated-thumb.jpg', current = { id: 'file', projectId: 'p', status: 'ACTIVE', deletedAt: null, storageKey: 'p/current', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'video/mp4', originalName: 'source.mp4', cdnConfigId: 'cloud-b', versions: [] };
+  const derivative = { storageKey: key, kind: 'THUMBNAIL', status: 'READY', size: BigInt(bytes.length), mimeType: 'image/jpeg', file: current };
+  current.derivatives = [derivative];
+  const f = metadataFixture({ files: [current], derivatives: [derivative] }), service = replicas(f); activeFiles(f, [current]);
+  current.cdnConfig = f.configs[2]; row(f, 'local', 'READY', 'p/current'); f.objects.set('local:p/current', bytes); f.objects.set(`cloud-b:${key}`, bytes);
+  await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('derivative-scan');
+  await service.runBatch('derivative-copy', 50); await service.processSyncBatch('derivative-status');
+  assert.equal(f.tasks[0].status, 'COMPLETED');
+  assert.deepEqual(f.objects.get(`local:${key}`), bytes); assert.deepEqual(f.objects.get(`cloud-a:${key}`), bytes);
+  assert.equal(f.records.some(record => record.configId === 'cloud-b'), false);
+});
+
+test('read-only version sources stay scoped to the active owning project and cannot use backup-only content', async () => {
+  for (const file of [{ projectId: 'other', status: 'ACTIVE', deletedAt: null }, { projectId: 'p', status: 'TRASHED', deletedAt: null }, { projectId: 'p', status: 'ACTIVE', deletedAt: new Date() }]) {
+    const f = metadataFixture({ versions: [{ storageKey: 'p/history', file, cdnConfigId: 'cloud-b', checksum: hash(bytes) }] });
+    const target = row(f, 'cloud-a', 'PENDING', 'p/history'); f.objects.set('cloud-b:p/history', bytes);
+    await replicas(f).runBatch('invalid-history-source'); assert.equal(target.status, 'MISSING'); assert.deepEqual(f.metadataUploads, []);
+  }
+  const f = backupFixture();
+  f.db.managedFile.findFirst = async () => null;
+  f.db.fileVersion.findFirst = async () => ({ cdnConfigId: 'cloud-a', checksum: hash(bytes) });
+  const target = row(f, 'cloud-b', 'PENDING', 'p/history'); f.objects.set('cloud-a:p/history', bytes);
+  await replicas(f).runBatch('backup-history-source'); assert.equal(target.status, 'MISSING'); assert.ok(!f.reads.includes('cloud-a'));
+});
+
+test('targeted sync restores indexed missing or corrupt HLS segments from their manifest owner without queueing the original account', async () => {
+  for (const corrupt of [false, true]) {
+    const current = { id: 'file', projectId: 'p', status: 'ACTIVE', deletedAt: null, storageKey: 'p/current', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'video/mp4', originalName: 'source.mp4', cdnConfigId: 'cloud-b', versions: [] };
+    const hls = { id: 'hls', storageKey: 'p/hls/master.m3u8', kind: 'HLS', status: 'READY', size: 1000n, mimeType: 'application/vnd.apple.mpegurl',
+      meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts'] }, file: current };
+    current.derivatives = [hls];
+    const f = metadataFixture({ files: [current], derivatives: [hls] }), service = replicas(f); activeFiles(f, [current]);
+    current.cdnConfig = f.configs[2]; f.configs[2].unbound = true;
+    for (const key of ['p/current', 'p/hls/master.m3u8']) { row(f, 'local', 'READY', key); f.objects.set(`local:${key}`, bytes); }
+    const key = 'p/hls/720/segment.ts'; row(f, 'local', 'MISSING', key); f.objects.set(`cloud-b:${key}`, bytes);
+    if (corrupt) f.objects.set(`local:${key}`, Buffer.alloc(bytes.length));
+    await service.enqueueProjectSync('p', 'cloud-a'); await service.processSyncBatch('hls-segment-scan');
+    await service.runBatch('hls-segment-copy', 50); await service.processSyncBatch('hls-segment-status');
+    assert.equal(f.tasks[0].status, 'COMPLETED', corrupt ? 'corrupt local segment' : 'missing local segment');
+    assert.deepEqual(f.objects.get(`local:${key}`), bytes); assert.deepEqual(f.objects.get(`cloud-a:${key}`), bytes);
+    assert.equal(f.records.some(record => record.configId === 'cloud-b'), false);
+    assert.equal(f.records.find(record => record.configId === 'local' && record.storageKey === key).status, 'READY');
+  }
+});
+
+test('legacy HLS segment recovery requires exact READY manifest membership in the active owning project before reading the origin', async () => {
+  const base = { id: 'hls', storageKey: 'p/hls/master.m3u8', kind: 'HLS', status: 'READY', meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts'] },
+    file: { projectId: 'p', status: 'ACTIVE', deletedAt: null } };
+  const invalid = [
+    { ...base, meta: { segmentPrefix: 'p/hls', files: [] } },
+    { ...base, meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts.backup'] } },
+    { ...base, meta: { segmentPrefix: 'p/hls-other', files: ['720/segment.ts'] } },
+    { ...base, status: 'PENDING' },
+    { ...base, kind: 'THUMBNAIL' },
+    { ...base, file: { ...base.file, projectId: 'other' } },
+    { ...base, file: { ...base.file, status: 'TRASHED' } },
+    { ...base, file: { ...base.file, deletedAt: new Date() } },
+  ];
+  for (const entry of invalid) {
+    const f = metadataFixture({ derivatives: [entry] }); entry.file.cdnConfig = f.configs[2];
+    const key = 'p/hls/720/segment.ts', target = row(f, 'cloud-a', 'PENDING', key); f.objects.set(`cloud-b:${key}`, bytes);
+    let originReads = 0; const adapter = f.registry.adapter;
+    f.registry.adapter = provider => { const real = adapter(provider), read = real.getDownloadTarget;
+      real.getDownloadTarget = async (config, objectKey) => { if (config.id === 'cloud-b') originReads++; return read(config, objectKey); }; return real; };
+    await replicas(f).runBatch('invalid-hls-origin');
+    assert.equal(target.status, 'MISSING'); assert.equal(originReads, 0); assert.deepEqual(f.metadataUploads, []);
+  }
+});
+
+test('HLS manifest recovery still verifies indexed bytes and refuses a backup-only source', async () => {
+  for (const backupOnly of [false, true]) {
+    const hls = { id: 'hls', storageKey: 'p/hls/master.m3u8', kind: 'HLS', status: 'READY', meta: { segmentPrefix: 'p/hls', files: ['720/segment.ts'] },
+      file: { projectId: 'p', status: 'ACTIVE', deletedAt: null } };
+    const f = metadataFixture({ derivatives: [hls] }); hls.file.cdnConfig = f.configs[2];
+    const key = 'p/hls/720/segment.ts', target = row(f, 'cloud-a', 'PENDING', key);
+    f.objects.set(`cloud-b:${key}`, backupOnly ? bytes : Buffer.alloc(bytes.length));
+    if (backupOnly) { f.configs[2].provider = 'ALIYUN_DRIVE'; f.registry.manifest = provider => ({ capabilities: { backupOnly: provider === 'ALIYUN_DRIVE' } }); }
+    await replicas(f).runBatch('verify-hls-origin');
+    assert.equal(target.status, backupOnly ? 'MISSING' : 'FAILED'); assert.deepEqual(f.metadataUploads, []);
+  }
 });

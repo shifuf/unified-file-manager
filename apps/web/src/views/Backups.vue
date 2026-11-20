@@ -23,8 +23,9 @@
           </span>
         </div>
 
+        <TableViewport v-slot="{ pinActions }" label="备份列表">
         <el-table v-loading="loading" :data="backups" row-key="id" class="data-table">
-          <el-table-column prop="name" label="备份名称" min-width="200" show-overflow-tooltip />
+          <el-table-column prop="name" label="备份名称" min-width="200" />
           <el-table-column label="状态" width="110">
             <template #default="{ row }">
               <el-tag :type="statusTagType(row.status)">{{ statusLabel(row.status) }}</el-tag>
@@ -61,7 +62,7 @@
               <span v-else class="muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" fixed="right" width="250">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="250">
             <template #default="{ row }">
               <div class="table-actions">
                 <el-button
@@ -85,6 +86,7 @@
             </template>
           </el-table-column>
         </el-table>
+        </TableViewport>
       </div>
     </section>
 
@@ -175,6 +177,7 @@
 import { Plus, Refresh, Upload } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import TableViewport from '@/components/TableViewport.vue';
 
 import { backupApi, type BackupRecord, type BackupScopeInfo, type BackupStatus } from '@/api/modules';
 

@@ -1,14 +1,56 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { open, stat } from 'node:fs/promises';
+import { mkdtemp, open, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import type { RuntimeCdnConfig, StorageByteRange, StorageUploadFileParams } from '@ufm/storage-plugin-sdk';
+import type { RuntimeCdnConfig, StorageByteRange, StorageProjectIdentity, StorageUploadFileParams } from '@ufm/storage-plugin-sdk';
 import { checkedDownloadUrl, DriveClient, DriveError } from './client';
 
 type Binding = { accountId: string; driveId: string; root: string; scope: string };
 type ObjectState = { fileId: string; size: number; checksum: string; sha1: string; uploadId?: string; ready: boolean };
+type SearchBudget = { pages: number; items: number };
+type CloudItem = Record<string, any>;
+type ProjectProof = { fileId: string; size: number; sha1: string; project: StorageProjectIdentity };
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 const CHUNK_SIZE = 10 * 1024 * 1024;
+const JSON_LIMIT = 16 * 1024;
+const PROJECT_MARKER = '.ufm-project.json';
+const budget = (): SearchBudget => ({ pages: 256, items: 20_000 });
+const shortProjectId = (id: string) => sha256(id).slice(0, 12);
+
+export function checkedProject(value: unknown): StorageProjectIdentity {
+  const project = value as StorageProjectIdentity;
+  if (!project || typeof project.id !== 'string' || !project.id.trim() || project.id.length > 128 || /[\x00-\x1f\x7f]/.test(project.id) ||
+    typeof project.name !== 'string' || !project.name.trim() || project.name.length > 255 || /[\x00-\x1f\x7f]/.test(project.name)) throw new Error('项目名称或标识无效。');
+  return { id: project.id, name: project.name };
+}
+export function checkedFolderPath(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 1024 || /[\\\x00-\x1f\x7f]/.test(value) || value.startsWith('/') ||
+    value && (value.split('/').length > 64 || value.split('/').some(part => !part || part === '.' || part === '..' || part.length > 255))) throw new Error('项目相对目录路径无效。');
+  return value;
+}
+function projectFolderName(project: StorageProjectIdentity): string {
+  const cleaned = project.name.normalize('NFKC').replace(/[\\/:*?"<>|\x00-\x1f\x7f]/g, '_').replace(/\s+/g, ' ').replace(/^[. ]+|[. ]+$/g, '') || '项目';
+  let readable = '';
+  for (const character of cleaned) { if (Buffer.byteLength(readable + character, 'utf8') > 160) break; readable += character; }
+  return `${readable}-${shortProjectId(project.id)}`;
+}
+export type PortableDescription = { originalName: string; storageKey: string; checksum: string; mimeType: string; project?: StorageProjectIdentity; folderPath?: string };
+export function checkedPortableDescription(value: any, item: CloudItem): PortableDescription | undefined {
+  const key = value?.storageKey, name = value?.originalName;
+  if (value?.version !== 1 || typeof key !== 'string' || !key || key.length > 512 || key.includes('\0') ||
+    key.startsWith('/') || key.split('/').includes('..') || sha256(key) !== item.name ||
+    typeof name !== 'string' || !name.trim() || name.length > 255 || /[\x00-\x1f/\\]/.test(name) || name === '.' || name === '..' ||
+    value.size !== Number(item.size) || typeof value.sha1 !== 'string' || value.sha1.toLowerCase() !== String(item.content_hash).toLowerCase() ||
+    typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/i.test(value.checksum)) return undefined;
+  try {
+    return { storageKey: key, originalName: name, checksum: value.checksum.toLowerCase(),
+      mimeType: typeof value.mimeType === 'string' && /^[\w.+-]+\/[\w.+-]+$/.test(value.mimeType) ? value.mimeType : 'application/octet-stream',
+      ...(value.project === undefined ? {} : { project: checkedProject(value.project) }),
+      ...(value.folderPath === undefined ? {} : { folderPath: checkedFolderPath(value.folderPath) }) };
+  } catch { return undefined; }
+}
 
 export class DriveObjects {
   constructor(private readonly client: DriveClient) {}
@@ -23,31 +65,129 @@ export class DriveObjects {
     return `object-${sha256(binding.scope + '\0' + key)}`;
   }
   private name(key: string) { return sha256(key); }
+  private stateKey(binding: Binding, key: string, cloudName?: string) {
+    return this.objectKey(binding, key) + (cloudName ? '-metadata' : '');
+  }
   private async metadata(binding: Binding, fileId: string) {
-    try { return await this.client.request(binding.accountId, '/v2/file/get', { drive_id: binding.driveId, file_id: fileId }); }
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(fileId)) throw new Error('网盘文件标识无效。');
+    try {
+      const item = await this.client.request(binding.accountId, '/v2/file/get', { drive_id: binding.driveId, file_id: fileId });
+      if (item.file_id !== fileId) throw new Error('网盘文件标识不一致。');
+      return item;
+    }
     catch (error) { if (error instanceof DriveError && error.missing) return null; throw error; }
   }
-  private async list(binding: Binding, parent: string, name: string) {
+  private async entries(binding: Binding, parent: string, remaining: SearchBudget = budget()): Promise<CloudItem[]> {
+    const items: CloudItem[] = [];
     let marker = ''; const seen = new Set<string>();
     do {
+      if (--remaining.pages < 0) throw new Error('网盘目录查找超过分页上限，请缩小保存目录。');
       const page = await this.client.request(binding.accountId, '/v2/file/list', {
         drive_id: binding.driveId, parent_file_id: parent, limit: 200, marker, fields: '*', order_by: 'name', order_direction: 'ASC',
       });
-      const found = (page.items as Array<Record<string, any>> || []).filter(item => item.name === name && !item.trashed);
-      if (found.length > 1) throw new Error('网盘内存在重复对象，请检查 UFM 目录。');
-      if (found.length) return found[0];
+      if (!Array.isArray(page.items)) throw new Error('网盘返回了无效的目录列表。');
+      remaining.items -= page.items.length;
+      if (remaining.items < 0) throw new Error('网盘目录查找超过条目上限，请缩小保存目录。');
+      for (const item of page.items) {
+        if (item.parent_file_id !== parent || !['folder', 'file'].includes(item.type) || typeof item.name !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(item.file_id || '')) throw new Error('网盘文件目录信息不一致。');
+        items.push(item);
+      }
       marker = String(page.next_marker || '');
-      if (marker && seen.has(marker)) throw new Error('网盘分页游标异常。');
+      if (marker.length > 2048 || /[\x00-\x1f]/.test(marker) || marker && seen.has(marker)) throw new Error('网盘分页游标异常。');
       seen.add(marker);
     } while (marker);
-    return null;
+    return items;
+  }
+  private async list(binding: Binding, parent: string, name: string, remaining: SearchBudget = budget()) {
+    const found = (await this.entries(binding, parent, remaining)).filter(item => item.name === name && !item.trashed);
+    if (found.length > 1) throw new Error('网盘内存在重复对象，请检查 UFM 目录。');
+    return found[0] || null;
+  }
+  private legacyFolderName(binding: Binding) { return `UFM-objects-${binding.scope.slice(0, 16)}`; }
+  private markerScope(binding: Binding) { return sha256(`${binding.driveId}\0${binding.root}`); }
+  private projectProofKey(binding: Binding, folderId: string) { return `project-proof-${binding.scope}-${folderId}`; }
+  private async readJson(binding: Binding, item: CloudItem): Promise<{ value: any; bytes: Buffer } | null> {
+    const size = Number(item.size);
+    if (item.type !== 'file' || item.trashed || item.status !== 'available' || !Number.isSafeInteger(size) || size < 1 || size > JSON_LIMIT || !/^[a-f0-9]{40}$/i.test(item.content_hash || '')) return null;
+    const target = await this.client.request(binding.accountId, '/v2/file/get_download_url', { drive_id: binding.driveId, file_id: item.file_id, expire_sec: 300 });
+    const response = await this.client.transport(checkedDownloadUrl(target.url), {
+      redirect: 'error', signal: AbortSignal.timeout(120_000), headers: { Referer: 'https://www.aliyundrive.com/' },
+    });
+    if (!response.ok || response.status !== 200 || !response.body) { await response.body?.cancel(); throw new DriveError('DownloadFailed', response.status); }
+    const chunks: Buffer[] = []; let received = 0;
+    try {
+      for await (const chunk of response.body) {
+        received += chunk.byteLength;
+        if (received > size) throw new Error('云端 JSON 描述大小校验失败。');
+        chunks.push(Buffer.from(chunk));
+      }
+    } finally { await response.body.cancel().catch(() => undefined); }
+    const bytes = Buffer.concat(chunks);
+    if (received !== size || createHash('sha1').update(bytes).digest('hex') !== String(item.content_hash).toLowerCase()) throw new Error('云端 JSON 描述内容校验失败。');
+    try { return { value: JSON.parse(bytes.toString('utf8')), bytes }; } catch { return null; }
+  }
+  private async folderProject(binding: Binding, folder: CloudItem, remaining: SearchBudget = budget()): Promise<StorageProjectIdentity | null> {
+    if (folder.type !== 'folder' || folder.trashed || folder.parent_file_id !== binding.root || !/-[a-f0-9]{12}$/.test(folder.name)) return null;
+    const marker = await this.list(binding, String(folder.file_id), PROJECT_MARKER, remaining);
+    if (!marker) return null;
+    const cached = await this.client.context.getState<ProjectProof>(this.projectProofKey(binding, String(folder.file_id)));
+    if (cached && marker.type === 'file' && marker.status === 'available' && cached.fileId === marker.file_id && cached.size === Number(marker.size) &&
+      cached.sha1 === String(marker.content_hash).toLowerCase()) {
+      const project = checkedProject(cached.project);
+      if (folder.name.endsWith(`-${shortProjectId(project.id)}`)) return project;
+    }
+    const json = await this.readJson(binding, marker);
+    if (!json || json.value?.version !== 1 || json.value.kind !== 'ufm-project' || json.value.scope !== this.markerScope(binding)) return null;
+    try {
+      const project = checkedProject(json.value.project);
+      if (!folder.name.endsWith(`-${shortProjectId(project.id)}`)) return null;
+      await this.client.context.setState(this.projectProofKey(binding, String(folder.file_id)), {
+        fileId: String(marker.file_id), size: Number(marker.size), sha1: String(marker.content_hash).toLowerCase(), project,
+      });
+      return project;
+    } catch { return null; }
+  }
+  async projectForFolder(config: RuntimeCdnConfig, folderId: string): Promise<StorageProjectIdentity | undefined> {
+    const binding = this.binding(config), seen = new Set<string>(); let current = folderId;
+    for (let depth = 0; depth < 64 && current !== binding.root; depth++) {
+      if (seen.has(current) || current === 'root') break;
+      seen.add(current);
+      const item = await this.metadata(binding, current);
+      if (!item || item.trashed || item.type !== 'folder') break;
+      if (item.parent_file_id === binding.root) return (await this.folderProject(binding, item)) || undefined;
+      current = String(item.parent_file_id || '');
+    }
+    return undefined;
+  }
+  private async assertManagedParent(binding: Binding, parentId: string): Promise<StorageProjectIdentity | null> {
+    const seen = new Set<string>(); let current = parentId;
+    for (let depth = 0; depth < 64; depth++) {
+      if (current === binding.root || current === 'root' || seen.has(current)) break;
+      seen.add(current);
+      const folder = await this.metadata(binding, current);
+      if (!folder || folder.trashed || folder.type !== 'folder') break;
+      if (folder.parent_file_id === binding.root) {
+        if (/^UFM-objects-[a-f0-9]{16}$/.test(folder.name)) return null;
+        const project = await this.folderProject(binding, folder);
+        if (project) return project;
+        break;
+      }
+      current = String(folder.parent_file_id || '');
+    }
+    throw new Error('对象不在此存储的 UFM 管理目录范围内。');
   }
   private async folder(binding: Binding, create: boolean): Promise<string | null> {
     return this.client.context.withLock(`folder-${binding.scope}`, async () => {
       const key = `folder-${binding.scope}`;
       const cached = await this.client.context.getState<{ fileId: string }>(key);
-      if (cached && await this.metadata(binding, cached.fileId)) return cached.fileId;
-      const name = `UFM-objects-${binding.scope.slice(0, 16)}`;
+      if (cached) {
+        const item = await this.metadata(binding, cached.fileId);
+        if (item && !item.trashed) {
+          if (item.type !== 'folder' || item.parent_file_id !== binding.root || item.name !== this.legacyFolderName(binding)) throw new Error('缓存的 UFM 对象目录不在保存根目录内。');
+          return cached.fileId;
+        }
+      }
+      const name = this.legacyFolderName(binding);
       let folder = await this.list(binding, binding.root, name);
       if (!folder && create) folder = await this.client.request(binding.accountId, '/adrive/v2/file/createWithFolders', {
         drive_id: binding.driveId, parent_file_id: binding.root, name, type: 'folder', check_name_mode: 'refuse',
@@ -58,22 +198,155 @@ export class DriveObjects {
       return String(folder.file_id);
     });
   }
-  private async find(binding: Binding, key: string, includeTrashed = false) {
-    const id = this.objectKey(binding, key);
+  private async projectFolder(config: RuntimeCdnConfig, project: StorageProjectIdentity): Promise<string> {
+    const binding = this.binding(config), key = `project-folder-${binding.scope}-${sha256(project.id)}`;
+    return this.client.context.withLock(key, async () => {
+      const saved = await this.client.context.getState<{ fileId: string; pendingMarker?: boolean }>(key);
+      if (saved) {
+        const folder = await this.metadata(binding, saved.fileId);
+        if (folder && !folder.trashed) {
+          if (folder.type !== 'folder' || folder.parent_file_id !== binding.root || !folder.name.endsWith(`-${shortProjectId(project.id)}`)) throw new Error('缓存的项目目录不在保存根目录内。');
+          const identity = await this.folderProject(binding, folder);
+          if (identity?.id === project.id) return saved.fileId;
+          const marker = await this.list(binding, saved.fileId, PROJECT_MARKER);
+          if (!saved.pendingMarker || marker?.status === 'available') throw new Error('项目目录标记无效，请检查云端目录。');
+          await this.writeProjectMarker(config, saved.fileId, project);
+          await this.client.context.setState(key, { fileId: saved.fileId });
+          return saved.fileId;
+        }
+      }
+      const remaining = budget(), entries = await this.entries(binding, binding.root, remaining);
+      const matching: CloudItem[] = [];
+      for (const entry of entries) {
+        if (entry.trashed || !entry.name.endsWith(`-${shortProjectId(project.id)}`)) continue;
+        const identity = await this.folderProject(binding, entry, remaining);
+        if (!identity || identity.id !== project.id) throw new Error('项目目录被同名对象占用或标记无效。');
+        matching.push(entry);
+      }
+      if (matching.length > 1) throw new Error('网盘内存在重复的项目目录，请检查项目标记。');
+      if (matching.length) { await this.client.context.setState(key, { fileId: matching[0].file_id }); return String(matching[0].file_id); }
+      const name = projectFolderName(project);
+      if (entries.some(entry => entry.name === name && !entry.trashed)) throw new Error('项目目录名称已被占用。');
+      const created = await this.client.request(binding.accountId, '/adrive/v2/file/createWithFolders', {
+        drive_id: binding.driveId, parent_file_id: binding.root, name, type: 'folder', check_name_mode: 'refuse',
+      });
+      if (!created.file_id || created.type !== 'folder') throw new Error('创建项目目录失败。');
+      const fileId = String(created.file_id);
+      await this.client.context.setState(key, { fileId, pendingMarker: true });
+      await this.writeProjectMarker(config, fileId, project);
+      await this.client.context.setState(key, { fileId });
+      return fileId;
+    });
+  }
+  private async writeProjectMarker(config: RuntimeCdnConfig, parentId: string, project: StorageProjectIdentity) {
+    const binding = this.binding(config);
+    const bytes = Buffer.from(JSON.stringify({ version: 1, kind: 'ufm-project', scope: this.markerScope(binding), project }));
+    if (bytes.length > JSON_LIMIT) throw new Error('项目目录标记超过大小上限。');
+    await this.withJsonFile(bytes, async path => this.uploadObject(config, { key: `__ufm_project_marker/${sha256(project.id)}`, path,
+      size: bytes.length, checksum: sha256(bytes.toString()), mimeType: 'application/json', originalName: PROJECT_MARKER }, PROJECT_MARKER, parentId));
+    const marker = await this.list(binding, parentId, PROJECT_MARKER);
+    const hash = createHash('sha1').update(bytes).digest('hex');
+    if (!marker || marker.status !== 'available' || Number(marker.size) !== bytes.length || String(marker.content_hash).toLowerCase() !== hash) throw new Error('项目目录标记上传后校验失败。');
+    await this.client.context.setState(this.projectProofKey(binding, parentId), { fileId: marker.file_id, size: bytes.length, sha1: hash, project });
+  }
+  private async managedFolders(binding: Binding, remaining: SearchBudget): Promise<string[]> {
+    const folders: string[] = [];
+    for (const entry of await this.entries(binding, binding.root, remaining)) {
+      if (entry.trashed || entry.type !== 'folder') continue;
+      if (/^UFM-objects-[a-f0-9]{16}$/.test(entry.name) || await this.folderProject(binding, entry, remaining)) folders.push(String(entry.file_id));
+    }
+    return folders;
+  }
+  private async find(binding: Binding, key: string, includeTrashed = false, cloudName?: string): Promise<{ saved: ObjectState | null; item: CloudItem } | null> {
+    const id = this.stateKey(binding, key, cloudName);
     const saved = await this.client.context.getState<ObjectState>(id);
     if (saved) {
       const item = await this.metadata(binding, saved.fileId);
-      if (item) return !item.trashed || includeTrashed ? { saved, item } : null;
+      if (item) {
+        if (item.type !== 'file' || item.name !== (cloudName || this.name(key))) throw new Error('缓存的不可变对象标识不一致。');
+        await this.assertManagedParent(binding, String(item.parent_file_id || ''));
+        return !item.trashed || includeTrashed ? { saved, item } : null;
+      }
       await this.client.context.setState(id, null);
     }
-    const parent = await this.folder(binding, false);
-    if (!parent) return null;
-    const item = await this.list(binding, parent, this.name(key));
-    if (!item) return null;
-    return { saved: null, item };
+    const remaining = budget(), queue = (await this.managedFolders(binding, remaining)).map(id => ({ id, depth: 0 })), seen = new Set<string>(), found: CloudItem[] = [];
+    while (queue.length) {
+      const parent = queue.shift()!;
+      if (seen.has(parent.id)) throw new Error('网盘目录出现循环引用。');
+      seen.add(parent.id);
+      for (const item of await this.entries(binding, parent.id, remaining)) {
+        if (item.trashed && !includeTrashed) continue;
+        if (item.type === 'folder' && !item.trashed) {
+          if (parent.depth >= 63) throw new Error('网盘对象目录超过深度上限。');
+          queue.push({ id: String(item.file_id), depth: parent.depth + 1 });
+        } else if (item.type === 'file' && item.name === (cloudName || this.name(key))) found.push(item);
+      }
+    }
+    if (found.length > 1) throw new Error('网盘内存在重复对象，请检查 UFM 目录。');
+    return found.length ? { saved: null, item: found[0] } : null;
+  }
+  private async hasPortableDescription(binding: Binding, params: StorageUploadFileParams, source: ObjectState): Promise<CloudItem | null> {
+    const found = await this.find(binding, params.key, false, `${this.name(params.key)}.ufm.json`);
+    if (!found || found.item.status !== 'available') return null;
+    if (found.saved?.ready && Number(found.item.size) === found.saved.size &&
+      String(found.item.content_hash || '').toUpperCase() === found.saved.sha1) return found.item;
+    const json = await this.readJson(binding, found.item);
+    const value = json && checkedPortableDescription(json.value, { name: this.name(params.key), size: params.size, content_hash: source.sha1 });
+    // The key describes immutable bytes; keep its first verified display name
+    // when a later upload retries those bytes after a business-file rename.
+    if (!json || !value || value.storageKey !== params.key || value.checksum !== params.checksum || value.project && params.project && value.project.id !== params.project.id) return null;
+    await this.client.context.setState(this.stateKey(binding, params.key, `${this.name(params.key)}.ufm.json`), {
+      fileId: found.item.file_id, size: json.bytes.length, checksum: createHash('sha256').update(json.bytes).digest('hex'), sha1: String(found.item.content_hash).toUpperCase(), ready: true,
+    });
+    return found.item;
+  }
+  private async withJsonFile<T>(bytes: Buffer, action: (path: string) => Promise<T>): Promise<T> {
+    const directory = await mkdtemp(join(tmpdir(), 'ufm-drive-metadata-')), path = join(directory, 'description.json');
+    try { await writeFile(path, bytes, { mode: 0o600 }); return await action(path); }
+    finally { await unlink(path).catch(() => undefined); await rmdir(directory).catch(() => undefined); }
+  }
+  private async move(binding: Binding, item: CloudItem, parentId: string) {
+    if (item.parent_file_id === parentId) return;
+    await this.client.request(binding.accountId, '/v3/file/move', {
+      drive_id: binding.driveId, file_id: item.file_id, to_parent_file_id: parentId, check_name_mode: 'refuse',
+    });
+    const moved = await this.metadata(binding, String(item.file_id));
+    if (!moved || moved.trashed || moved.parent_file_id !== parentId || moved.name !== item.name || moved.status !== 'available' ||
+      Number(moved.size) !== Number(item.size) || String(moved.content_hash).toLowerCase() !== String(item.content_hash).toLowerCase()) throw new Error('网盘对象移动后校验失败，任务可重试。');
   }
   async uploadFile(config: RuntimeCdnConfig, params: StorageUploadFileParams) {
+    if (params.project !== undefined) params = { ...params, project: checkedProject(params.project) };
+    if (params.folderPath !== undefined) checkedFolderPath(params.folderPath);
     const binding = this.binding(config), id = this.objectKey(binding, params.key);
+    return this.client.context.withLock(`portable-${id}`, async () => {
+      const stored = await this.uploadObject(config, params);
+      const saved = await this.client.context.getState<ObjectState>(id);
+      if (!saved?.ready) throw new Error('上传对象的校验元数据尚未保存。');
+      if (params.project) {
+        const item = await this.metadata(binding, saved.fileId);
+        if (!item || item.status !== 'available' || Number(item.size) !== params.size || String(item.content_hash).toUpperCase() !== saved.sha1) throw new Error('整理前的网盘对象校验失败。');
+        const previous = await this.assertManagedParent(binding, String(item.parent_file_id));
+        if (previous && previous.id !== params.project.id) throw new Error('不可变对象已经属于另一个项目。');
+        await this.move(binding, item, await this.projectFolder(config, params.project));
+      }
+      const description = await this.hasPortableDescription(binding, params, saved);
+      if (description) {
+        if (params.project) await this.move(binding, description, await this.projectFolder(config, params.project));
+        return stored;
+      }
+      const bytes = Buffer.from(JSON.stringify({ version: 1, storageKey: params.key,
+        originalName: params.originalName, mimeType: params.mimeType,
+        size: params.size, checksum: params.checksum, sha1: saved.sha1.toLowerCase(),
+        ...(params.project ? { project: params.project } : {}), ...(params.folderPath === undefined ? {} : { folderPath: params.folderPath }) }));
+      if (bytes.length > JSON_LIMIT) throw new Error('文件名称元数据超过大小上限。');
+      await this.withJsonFile(bytes, path => this.uploadObject(config, { key: params.key, path, size: bytes.length,
+          checksum: createHash('sha256').update(bytes).digest('hex'), mimeType: 'application/json',
+          originalName: `${this.name(params.key)}.ufm.json`, project: params.project }, `${this.name(params.key)}.ufm.json`));
+      return stored;
+    });
+  }
+  private async uploadObject(config: RuntimeCdnConfig, params: StorageUploadFileParams, cloudName?: string, fixedParent?: string) {
+    const binding = this.binding(config), id = this.stateKey(binding, params.key, cloudName);
     return this.client.context.withLock(id, async () => {
       const info = await stat(params.path);
       if (!info.isFile() || info.size !== params.size) throw new Error('上传源文件大小发生变化。');
@@ -81,13 +354,17 @@ export class DriveObjects {
       for await (const bytes of createReadStream(params.path)) { hash.update(bytes); checksum.update(bytes); }
       const sha1 = hash.digest('hex').toUpperCase();
       if (checksum.digest('hex') !== params.checksum) throw new Error('上传源文件 SHA256 校验失败。');
-      const existing = await this.find(binding, params.key);
+      const existing = fixedParent ? await (async () => {
+        const saved = await this.client.context.getState<ObjectState>(id), item = await this.list(binding, fixedParent, cloudName!);
+        return item ? { saved: saved?.fileId === item.file_id ? saved : null, item } : null;
+      })() : await this.find(binding, params.key, false, cloudName);
       let saved = existing?.saved;
       if (existing) {
         const expectedRemoteSize = existing.item.status === 'uploading' && saved?.uploadId && !saved.ready
           ? saved.size : Number(existing.item.size);
         if (expectedRemoteSize !== params.size ||
-          (saved ? saved.checksum !== params.checksum : String(existing.item.content_hash || '').toUpperCase() !== sha1)) {
+          (saved && saved.checksum !== params.checksum) || existing.item.status === 'available' && String(existing.item.content_hash || '').toUpperCase() !== sha1 ||
+          !saved && String(existing.item.content_hash || '').toUpperCase() !== sha1) {
           throw new Error('不可变 key 已存在不同内容的对象。');
         }
         if (existing.item.status === 'available') {
@@ -101,7 +378,7 @@ export class DriveObjects {
       const parts = Array.from({ length: count }, (_, index) => ({ part_number: index + 1 }));
       let urls: Array<{ part_number: number; upload_url: string }>;
       if (!saved?.uploadId) {
-        const parent = await this.folder(binding, true);
+        const parent = fixedParent || (params.project ? await this.projectFolder(config, params.project) : await this.folder(binding, true));
         const state = await this.client.fresh(binding.accountId);
         const digest = createHash('md5').update(state.accessToken).digest('hex').slice(0, 16);
         const offset = params.size ? Number(BigInt(`0x${digest}`) % BigInt(params.size)) : 0;
@@ -110,7 +387,7 @@ export class DriveObjects {
         try { proof = Buffer.alloc(Math.min(8, params.size - offset)); await file.read(proof, 0, proof.length, offset); }
         finally { await file.close(); }
         const created = await this.client.request(binding.accountId, '/adrive/v2/file/createWithFolders', {
-          drive_id: binding.driveId, parent_file_id: parent, type: 'file', name: this.name(params.key), check_name_mode: 'refuse',
+          drive_id: binding.driveId, parent_file_id: parent, type: 'file', name: cloudName || this.name(params.key), check_name_mode: 'refuse',
           size: params.size, content_hash: sha1, content_hash_name: 'sha1', proof_code: proof.toString('base64'), proof_version: 'v1', part_info_list: parts,
         });
         if (!created.file_id) throw new Error('创建网盘对象失败。');
@@ -162,6 +439,16 @@ export class DriveObjects {
   }
   async verifyBackup(config: RuntimeCdnConfig, key: string, size: number, checksum: string) {
     const binding = this.binding(config), found = await this.find(binding, key);
+    if (found && !found.saved && found.item.status === 'available' && !found.item.trashed && Number(found.item.size) === size) {
+      const description = await this.find(binding, key, false, `${this.name(key)}.ufm.json`);
+      const json = description && await this.readJson(binding, description.item);
+      const portable = json && checkedPortableDescription(json.value, found.item);
+      if (portable && portable.storageKey === key && portable.checksum === checksum) {
+        const saved = { fileId: String(found.item.file_id), size, checksum, sha1: String(found.item.content_hash).toUpperCase(), ready: true };
+        await this.client.context.setState(this.objectKey(binding, key), saved);
+        found.saved = saved;
+      }
+    }
     if (!found || found.item.status !== 'available' || found.item.trashed || Number(found.item.size) !== size ||
       !found.saved || found.saved.size !== size || found.saved.checksum !== checksum || !found.saved.ready ||
       String(found.item.content_hash || '').toUpperCase() !== found.saved.sha1) {
@@ -176,8 +463,19 @@ export class DriveObjects {
   }
   async remove(config: RuntimeCdnConfig, key: string) {
     const binding = this.binding(config), id = this.objectKey(binding, key);
+    await this.client.context.withLock(`portable-${id}`, async () => {
+      // Resolve the whole pair before any deletion; ambiguous metadata must not
+      // leave an otherwise valid object only partly removed.
+      await this.find(binding, key, true);
+      await this.find(binding, key, true, `${this.name(key)}.ufm.json`);
+      await this.removeObject(config, key);
+      await this.removeObject(config, key, `${this.name(key)}.ufm.json`);
+    });
+  }
+  private async removeObject(config: RuntimeCdnConfig, key: string, cloudName?: string) {
+    const binding = this.binding(config), id = this.stateKey(binding, key, cloudName);
     await this.client.context.withLock(id, async () => {
-      const found = await this.find(binding, key, true);
+      const found = await this.find(binding, key, true, cloudName);
       if (!found) return;
       try { await this.client.request(binding.accountId, '/v2/file/delete', { drive_id: binding.driveId, file_id: found.item.file_id }); }
       catch (error) { if (!(error instanceof DriveError && error.missing)) throw error; }

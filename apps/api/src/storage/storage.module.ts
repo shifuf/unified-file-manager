@@ -12,9 +12,11 @@ import { FileReplicaService } from './file-replica.service';
 import { ReplicaWorker } from './replica.worker';
 import { StorageLimitsService } from './storage-limits.service';
 import { ProjectAccessService } from '../projects/project-access.service';
+import { StorageProjectSyncController } from './storage-project-sync.controller';
+import { StorageProjectSyncService } from './storage-project-sync.service';
 
 @Module({
-  controllers: [ReplicaController, FileReplicaController, StoragePluginsController, PluginAuthController],
+  controllers: [ReplicaController, FileReplicaController, StoragePluginsController, PluginAuthController, StorageProjectSyncController],
   providers: [
     LocalStorageAdapter,
     StorageAdapterRegistry,
@@ -24,6 +26,7 @@ import { ProjectAccessService } from '../projects/project-access.service';
     FileReplicaService,
     ReplicaWorker,
     ProjectAccessService,
+    StorageProjectSyncService,
   ],
   exports: [StorageAdapterRegistry, StorageService, ReplicaService, StorageLimitsService],
 })

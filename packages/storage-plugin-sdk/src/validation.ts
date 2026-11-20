@@ -8,7 +8,7 @@ export interface StoragePluginField {
 }
 export interface StoragePluginManifest {
   id: string; name: string; version: string; apiVersion: 1; entry: string; description?: string;
-  fields: StoragePluginField[]; capabilities: { directUpload: boolean; usage: boolean; authentication?: boolean; backupOnly?: boolean };
+  fields: StoragePluginField[]; capabilities: { directUpload: boolean; usage: boolean; authentication?: boolean; backupOnly?: boolean; remoteFiles?: boolean };
 }
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 function record(value: unknown): value is Record<string, unknown> {
@@ -27,6 +27,7 @@ export function validateManifest(input: unknown): StoragePluginManifest {
   if (!record(input.capabilities) || typeof input.capabilities.directUpload !== 'boolean' || typeof input.capabilities.usage !== 'boolean') fail('capabilities 无效');
   if (input.capabilities.authentication !== undefined && typeof input.capabilities.authentication !== 'boolean') fail('authentication 无效');
   if (input.capabilities.backupOnly !== undefined && typeof input.capabilities.backupOnly !== 'boolean') fail('backupOnly 无效');
+  if (input.capabilities.remoteFiles !== undefined && typeof input.capabilities.remoteFiles !== 'boolean') fail('remoteFiles 无效');
   if (!Array.isArray(input.fields) || input.fields.length > 100) fail('fields 无效');
   const keys = new Set<string>();
   for (const f of input.fields) {
@@ -85,6 +86,9 @@ export function validateAdapter(manifest: StoragePluginManifest, adapter: unknow
   if (!record(adapter) || adapter.provider !== manifest.id) fail('适配器 provider 与 manifest 不一致');
   for (const method of ['upload', 'uploadFile', 'remove', 'getDownloadUrl', 'objectExists']) if (typeof adapter[method] !== 'function') fail(`适配器缺少 ${method}`);
   if (manifest.capabilities.backupOnly && typeof adapter.verifyBackup !== 'function') fail('备份适配器缺少 verifyBackup');
+  if (manifest.capabilities.remoteFiles) for (const method of ['listRemoteFiles', 'readRemoteFile']) {
+    if (typeof adapter[method] !== 'function') fail(`云端文件适配器缺少 ${method}`);
+  }
   if (manifest.capabilities.authentication) for (const method of ['startLogin', 'pollLogin', 'cancelLogin', 'accountStatus', 'disconnectAccount']) {
     if (typeof adapter[method] !== 'function') fail(`认证适配器缺少 ${method}`);
   }
