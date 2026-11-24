@@ -36,9 +36,11 @@ ENV DATABASE_URL=mysql://ufm:ufm_password@mysql:3306/unified_file_manager
 RUN npm --workspace apps/api run prisma:generate
 RUN npm --workspace apps/api run build
 
-FROM api-build AS api-runtime-deps
-# Prune where the complete workspace metadata exists. Plugin workspaces are development deliverables.
-RUN npm prune --omit=dev --workspace=@ufm/api --include-workspace-root=false --ignore-scripts
+FROM deps AS api-runtime-deps
+# A fresh workspace install excludes web/plugin dependencies already present in deps.
+# Prisma's runtime engines and sharp's optional native packages keep their install scripts.
+RUN npm ci --omit=dev --workspace=@ufm/api --include-workspace-root=false \
+    --include=optional --no-audit --fund=false
 
 FROM source AS web-build
 RUN npm --workspace apps/web run build
@@ -57,17 +59,18 @@ WORKDIR /app
 # ffmpeg enables cover extraction / optional VIDEO_TRANSCODE / VIDEO_HLS pipelines.
 RUN apk add --no-cache openssl su-exec ffmpeg
 ENV NODE_ENV=production
-COPY --from=api-runtime-deps /app/node_modules ./node_modules
-COPY --from=api-build /app/apps/api/dist ./apps/api/dist
-COPY --from=api-build /app/apps/api/prisma ./apps/api/prisma
-COPY --from=api-build /app/apps/api/scripts ./apps/api/scripts
-COPY --from=api-build /app/apps/api/package.json ./apps/api/package.json
-COPY --from=api-build /app/packages/storage-plugin-sdk/package.json ./packages/storage-plugin-sdk/package.json
-COPY --from=api-build /app/packages/storage-plugin-sdk/dist ./packages/storage-plugin-sdk/dist
-COPY apps/api/docker-entrypoint.sh ./apps/api/docker-entrypoint.sh
+COPY --from=api-runtime-deps --chown=node:node /app/node_modules ./node_modules
+COPY --from=api-build --chown=node:node /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=api-build --chown=node:node /app/apps/api/dist ./apps/api/dist
+COPY --from=api-build --chown=node:node /app/apps/api/prisma ./apps/api/prisma
+COPY --from=api-build --chown=node:node /app/apps/api/scripts ./apps/api/scripts
+COPY --from=api-build --chown=node:node /app/apps/api/package.json ./apps/api/package.json
+COPY --from=api-build --chown=node:node /app/packages/storage-plugin-sdk/package.json ./packages/storage-plugin-sdk/package.json
+COPY --from=api-build --chown=node:node /app/packages/storage-plugin-sdk/dist ./packages/storage-plugin-sdk/dist
+COPY --chown=node:node apps/api/docker-entrypoint.sh ./apps/api/docker-entrypoint.sh
 RUN chmod +x ./apps/api/docker-entrypoint.sh \
     && mkdir -p /app/storage /app/storage-plugins \
-    && chown -R node:node /app
+    && chown node:node /app/storage /app/storage-plugins
 EXPOSE 60557
 ENTRYPOINT ["./apps/api/docker-entrypoint.sh"]
 CMD ["node", "apps/api/dist/main.js"]

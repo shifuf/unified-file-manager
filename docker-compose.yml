@@ -6,11 +6,18 @@
 # 配置只读项目根 .env（见 .env.example，必改项很少）
 # 数据卷：ufm_mysql_data / ufm_redis_data / ufm_meili_data / ufm_storage_data
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${DOCKER_LOG_MAX_FILE:-3}"
+
 services:
   mysql:
     image: mysql:8.4
     container_name: ufm-mysql
     restart: unless-stopped
+    logging: *default-logging
     env_file:
       - .env
     environment:
@@ -27,6 +34,9 @@ services:
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
+      - --binlog-row-image=${MYSQL_BINLOG_ROW_IMAGE:-MINIMAL}
+      - --binlog-expire-logs-seconds=${MYSQL_BINLOG_EXPIRE_LOGS_SECONDS:-259200}
+      - --max-binlog-size=${MYSQL_MAX_BINLOG_SIZE:-67108864}
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
       interval: 10s
@@ -38,6 +48,7 @@ services:
     image: redis:7.4-alpine
     container_name: ufm-redis
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "${BIND_IP:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     mem_limit: ${REDIS_MEMORY_LIMIT:-96m}
@@ -55,6 +66,7 @@ services:
     container_name: ufm-meilisearch
     profiles: ["extras", "full"]
     restart: unless-stopped
+    logging: *default-logging
     environment:
       MEILI_ENV: ${MEILI_ENV:-production}
       MEILI_NO_ANALYTICS: "true"
@@ -81,6 +93,7 @@ services:
     container_name: ufm-api
     profiles: ["full"]
     restart: unless-stopped
+    logging: *default-logging
     env_file:
       - .env
     environment:
@@ -117,6 +130,7 @@ services:
 
   plugin-installer:
     profiles: ["plugins"]
+    logging: *default-logging
     build:
       context: .
       dockerfile: Dockerfile
@@ -139,6 +153,7 @@ services:
     container_name: ufm-web
     profiles: ["full"]
     restart: unless-stopped
+    logging: *default-logging
     env_file:
       - .env
     depends_on:
