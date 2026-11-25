@@ -40,4 +40,9 @@ echo "Starting API..."
 chown -R node:node /app/storage 2>/dev/null || true
 mkdir -p "${STORAGE_PLUGIN_DIR:-/app/storage-plugins}"
 chown -R node:node "${STORAGE_PLUGIN_DIR:-/app/storage-plugins}" 2>/dev/null || true
+# Keep retained archives across container replacement. Only adjust this dedicated
+# directory, never the parent holding deployment snapshots or their contents.
+mkdir -p /app/backups
+chown node:node /app/backups
+chmod 700 /app/backups
 exec su-exec node "$@"

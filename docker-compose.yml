@@ -115,7 +115,7 @@ services:
     volumes:
       - ufm_storage_data:/app/storage
       - ufm_plugin_data:/app/storage-plugins
-      - ./backups:/app/backups
+      - ./backups/archives:/app/backups
     ports:
       - "${BIND_IP:-127.0.0.1}:${APP_PORT:-60557}:${APP_PORT:-60557}"
     healthcheck:
