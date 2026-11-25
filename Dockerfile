@@ -1,4 +1,5 @@
 ARG NODE_IMAGE=node:22-alpine
+ARG API_RUNTIME_IMAGE=${NODE_IMAGE}
 ARG NGINX_IMAGE=nginx:1.27-alpine
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 
@@ -52,12 +53,17 @@ COPY scripts/install-storage-plugins.cjs scripts/install-storage-plugins.cjs
 RUN npm run build:plugins
 CMD ["node", "scripts/install-storage-plugins.cjs"]
 
-FROM ${NODE_IMAGE} AS api
+FROM ${API_RUNTIME_IMAGE} AS api
 ARG UFM_VERSION=dev
+ARG API_RUNTIME_PREPARED=false
 ENV UFM_VERSION=${UFM_VERSION}
 WORKDIR /app
 # ffmpeg enables cover extraction / optional VIDEO_TRANSCODE / VIDEO_HLS pipelines.
-RUN apk add --no-cache openssl su-exec ffmpeg
+RUN if [ "$API_RUNTIME_PREPARED" = "true" ]; then \
+      openssl version && ffmpeg -version >/dev/null && command -v su-exec \
+      && rm -rf /app/node_modules /app/apps/api/dist /app/apps/api/prisma \
+        /app/apps/api/scripts /app/packages/storage-plugin-sdk/dist; \
+    else apk add --no-cache openssl su-exec ffmpeg; fi
 ENV NODE_ENV=production
 COPY --from=api-runtime-deps --chown=node:node /app/node_modules ./node_modules
 COPY --from=api-build --chown=node:node /app/node_modules/.prisma ./node_modules/.prisma
