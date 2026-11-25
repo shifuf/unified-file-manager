@@ -1,12 +1,18 @@
 ARG NODE_IMAGE=node:22-alpine
 ARG API_RUNTIME_IMAGE=${NODE_IMAGE}
+ARG BUILD_RUNTIME_IMAGE=${NODE_IMAGE}
 ARG NGINX_IMAGE=nginx:1.27-alpine
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 
-FROM ${NODE_IMAGE} AS deps
+FROM ${BUILD_RUNTIME_IMAGE} AS deps
+ARG BUILD_RUNTIME_PREPARED=false
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 WORKDIR /app
-RUN apk add --no-cache openssl
+RUN if [ "$BUILD_RUNTIME_PREPARED" = "true" ]; then \
+      node --version && npm --version && openssl version \
+      && rm -rf /app/node_modules /app/apps/api/dist /app/apps/api/prisma \
+        /app/apps/api/scripts /app/packages/storage-plugin-sdk/dist; \
+    else apk add --no-cache openssl; fi
 COPY package.json package-lock.json ./
 COPY apps/api/package.json apps/api/package.json
 COPY apps/web/package.json apps/web/package.json
@@ -20,7 +26,7 @@ COPY plugins/aliyun-drive/package.json plugins/aliyun-drive/package.json
 COPY plugins/s3/package.json plugins/s3/package.json
 COPY plugins/cloudflare-r2/package.json plugins/cloudflare-r2/package.json
 RUN npm config set registry "$NPM_REGISTRY" \
-    && npm ci --include=optional --no-audit --fund=false
+    && npm ci --include=dev --include=optional --no-audit --fund=false
 
 FROM deps AS source
 WORKDIR /app

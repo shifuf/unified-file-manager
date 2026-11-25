@@ -15,3 +15,5 @@ DAV 删除和彻底删除开始后，文件进入持久的删除状态。存储�
 拖拽普通文件继续使用现有上传流程。云存储的日期目录是对象存储路径，与文件管理页面中的逻辑文件夹分别管理；本次未修改目录布局。
 
 部署可通过 `API_RUNTIME_IMAGE` 指定已经验证的 API 运行时镜像，并设置 `API_RUNTIME_PREPARED=true`。构建先确认 OpenSSL、FFmpeg 和 su-exec 可用，再清除继承的 API 代码与依赖并装入本次编译结果。通常构建保持默认参数；复用时固定一个基础镜像 digest，避免连续把上一轮 API 镜像作为基础而叠加镜像体积。
+
+构建阶段也可通过 `BUILD_RUNTIME_IMAGE` 指定固定运行时镜像，并设置 `BUILD_RUNTIME_PREPARED=true`。构建会确认 Node、npm、OpenSSL 可用，清除继承的编译产物后重新安装含开发工具的工作区依赖。API 与 Web 构建均可使用；默认仍基于 `NODE_IMAGE` 安装 OpenSSL。该选项不改变最终 Web 镜像的 Nginx 基础层。
