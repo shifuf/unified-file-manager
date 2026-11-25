@@ -853,6 +853,7 @@ export class PublicFilesController {
       ? null
       : parseByteRange(getRequestRangeHeader(request), fileSize);
     if (parsedRange === 'unsatisfiable') {
+      target.stream?.destroy();
       writeUnsatisfiableRange(response, fileSize);
       return;
     }
@@ -867,6 +868,7 @@ export class PublicFilesController {
       if (thumb) {
         const thumbEtag = this.buildThumbEtag(file.id, thumb.size, file.checksum);
         if (this.matchesEtag(request, thumbEtag)) {
+          target.stream?.destroy();
           response.status(304).end();
           return;
         }
@@ -877,6 +879,7 @@ export class PublicFilesController {
             thumb.storageKey,
           );
           if (thumbTarget.type === 'redirect' && thumbTarget.url && !thumbTarget.stream) {
+            target.stream?.destroy();
             writeDownloadStorageHeader(response, thumbTarget.storageSource);
             recordPublicDownload(thumbTarget.storageSource, thumb.size);
             // Signed CDN URL — do not cache 302 (token expires).
@@ -890,6 +893,7 @@ export class PublicFilesController {
             stream = await this.fetchRemoteStream(thumbTarget.url);
           }
           if (stream) {
+            target.stream?.destroy();
             writeDownloadStorageHeader(response, thumbTarget.storageSource);
             recordPublicDownload(thumbTarget.storageSource, thumb.size);
             response.setHeader('Content-Type', thumb.mimeType || 'image/webp');
@@ -912,11 +916,16 @@ export class PublicFilesController {
     // Prefer ranged stream when seeking; avoid bare redirect so Accept-Ranges works.
     // Image transforms also need a server-side stream (sharp).
     let activeTarget = target;
-    if (rangeOpts || shouldTransform) {
+    if (target.verified && target.stream) {
+      if (parsedRange && typeof parsedRange === 'object') {
+        activeTarget = { ...target, stream: sliceByteRange(target.stream, parsedRange), contentLength: parsedRange.length };
+      }
+    } else if (rangeOpts || shouldTransform) {
       try {
         activeTarget = await this.storageService.getDownloadTarget(file, undefined, rangeOpts, {
           preferRedirect: false,
         });
+        if (activeTarget.stream !== target.stream) target.stream?.destroy();
       } catch {
         activeTarget = target;
       }
@@ -974,6 +983,7 @@ export class PublicFilesController {
 
     const etag = this.buildFileEtag(file);
     if (!rangeOpts && etag && this.matchesEtag(request, etag)) {
+      stream.destroy();
       response.status(304).end();
       return;
     }
@@ -1258,7 +1268,7 @@ export class PublicSharesController {
     disposition: 'attachment' | 'inline' = 'attachment',
   ): Promise<void> {
     const head = request.method === 'HEAD';
-    const { file, shareId, target, watermarkText, range, unsatisfiable } = await this.filesService.getShareDownloadTarget(token, password, {
+    const { file, shareId, target, watermarkText, range, unsatisfiable, recordDownload } = await this.filesService.getShareDownloadTarget(token, password, {
       ip: getClientIp(request),
       ticket, expires: expires === undefined ? undefined : Number(expires),
       head, rangeHeader: getRequestRangeHeader(request),
@@ -1271,7 +1281,7 @@ export class PublicSharesController {
       response.end();
       return;
     }
-    if (disposition === 'attachment') this.downloadStatsService.record({
+    if (disposition === 'attachment' && recordDownload !== false) this.downloadStatsService.record({
       projectId: file.projectId,
       fileId: file.id,
       originalName: file.originalName,

@@ -63,7 +63,7 @@ export type DownloadStorageIdentity = { configId: string; configName: string; pr
 export type DownloadStorageSource = {
   strategy: 'CLOUD_PRIORITY';
   selected: DownloadStorageIdentity;
-  attempts: Array<DownloadStorageIdentity & { outcome: 'SELECTED' | 'FAILED' | 'SKIPPED'; reason?: string }>;
+  attempts: Array<DownloadStorageIdentity & { outcome: 'SELECTED' | 'FAILED' | 'SKIPPED'; reason?: string; route?: 'CDN' | 'ORIGIN' }>;
   omittedAttempts?: number;
 };
 
@@ -126,6 +126,8 @@ export interface StorageAdapter {
     key: string,
     range?: StorageByteRange,
   ): Promise<StorageDownloadTarget>;
+
+  getCdnDownloadTarget?(config: RuntimeCdnConfig, key: string): Promise<StorageDownloadTarget | null>;
 
   objectExists?(config: RuntimeCdnConfig, key: string): Promise<boolean>;
 

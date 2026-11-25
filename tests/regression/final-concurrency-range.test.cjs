@@ -7,7 +7,8 @@ const {sliceByteRange,pipeStreamToResponse}=require('../../apps/api/src/common/u
 const file={id:'f',projectId:'p',storageKey:'source',currentVersion:4,size:10n,checksum:'hash',cdnConfigId:'local',mimeType:'video/mp4',originalName:'v.mp4'};
 test('simultaneous identical version snapshot survives MySQL upsert unique race',async()=>{
  const s=Object.create(FilesService.prototype);let audits=0;
- Object.assign(s,{prisma:{fileVersion:{upsert:async()=>{throw Object.assign(new Error('race'),{code:'P2002'});},findUnique:async()=>({...file,fileId:file.id,version:4})}},auditService:{write:async()=>audits++}});
+ const tx={$queryRaw:async()=>[],managedFile:{findUnique:async()=>file},fileVersion:{upsert:async()=>{throw Object.assign(new Error('race'),{code:'P2002'});},findUnique:async()=>({...file,fileId:file.id,version:4})}};
+ Object.assign(s,{prisma:{...tx,$transaction:async fn=>fn(tx)},auditService:{write:async()=>audits++}});
  await s.snapshotCurrentVersion(file);assert.equal(audits,1);
 });
 test('canceling a range before its first read closes the verified source',async()=>{
@@ -21,7 +22,8 @@ test('browser disconnect closes a partially streamed range and its source',async
 });
 test('unique collision with a different historical object reports conflict',async()=>{
  const s=Object.create(FilesService.prototype);
- Object.assign(s,{prisma:{fileVersion:{upsert:async()=>{throw Object.assign(new Error('race'),{code:'P2002'});},findUnique:async()=>({...file,storageKey:'different'})}},auditService:{write:async()=>assert.fail('must not audit failed snapshot')}});
+ const tx={$queryRaw:async()=>[],managedFile:{findUnique:async()=>file},fileVersion:{upsert:async()=>{throw Object.assign(new Error('race'),{code:'P2002'});},findUnique:async()=>({...file,storageKey:'different'})}};
+ Object.assign(s,{prisma:{...tx,$transaction:async fn=>fn(tx)},auditService:{write:async()=>assert.fail('must not audit failed snapshot')}});
  await assert.rejects(s.snapshotCurrentVersion(file),e=>e.getStatus?.()===409);
 });
 test('HLS child resource uses its verified size instead of master playlist size',async()=>{
@@ -60,6 +62,32 @@ test('public Range history matches the final range source instead of the initial
  assert.equal(records[0].bytes, 4);
  assert.equal(records[0].rangeStart, 2);
  assert.equal(records[0].rangeEnd, 5);
+});
+
+test('public Range reuses one fully verified source without a second origin read', async () => {
+ const source = { strategy: 'CLOUD_PRIORITY', selected: { configId: 'verified-cloud', configName: 'cloud', provider: 'UPYUN' }, attempts: [] };
+ let reads = 0;
+ const records = [], original = Readable.from(['0123', '456789']);
+ const c = new PublicFilesController({ get: () => '' }, { getPublicDownloadTarget: async () => { reads++; return { file, target: { type: 'stream', stream: original, verified: true, contentLength: 10, storageSource: source }, isOpenPublic: true }; } }, {}, { getDownloadTarget: async () => { reads++; return { type: 'stream', stream: Readable.from(['2345']), verified: true }; } }, { recordPublicAccess: () => {} }, { record: value => records.push(value) });
+ c.enforcePublicAccessPolicy = async () => 'open';
+ const { r, chunks } = response(), finished = new Promise(resolve => r.on('finish', resolve));
+ await c.access('f', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { headers: { range: 'bytes=2-5' }, get: () => undefined }, r);
+ await finished;
+ assert.equal(Buffer.concat(chunks).toString(), '2345');
+ assert.equal(reads, 1, 'Range must not download and verify the complete object twice');
+ assert.equal(records[0].storageSource.selected.configId, 'verified-cloud');
+ assert.equal(original.destroyed, true);
+});
+
+test('public 416 and 304 responses close their unused verified object streams', async () => {
+ for (const headers of [{ range: 'bytes=100-200' }, { 'if-none-match': '"hash"' }]) {
+  const original = Readable.from(['0123456789']);
+  const c = new PublicFilesController({ get: () => '' }, { getPublicDownloadTarget: async () => ({ file, target: { type: 'stream', stream: original, verified: true, contentLength: 10 }, isOpenPublic: true }) }, {}, {}, { recordPublicAccess: () => {} }, { record: () => {} });
+  c.enforcePublicAccessPolicy = async () => 'open';
+  const { r } = response();
+  await c.access('f', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { headers, get: () => undefined }, r);
+  assert.equal(original.destroyed, true);
+ }
 });
 
 test('open API Range audit retains the final source and exact bounds', async () => {

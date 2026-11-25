@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { decryptText, getSigningSecret, hmacSha256Base64Url } from './crypto.util';
 import { StorageAdapterRegistry } from './storage-registry.service';
 import { storageIdentity } from './download-source.util';
+import { FILE_DELETION_PURGE_AT, isFileDeletionFrozen } from './file-deletion.util';
 import { ReplicaService, verifiedTarget } from './replica.service';
 import { selectFailoverStorage } from './storage-policy.util';
 import { StorageLimitsService } from './storage-limits.service';
@@ -28,6 +29,8 @@ export type StorageFileInput = {
   checksum?: string | null;
   cdnConfigId?: string | null;
   cdnConfig?: CdnConfig | null;
+  status?: string;
+  purgeAt?: Date | null;
 };
 
 export type StorageTargetOptions = {
@@ -89,16 +92,25 @@ export class StorageService {
 
   /** Freeze indexed copies before touching bytes. Keep the index on failure so retry
    * can finish even after some providers have already removed their objects. */
-  async removeFileObjects(fileId: string): Promise<string[]> {
+  async removeFileObjects(fileId: string, options: { historyOnly?: boolean; allowActive?: boolean;
+    expectedHead?: { storageKey: string; currentVersion: number } } = {}): Promise<string[]> {
     const plan = await this.prisma.$transaction(async tx => {
       const initial = await tx.managedFile.findUnique({ where: { id: fileId } });
-      if (!initial) return { projectId: '', keys: [] as string[], targets: [] as Array<{ config: CdnConfig; key: string }> };
+      if (!initial) return { projectId: '', keys: [] as string[], versionIds: [] as string[], targets: [] as Array<{ config: CdnConfig; key: string }> };
       await tx.$queryRaw`SELECT id FROM Project WHERE id = ${initial.projectId} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${fileId} FOR UPDATE`;
       const file = await tx.managedFile.findUnique({ where: { id: fileId }, include: {
         cdnConfig: true, versions: true, derivatives: true,
       } });
-      if (!file || file.status !== 'RECYCLED') throw new ConflictException('文件状态已变化，请刷新回收站后重试。');
+      if (!file || (options.historyOnly ? file.status === 'DELETED' || isFileDeletionFrozen(file)
+        : file.status !== (options.allowActive ? 'ACTIVE' : 'RECYCLED') && !isFileDeletionFrozen(file))) {
+        throw new ConflictException('文件状态已变化，请刷新后重试。');
+      }
+      if (options.expectedHead && (file.storageKey !== options.expectedHead.storageKey || file.currentVersion !== options.expectedHead.currentVersion)) {
+        throw new ConflictException('文件内容已变化，请刷新后重试彻底删除。');
+      }
+      const versions = options.historyOnly ? [...file.versions].sort((a, b) => b.version - a.version).slice(3) : file.versions;
+      const versionIds = options.historyOnly ? versions.map(version => version.id) : [];
       const origins = new Map<string, CdnConfig[]>();
       const add = (key: string, config: CdnConfig | null) => {
         if (!key) return;
@@ -106,19 +118,27 @@ export class StorageService {
         if (config && !configs.some(c => c.id === config.id)) configs.push(config);
         origins.set(key, configs);
       };
-      add(file.storageKey, file.cdnConfig);
-      const versionConfigs = await tx.cdnConfig.findMany({ where: { id: { in: file.versions.flatMap(v => v.cdnConfigId ? [v.cdnConfigId] : []) } } });
-      for (const version of file.versions) add(version.storageKey, versionConfigs.find(c => c.id === version.cdnConfigId) ?? null);
+      if (!options.historyOnly) add(file.storageKey, file.cdnConfig);
+      const versionConfigs = await tx.cdnConfig.findMany({ where: { id: { in: versions.flatMap(v => v.cdnConfigId ? [v.cdnConfigId] : []) } } });
+      for (const version of versions) add(version.storageKey, versionConfigs.find(c => c.id === version.cdnConfigId) ?? null);
+      const retainedKeys = new Set(options.historyOnly ? [file.storageKey,
+        ...file.versions.filter(version => !versionIds.includes(version.id)).map(version => version.storageKey)] : []);
       for (const derivative of file.derivatives) {
-        add(derivative.storageKey, file.cdnConfig);
+        if (options.historyOnly) retainedKeys.add(derivative.storageKey);
+        else add(derivative.storageKey, file.cdnConfig);
         const meta = derivative.meta as { segmentPrefix?: string; files?: unknown[] } | null;
         if (derivative.kind === 'HLS' && typeof meta?.segmentPrefix === 'string' && Array.isArray(meta.files)) {
-          for (const name of meta.files) if (typeof name === 'string') add(`${meta.segmentPrefix}/${name}`, file.cdnConfig);
+          for (const name of meta.files) if (typeof name === 'string') {
+            const key = `${meta.segmentPrefix}/${name}`;
+            if (options.historyOnly) retainedKeys.add(key);
+            else add(key, file.cdnConfig);
+          }
         }
       }
       // Imported records and historical versions may share immutable keys. Retain
       // bytes until the last referencing record is permanently removed.
       for (const key of origins.keys()) {
+        if (retainedKeys.has(key)) { origins.delete(key); continue; }
         const shared = await tx.managedFile.findFirst({ where: { id: { not: fileId }, OR: [
           { storageKey: key }, { versions: { some: { storageKey: key } } }, { derivatives: { some: { storageKey: key } } },
         ] }, select: { id: true } });
@@ -130,6 +150,12 @@ export class StorageService {
       if (rows.some(row => row.leaseOwner && row.leaseUntil && row.leaseUntil > new Date())) {
         throw new ConflictException('文件副本正在同步，请等待同步完成后重试彻底删除。');
       }
+      if (!options.historyOnly) {
+        const frozen = await tx.managedFile.updateMany({ where: { id: fileId, projectId: file.projectId,
+          storageKey: file.storageKey, currentVersion: file.currentVersion, status: file.status },
+          data: { status: 'RECYCLED', deletedAt: file.deletedAt ?? new Date(), purgeAt: FILE_DELETION_PURGE_AT } });
+        if (frozen.count !== 1) throw new ConflictException('文件内容已变化，请刷新后重试彻底删除。');
+      }
       const targets = new Map<string, { config: CdnConfig; key: string }>();
       for (const [key, configs] of origins) for (const config of configs) targets.set(`${config.id}\0${key}`, { config, key });
       for (const row of rows) targets.set(`${row.configId}\0${row.storageKey}`, { config: row.config, key: row.storageKey });
@@ -140,7 +166,8 @@ export class StorageService {
       })), skipDuplicates: true });
       if (keys.length) await tx.storageReplica.updateMany({ where: { projectId: file.projectId, storageKey: { in: keys } },
         data: { status: 'DELETING', leaseOwner: null, leaseUntil: null, lastError: '正在彻底删除；失败后请在回收站重试。' } });
-      return { projectId: file.projectId, keys, targets: [...targets.values()] };
+      return { projectId: file.projectId, fileId, storageKey: file.storageKey, currentVersion: file.currentVersion,
+        keys, versionIds, targets: [...targets.values()] };
     });
     try {
       // Clouds first: a cloud outage should leave the local safety copy available.
@@ -159,7 +186,45 @@ export class StorageService {
     } catch {
       throw new ServiceUnavailableException('存储对象尚未全部删除，文件记录已保留，请检查存储连接、插件和删除权限后重试。');
     }
+    if (options.historyOnly && plan.versionIds.length) {
+      await this.prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT id FROM Project WHERE id = ${plan.projectId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${fileId} FOR UPDATE`;
+        await tx.fileVersion.deleteMany({ where: { fileId, id: { in: plan.versionIds } } });
+        if (plan.keys.length) await tx.storageReplica.deleteMany({ where: {
+          projectId: plan.projectId, storageKey: { in: plan.keys }, status: 'DELETING',
+        } });
+      });
+    }
     return plan.keys;
+  }
+
+  async pruneFileVersions(fileId: string): Promise<void> {
+    await this.removeFileObjects(fileId, { historyOnly: true });
+  }
+
+  async deleteDavFile(fileId: string): Promise<void> {
+    const file = await this.prisma.managedFile.findUnique({ where: { id: fileId } });
+    if (!file) return;
+    const expected = { id: fileId, projectId: file.projectId, storageKey: file.storageKey, currentVersion: file.currentVersion };
+    const keys = await this.removeFileObjects(fileId, { allowActive: true, expectedHead: expected });
+    await this.finishFileDeletion(expected, keys);
+  }
+
+  async finishFileDeletion(expected: { id: string; projectId: string; storageKey: string; currentVersion: number }, keys: string[]): Promise<void> {
+    await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${expected.projectId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${expected.id} FOR UPDATE`;
+      const file = await tx.managedFile.findUnique({ where: { id: expected.id } });
+      if (!file) return;
+      if (!isFileDeletionFrozen(file) || file.storageKey !== expected.storageKey || file.currentVersion !== expected.currentVersion) {
+        throw new ConflictException('文件内容已变化，请刷新后重试删除。');
+      }
+      if (keys.length) await tx.storageReplica.deleteMany({ where: { projectId: file.projectId,
+        storageKey: { in: keys }, status: 'DELETING' } });
+      const removed = await tx.managedFile.deleteMany({ where: { ...expected, status: 'RECYCLED', purgeAt: FILE_DELETION_PURGE_AT } });
+      if (removed.count !== 1) throw new ConflictException('文件内容已变化，请刷新后重试删除。');
+    });
   }
 
   async materializeUploadedObject(projectId: string, configId: string, key: string, size: bigint | number | undefined,
@@ -184,6 +249,7 @@ export class StorageService {
     range?: { start?: number; end?: number },
     _options: StorageTargetOptions = {},
   ): Promise<StorageDownloadTarget> {
+    if (isFileDeletionFrozen(file)) throw new ConflictException('文件正在彻底删除，请在回收站重试删除。');
     if (this.replicas) return this.replicas.getDownloadTargetForKey(file, key, range);
     const config = this.runtimeConfigForFile(file);
     const storageKey = normalizeStorageKey(key);
@@ -193,8 +259,10 @@ export class StorageService {
 
     const current = storageKey === normalizeStorageKey(file.storageKey);
     const reader = new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
-    const object = await reader.readVerified(config, storageKey, current ? file.size : undefined, current ? file.checksum : undefined);
-    return { ...verifiedTarget(object, range, file.mimeType), storageSource };
+    const object = await reader.readVerified(config, storageKey, current ? file.size : undefined, current ? file.checksum : undefined, undefined, { allowCdn: true });
+    return { ...verifiedTarget(object, range, file.mimeType), storageSource: { ...storageSource,
+      attempts: object.readAttempts?.map(attempt => ({ ...selected, ...attempt })) ?? storageSource.attempts,
+    } };
   }
 
   /** Copy an object into a selected config without removing the source object. */

@@ -165,7 +165,7 @@ export class PublicFolderSharesController {
   private async downloadFile(token: string, fileId: string, password: string | undefined, ticket: string | undefined, expires: string | undefined, request: Request, response: Response): Promise<void> {
     const clientIp = getClientIp(request);
     const head = request.method === 'HEAD';
-    const { file, shareId, target, range, unsatisfiable } = await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
+    const { file, shareId, target, range, unsatisfiable, recordDownload } = await this.folderShareService.getFileDownloadTarget(token, fileId, password, {
       ip: clientIp, head, rangeHeader: getRequestRangeHeader(request),
       ticket, expires: expires === undefined ? undefined : Number(expires),
     });
@@ -184,7 +184,7 @@ export class PublicFolderSharesController {
       response.status(404).send('File stream not found.');
       return;
     }
-    this.downloadStatsService.record({
+    if (recordDownload !== false) this.downloadStatsService.record({
       projectId: file.projectId,
       fileId: file.id,
       originalName: file.originalName,

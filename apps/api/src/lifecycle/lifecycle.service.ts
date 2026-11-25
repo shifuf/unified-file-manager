@@ -133,27 +133,22 @@ export class LifecycleService {
     );
 
     const now = new Date();
+    let affected = 0;
     for (const file of matched) {
-      if (policy.action === 'PURGE') {
-        // Soft-mark for immediate purge by maintenance; avoid hard storage delete here.
-        await this.prisma.managedFile.update({
-          where: { id: file.id },
-          data: {
-            status: FileStatus.RECYCLED,
-            deletedAt: now,
-            purgeAt: now,
-          },
-        });
-      } else {
-        await this.prisma.managedFile.update({
-          where: { id: file.id },
-          data: {
-            status: FileStatus.RECYCLED,
-            deletedAt: now,
-            purgeAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
-          },
-        });
-      }
+      // Selection can predate a save or a DAV deletion freeze. Atomically claim
+      // only the selected ACTIVE identity, preserving whole-file delete intent.
+      const changed = await this.prisma.managedFile.updateMany({
+        where: { id: file.id, projectId: file.projectId, status: FileStatus.ACTIVE,
+          storageKey: file.storageKey, currentVersion: file.currentVersion },
+        data: {
+          status: FileStatus.RECYCLED,
+          deletedAt: now,
+          // Soft-mark for maintenance; provider I/O stays outside transactions.
+          purgeAt: policy.action === 'PURGE' ? now : new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+        },
+      });
+      if (changed.count !== 1) continue;
+      affected++;
       this.eventBus.emit(DOMAIN_EVENTS.FILE_DELETED, {
         projectId: file.projectId,
         fileId: file.id,
@@ -166,6 +161,6 @@ export class LifecycleService {
       data: { lastRunAt: new Date() },
     });
 
-    return { affected: matched.length };
+    return { affected };
   }
 }

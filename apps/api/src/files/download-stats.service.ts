@@ -191,8 +191,9 @@ export class DownloadStatsService {
     const storageSource = input.storageSource ? {
       strategy: input.storageSource.strategy,
       selected: identity(input.storageSource.selected),
-      attempts: input.storageSource.attempts.map(({ outcome, reason, ...item }) => ({
+      attempts: input.storageSource.attempts.map(({ outcome, reason, route, ...item }) => ({
         ...identity(item), outcome, ...(reason ? { reason } : {}),
+        ...(route === 'CDN' || route === 'ORIGIN' ? { route } : {}),
       })),
       ...(input.storageSource.omittedAttempts ? { omittedAttempts: input.storageSource.omittedAttempts } : {}),
     } : null;

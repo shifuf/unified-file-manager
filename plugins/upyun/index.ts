@@ -50,6 +50,13 @@ export class UpyunAdapter implements StorageAdapter {
     const length = response.headers.get('content-length');
     return { type: 'stream', stream: Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]), contentType: response.headers.get('content-type') ?? undefined, contentLength: length === null ? undefined : Number(length) };
   }
+  async getCdnDownloadTarget(config: RuntimeCdnConfig, key: string): Promise<StorageDownloadTarget | null> {
+    if (!configText(config, 'domain') || configText(config, 'tokenSecret') || configText(config, 'secret')) return null;
+    const response = await fetch(await this.getDownloadUrl(config, key, 600), { signal: AbortSignal.timeout(120_000) });
+    if (!response.ok || !response.body) { await response.body?.cancel(); throw new StoragePluginError(`又拍云 CDN 读取失败：${response.status}`, response.status); }
+    const length = response.headers.get('content-length');
+    return { type: 'stream', stream: Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]), contentType: response.headers.get('content-type') ?? undefined, contentLength: length === null ? undefined : Number(length) };
+  }
   async getUsage() { return { checkedAt: new Date().toISOString(), message: '又拍云未提供稳定的用量查询接口，请在又拍云控制台查看空间与流量。' }; }
 }
 export function createAdapter() { return new UpyunAdapter(); }

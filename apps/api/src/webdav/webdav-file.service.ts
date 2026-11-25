@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { FileStatus, type ManagedFile } from '@prisma/client';
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
@@ -11,6 +11,7 @@ import { FilesService } from '../files/files.service';
 import { FolderManagerService } from '../files/folder-manager.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
+import { isFileDeletionFrozen } from '../storage/file-deletion.util';
 import type { DownloadStorageSource } from '../storage/storage.types';
 import type { WebdavAccount } from './webdav-account.service';
 import { davBaseName, parentDavPath } from './webdav.utils';
@@ -74,8 +75,9 @@ export class WebdavFileService {
 
     const existing = await this.prisma.managedFile.findFirst({
       where: { projectId: account.projectId, originalName: name, folderPath: folderPath || null },
-      select: { id: true, status: true, size: true, storageKey: true, cdnConfig: true },
+      include: { cdnConfig: true },
     });
+    if (existing && isFileDeletionFrozen(existing)) throw new ConflictException('文件正在彻底删除，请在回收站重试删除。');
 
     const isOverwrite = Boolean(existing && existing.status === FileStatus.ACTIVE);
 
@@ -87,6 +89,16 @@ export class WebdavFileService {
 
     await this.folderManager.ensure(account.projectId, folderPath, actorId);
 
+    if (isOverwrite && existing) {
+      await this.filesService.replaceExistingFile({ projectId: account.projectId, projectName: account.projectName,
+        targetFileId: existing.id, buffer: body, originalName: name, mimeType, size: body.length,
+        folderPath: folderPath || null, extension: resolveExtension(name), category: resolveFileCategory(name, mimeType),
+        checksum: createHash('sha256').update(body).digest('hex'),
+      });
+      this.eventBus.emit(DOMAIN_EVENTS.FILE_UPDATED, { projectId: account.projectId, fileId: existing.id, originalName: name, actorId });
+      return;
+    }
+
     const stored = await this.storageService.upload(account.projectId, {
       key: await this.buildStorageKey(account, folderPath, name),
       buffer: body,
@@ -95,31 +107,6 @@ export class WebdavFileService {
     });
     const category = resolveFileCategory(name, mimeType);
     const checksum = createHash('sha256').update(body).digest('hex');
-
-    if (isOverwrite && existing) {
-      await this.prisma.managedFile.update({
-        where: { id: existing.id },
-        data: {
-          cdnConfigId: stored.cdnConfigId,
-          storageKey: stored.storageKey,
-          size: BigInt(body.length),
-          mimeType,
-          extension: resolveExtension(name),
-          category,
-          checksum,
-          publicUrl: stored.publicUrl,
-          thumbnailUrl: category === 'IMAGE' ? stored.publicUrl : null,
-          updatedAt: new Date(),
-        },
-      });
-      // Best-effort cleanup of the replaced object (mirrors the console upload path).
-      await this.storageService.remove(existing.cdnConfig, existing.storageKey).catch((error) => {
-        this.logger.warn(
-          `WebDAV 覆盖后清理旧对象失败 fileId=${existing.id}：${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
-      return;
-    }
 
     const created = await this.prisma.managedFile.create({
       data: {
@@ -162,15 +149,8 @@ export class WebdavFileService {
   }
 
   async deleteFile(account: WebdavAccount, davPath: string): Promise<void> {
-    const file = await this.requireFile(account, davPath);
-
-    await this.storageService.remove(file.cdnConfig, file.storageKey).catch((error) => {
-      this.logger.warn(
-        `WebDAV 删除存储对象失败 fileId=${file.id}：${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
-
-    await this.prisma.managedFile.delete({ where: { id: file.id } });
+    const file = await this.requireFile(account, davPath, true);
+    await this.storageService.deleteDavFile(file.id);
   }
 
   /** Recursive delete for a collection. */
@@ -186,11 +166,7 @@ export class WebdavFileService {
     });
 
     for (const file of files) {
-      await this.storageService.remove(file.cdnConfig, file.storageKey).catch(() => undefined);
-    }
-
-    if (files.length > 0) {
-      await this.prisma.managedFile.deleteMany({ where: { id: { in: files.map((file) => file.id) } } });
+      await this.storageService.deleteDavFile(file.id);
     }
 
     await this.folderManager.remove(account.projectId, folderPath);
@@ -198,7 +174,7 @@ export class WebdavFileService {
     return files.length;
   }
 
-  private async requireFile(account: WebdavAccount, davPath: string) {
+  private async requireFile(account: WebdavAccount, davPath: string, allowFrozen = false) {
     const normalized = folderPathKey(davPath);
     const name = davBaseName(normalized);
     const parent = folderPathKey(parentDavPath(normalized));
@@ -208,12 +184,12 @@ export class WebdavFileService {
         projectId: account.projectId,
         originalName: name,
         folderPath: parent || null,
-        status: FileStatus.ACTIVE,
+        status: allowFrozen ? { in: [FileStatus.ACTIVE, FileStatus.RECYCLED] } : FileStatus.ACTIVE,
       },
       include: { cdnConfig: true },
     });
 
-    if (!file) {
+    if (!file || file.status !== FileStatus.ACTIVE && !isFileDeletionFrozen(file)) {
       throw new NotFoundException('WebDAV 文件不存在。');
     }
 

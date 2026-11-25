@@ -14,6 +14,7 @@ function fixture() {
  service.prisma.managedFile.updateMany=async({data})=>{head={...head,...data};return {count:1};};
  service.prisma.managedFile.findUnique=async()=>head;
  service.prisma.$transaction=async fn=>fn(service.prisma);
+ service.prisma.$queryRaw=async()=>[];service.prisma.storageReplica={findFirst:async()=>null};service.storageService.pruneFileVersions=async()=>{};
  service.prisma.fileDerivative={updateMany:async()=>({count:0})};
  service.toResponse=file=>file;
  service.buildStorageKey=()=> 'p/new';

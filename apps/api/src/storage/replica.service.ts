@@ -34,7 +34,8 @@ type ReplicaDelegate = {
   updateMany(args: Record<string, unknown>): Promise<{ count: number }>;
   groupBy(args: Record<string, unknown>): Promise<Array<{ status: string; _count: { _all: number } }>>;
 };
-type VerifiedObject = { path: string; size: number; checksum: string; cleanup: () => Promise<void> };
+type VerifiedReadAttempt = { outcome: 'SELECTED' | 'FAILED'; route: 'CDN' | 'ORIGIN'; reason?: string };
+type VerifiedObject = { path: string; size: number; checksum: string; cleanup: () => Promise<void>; readAttempts?: VerifiedReadAttempt[] };
 type ReplicaUploadMetadata = Pick<StorageUploadFileParams, 'mimeType' | 'originalName' | 'project' | 'folderPath'>;
 const RETRY_STATES = ['PENDING', 'FAILED', 'MISSING'];
 const LEASE_MS = 5 * 60_000;
@@ -129,6 +130,7 @@ export class ReplicaService {
   }
 
   async getDownloadTargetForKey(file: StorageFileInput, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget> {
+    if (file.status === 'RECYCLED' && file.purgeAt?.getTime() === 0) throw new ConflictException('文件正在彻底删除，请在回收站重试删除。');
     const storageKey = normalizeKey(key);
     const rows = await this.table().findMany({ where: { projectId: file.projectId, storageKey }, include: { config: true } });
     if (rows.some(row => row.status === 'DELETING')) throw new ConflictException('文件正在彻底删除，请在回收站完成删除。');
@@ -150,9 +152,9 @@ export class ReplicaService {
       if (row.status === 'SKIPPED') skipped = skipped || '该副本已跳过同步。';
       if (skipped) { attempts.push({ ...storageIdentity(config), outcome: 'SKIPPED', reason: skipped }); continue; }
       try {
-        const object = await this.readVerified(this.runtime(config), storageKey, row.size, row.checksum);
+        const object = await this.readVerified(this.runtime(config), storageKey, row.size, row.checksum, undefined, { allowCdn: true });
         if (row.status !== 'READY') await this.recoverRead(file, this.runtime(config), storageKey, object);
-        attempts.push({ ...storageIdentity(config), outcome: 'SELECTED' });
+        attempts.push(...(object.readAttempts ?? [{ outcome: 'SELECTED' as const }]).map(attempt => ({ ...storageIdentity(config), ...attempt })));
         return { ...verifiedTarget(object, range, file.mimeType), storageSource: {
           strategy: 'CLOUD_PRIORITY', selected: storageIdentity(config), attempts,
         } };
@@ -168,11 +170,11 @@ export class ReplicaService {
       (file.cdnConfig.enabled && (await this.boundCloudIds(file.projectId)).has(file.cdnConfig.id)))) {
       try {
         const current = storageKey === normalizeKey(file.storageKey);
-        const object = await this.readVerified(this.runtime(file.cdnConfig), storageKey, current ? file.size : undefined, current ? file.checksum : undefined);
+        const object = await this.readVerified(this.runtime(file.cdnConfig), storageKey, current ? file.size : undefined, current ? file.checksum : undefined, undefined, { allowCdn: true });
         await this.recoverRead(file, this.runtime(file.cdnConfig), storageKey, object);
         const selected = storageIdentity(file.cdnConfig);
         return { ...verifiedTarget(object, range, file.mimeType), storageSource: {
-          strategy: 'CLOUD_PRIORITY', selected, attempts: [...attempts, { ...selected, outcome: 'SELECTED' }],
+          strategy: 'CLOUD_PRIORITY', selected, attempts: [...attempts, ...(object.readAttempts ?? [{ outcome: 'SELECTED' as const }]).map(attempt => ({ ...selected, ...attempt }))],
         } };
       } catch { /* continue to an explicit unavailable-object response */ }
     }
@@ -441,18 +443,46 @@ export class ReplicaService {
     return { queued: created.count + retried.count };
   }
 
-  async readVerified(config: RuntimeCdnConfig, key: string, size?: bigint | number, checksum?: string | null, reservation?: ReadReservation): Promise<VerifiedObject> {
+  async readVerified(config: RuntimeCdnConfig, key: string, size?: bigint | number, checksum?: string | null, reservation?: ReadReservation, options: { allowCdn?: boolean } = {}): Promise<VerifiedObject> {
     if (this.isBackupOnly(config.provider)) throw new Error('该存储仅用于上传备份，不提供下载。');
-    const ticket = reservation ?? await this.limits.reserveRead(config, size);
-    try {
-      const adapter = this.registry.adapter(config.provider);
+    const adapter = this.registry.adapter(config.provider);
+    const attempts: VerifiedReadAttempt[] = [];
+    // Only a known digest can certify CDN bytes. Keep origin reads for legacy
+    // objects without a checksum and for adapters that expose no CDN candidate.
+    const tryCdn = Boolean(options.allowCdn && checksum && adapter.getCdnDownloadTarget);
+    for (let attempt = 0; attempt < (tryCdn ? 2 : 1); attempt++) {
+      const ticket = (attempt === 0 ? reservation : undefined) ?? await this.limits.reserveRead(config, size);
+      let route: 'CDN' | 'ORIGIN' = tryCdn && attempt === 0 ? 'CDN' : 'ORIGIN';
+      try {
+        const object = await this.readVerifiedAttempt(config, key, size, checksum, ticket, async () => {
+          if (route === 'CDN') {
+            const candidate = await adapter.getCdnDownloadTarget!(config, key);
+            if (candidate) return candidate;
+            route = 'ORIGIN';
+          }
+          return adapter.getDownloadTarget?.(config, key);
+        });
+        if (tryCdn) object.readAttempts = [...attempts, { route, outcome: 'SELECTED' }];
+        return object;
+      } catch (error) {
+        if (route !== 'CDN' || error instanceof StorageLimitError) throw error;
+        attempts.push({ route, outcome: 'FAILED', reason: safeError(error) });
+      } finally { await this.limits.settleRead(ticket, 0n); }
+    }
+    throw new Error('存储对象无法读取。');
+  }
+
+  private async readVerifiedAttempt(config: RuntimeCdnConfig, key: string, size: bigint | number | undefined,
+    checksum: string | null | undefined, ticket: ReadReservation,
+    getTarget: () => Promise<StorageDownloadTarget | undefined>): Promise<VerifiedObject> {
       let target: StorageDownloadTarget;
       const range = ticket.bytes !== null && ticket.bytes > 0n ? { start: 0, end: Number(ticket.bytes - 1n) } : undefined;
       // Adapter streams do not expose Content-Range totals. Read their full object
       // so an unknown-size range cannot silently certify a truncated prefix.
-      if (adapter.getDownloadTarget) target = await adapter.getDownloadTarget(config, key);
+      const provided = await getTarget();
+      if (provided) target = provided;
       else {
-        const url = await adapter.getDownloadUrl(config, key, 600);
+        const url = await this.registry.adapter(config.provider).getDownloadUrl(config, key, 600);
         let response: Response;
         try { response = await fetch(url, { signal: AbortSignal.timeout(120_000),
           headers: range ? { Range: `bytes=0-${range.end}` } : undefined }); }
@@ -485,7 +515,6 @@ export class ReplicaService {
         }
       }
       return await this.limits.consumeRead(ticket, target.stream, stream => spoolVerifiedStream(stream, size, checksum));
-    } finally { await this.limits.settleRead(ticket, 0n); }
   }
 
   private async uploadDisk(config: RuntimeCdnConfig, key: string, object: VerifiedObject, mimeType: string, originalName: string,

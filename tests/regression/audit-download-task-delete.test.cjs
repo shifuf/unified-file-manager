@@ -12,6 +12,19 @@ const source = { strategy: 'CLOUD_PRIORITY', selected: { configId: 'local', conf
   { configId: 'local', configName: '本地安全副本', provider: 'LOCAL', outcome: 'SELECTED' },
 ] };
 
+test('persisted download audit distinguishes CDN failure from origin success and drops unknown route values', async () => {
+ const audits = [], selected = { configId: 'upyun', configName: 'UPYUN', provider: 'UPYUN' };
+ const service = new DownloadStatsService({ auditLog: { create: async ({ data }) => audits.push(data) } });
+ await service.persistAudit({ projectId: 'p', fileId: 'f', bytes: 4, source: 'PUBLIC', storageSource: {
+  strategy: 'CLOUD_PRIORITY', selected, attempts: [
+   { ...selected, route: 'CDN', outcome: 'FAILED', reason: 'checksum mismatch' },
+   { ...selected, route: 'ORIGIN', outcome: 'SELECTED' },
+   { ...selected, route: 'https://secret.example/path', outcome: 'SKIPPED' },
+  ],
+ } });
+ assert.deepEqual(audits[0].detail.storageSource.attempts.map(item => item.route), ['CDN', 'ORIGIN', undefined]);
+});
+
 test('WebDAV HEAD and redirect GET audit the same storage as the response header', async () => {
   const { dispatchDav } = require('../../apps/api/src/webdav/webdav-verbs.ts');
   for (const method of ['HEAD', 'GET']) {

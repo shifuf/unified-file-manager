@@ -32,6 +32,8 @@ import { ProjectAccessService } from '../projects/project-access.service';
 import { SearchService } from '../search/search.service';
 import { SettingsService } from '../settings/settings.service';
 import { StorageService } from '../storage/storage.service';
+import { isFileDeletionFrozen } from '../storage/file-deletion.util';
+import type { StorageDownloadTarget } from '../storage/storage.types';
 import { TasksService } from '../tasks/tasks.service';
 import { BatchFileOperationDto } from './dto/batch-file-operation.dto';
 import { BatchCopyFileDto, BatchMoveFileDto } from './dto/batch-move-file.dto';
@@ -367,15 +369,11 @@ export class FilesService {
       if (strategy === 'reuse' && duplicateSource.status === FileStatus.RECYCLED) {
         // Restoring a recycled file re-enters ACTIVE usage; charge as create for quota.
         await this.assertProjectQuota(projectId, size, actorId, { mode: 'create' });
-        const restoredDuplicate = await this.prisma.managedFile.update({
-          where: { id: duplicateSource.id },
-          data: {
+        const restoredDuplicate = await this.updateFileIfWritable(duplicateSource, {
             status: FileStatus.ACTIVE,
             deletedAt: null,
             purgeAt: null,
             duplicateOfId: duplicateSource.duplicateOfId ?? duplicateSource.id,
-          },
-          include: { cdnConfig: true },
         });
         await this.auditService.write({
           action: AuditAction.FILE_UPLOAD,
@@ -452,7 +450,7 @@ export class FilesService {
    * Overwrite an existing ManagedFile in-place: new storage object, same row id.
    * Public URL (`/api/public/files/:fileId`) and share links remain valid.
    */
-  private async replaceExistingFile(params: {
+  async replaceExistingFile(params: {
     projectId: string;
     projectName: string;
     buffer: Buffer;
@@ -480,6 +478,7 @@ export class FilesService {
     if (existing.status === FileStatus.DELETED) {
       throw new BadRequestException('目标文件已彻底删除，无法覆盖。');
     }
+    if (isFileDeletionFrozen(existing)) throw new ConflictException('文件正在彻底删除，无法覆盖。');
 
     // Short-circuit when content is identical — no storage rewrite needed.
     if (
@@ -539,10 +538,6 @@ export class FilesService {
     }
 
     const storageKey = this.buildStorageKey(params.projectName, params.originalName, params.folderPath);
-    // Snapshot current content before overwrite so restoreVersion can roll back.
-    if (existing.status === FileStatus.ACTIVE) {
-      await this.snapshotCurrentVersion(existing, params.actorId, 'before-replace');
-    }
     const uploadResult = await this.storageService.upload(params.projectId, {
       key: storageKey,
       buffer: params.buffer,
@@ -587,7 +582,7 @@ export class FilesService {
         // Clear stale duplicate pointers after content rewrite.
         duplicateOfId: null,
         currentVersion: await this.nextFileRevision(existing.id, existing.currentVersion),
-    });
+    }, existing.status, undefined, existing.status === FileStatus.ACTIVE ? { actorId: params.actorId, remark: 'before-replace' } : undefined);
 
     // Historical versions retain this immutable key for later restoration.
 
@@ -1205,7 +1200,6 @@ export class FilesService {
     await this.readEditableText(file);
     await this.assertProjectQuota(file.projectId, buffer.length, user.id, { mode: 'replace', previousBytes: Number(file.size) });
     const project = await this.prisma.project.findUniqueOrThrow({ where: { id: file.projectId } });
-    await this.snapshotCurrentVersion(file, user.id, '在线编辑前的版本');
     const uploaded = await this.storageService.upload(file.projectId, {
       key: this.buildStorageKey(project.name, file.originalName, file.folderPath),
       buffer, mimeType: file.mimeType, originalName: file.originalName,
@@ -1215,7 +1209,7 @@ export class FilesService {
       size: BigInt(buffer.length), checksum: createHash('sha256').update(buffer).digest('hex'),
       currentVersion: await this.nextFileRevision(file.id, file.currentVersion),
       thumbnailUrl: null, duplicateOfId: null, scanStatus: 'SKIPPED', scanDetail: null, scannedAt: new Date(),
-    }, FileStatus.ACTIVE);
+    }, FileStatus.ACTIVE, undefined, { actorId: user.id, remark: '在线编辑前的版本' });
     await this.auditService.write({ action: AuditAction.FILE_UPDATE, actorId: user.id, projectId: file.projectId,
       detail: { fileId, contentUpdated: true, version: updated.currentVersion } });
     this.eventBus.emit(DOMAIN_EVENTS.FILE_UPDATED, { projectId: file.projectId, fileId, originalName: file.originalName, actorId: user.id });
@@ -1726,10 +1720,7 @@ export class FilesService {
     const retentionDays = await this.settingsService.getRecycleRetentionDays();
     const purgeAt = new Date(now.getTime() + retentionDays * 24 * 60 * 60 * 1000);
 
-    await this.prisma.managedFile.update({
-      where: { id: fileId },
-      data: { status: FileStatus.RECYCLED, deletedAt: now, purgeAt },
-    });
+    await this.updateFileIfWritable(file, { status: FileStatus.RECYCLED, deletedAt: now, purgeAt });
     const disabledShareCount = await this.disableFileShareLinks(fileId);
     await this.auditService.write({
       action: AuditAction.FILE_DELETE,
@@ -1747,12 +1738,8 @@ export class FilesService {
   }
 
   async restoreForProject(fileId: string, projectId: string): Promise<Record<string, unknown>> {
-    await this.findFileForProject(fileId, projectId);
-    const restored = await this.prisma.managedFile.update({
-      where: { id: fileId },
-      data: { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null },
-      include: { cdnConfig: true },
-    });
+    const file = await this.findFileForProject(fileId, projectId);
+    const restored = await this.updateFileIfWritable(file, { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null });
     await this.auditService.write({
       action: AuditAction.FILE_RESTORE,
       projectId,
@@ -1803,8 +1790,6 @@ export class FilesService {
     }
 
     const nextVersion = await this.verifySnapshotAndNextVersion(file, snapshot);
-    // Snapshot current HEAD before restoring.
-    await this.snapshotCurrentVersion(file, undefined, 'restore-precheck');
 
     const updated = await this.updateRevisionIfCurrent(file, {
         storageKey: snapshot.storageKey,
@@ -1815,7 +1800,7 @@ export class FilesService {
         originalName: snapshot.originalName,
         currentVersion: nextVersion,
         thumbnailUrl: null,
-    });
+    }, undefined, version, { remark: 'restore-precheck' });
 
     await this.auditService.write({
       action: AuditAction.FILE_VERSION_RESTORE,
@@ -1845,10 +1830,7 @@ export class FilesService {
     const retentionDays = await this.settingsService.getRecycleRetentionDays();
     const purgeAt = new Date(now.getTime() + retentionDays * 24 * 60 * 60 * 1000);
 
-    await this.prisma.managedFile.updateMany({
-      where: { id: { in: files.map((file) => file.id) }, status: FileStatus.ACTIVE, projectId },
-      data: { status: FileStatus.RECYCLED, deletedAt: now, purgeAt },
-    });
+    await this.recycleFilesIfWritable(files, now, purgeAt);
     const disabledShareCount = await this.disableFileShareLinks(files.map((file) => file.id));
 
     await this.auditService.write({
@@ -1881,10 +1863,7 @@ export class FilesService {
       throw new BadRequestException('只能批量恢复回收站中的文件。');
     }
 
-    await this.prisma.managedFile.updateMany({
-      where: { id: { in: files.map((file) => file.id) }, status: FileStatus.RECYCLED, projectId },
-      data: { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null },
-    });
+    await this.restoreFilesIfWritable(files);
 
     await this.auditService.write({
       action: AuditAction.FILE_BATCH_RESTORE,
@@ -2125,10 +2104,7 @@ export class FilesService {
     const retentionDays = await this.settingsService.getRecycleRetentionDays();
     const purgeAt = new Date(now.getTime() + retentionDays * 24 * 60 * 60 * 1000);
 
-    await this.prisma.managedFile.update({
-      where: { id: fileId },
-      data: { status: FileStatus.RECYCLED, deletedAt: now, purgeAt },
-    });
+    await this.updateFileIfWritable(file, { status: FileStatus.RECYCLED, deletedAt: now, purgeAt });
     const disabledShareCount = await this.disableFileShareLinks(fileId);
 
     await this.auditService.write({
@@ -2154,15 +2130,7 @@ export class FilesService {
       throw new BadRequestException('只能恢复回收站中的文件。');
     }
 
-    if (await this.prisma.storageReplica.findFirst({ where: { projectId: file.projectId, storageKey: file.storageKey, status: 'DELETING' } })) {
-      throw new ConflictException('此文件已开始彻底删除，部分对象可能已移除，请重试彻底删除。');
-    }
-
-    const restored = await this.prisma.managedFile.update({
-      where: { id: fileId },
-      data: { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null },
-      include: { cdnConfig: true },
-    });
+    const restored = await this.updateFileIfWritable(file, { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null });
 
     await this.auditService.write({
       action: AuditAction.FILE_RESTORE,
@@ -2223,8 +2191,6 @@ export class FilesService {
     }
 
     const nextVersion = await this.verifySnapshotAndNextVersion(file, snapshot);
-    // Snapshot current HEAD before restoring.
-    await this.snapshotCurrentVersion(file, user.id, 'restore-precheck');
 
     const updated = await this.updateRevisionIfCurrent(file, {
         storageKey: snapshot.storageKey,
@@ -2235,7 +2201,7 @@ export class FilesService {
         originalName: snapshot.originalName,
         currentVersion: nextVersion,
         thumbnailUrl: null,
-    });
+    }, undefined, version, { actorId: user.id, remark: 'restore-precheck' });
 
     await this.auditService.write({
       action: AuditAction.FILE_VERSION_RESTORE,
@@ -2254,14 +2220,68 @@ export class FilesService {
     return this.toResponse(updated);
   }
 
+  private async updateFileIfWritable(file: ManagedFile, data: Prisma.ManagedFileUncheckedUpdateManyInput,
+    transaction?: Prisma.TransactionClient): Promise<FileWithStorage> {
+    const mutate = async (tx: Prisma.TransactionClient) => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${file.projectId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${file.id} FOR UPDATE`;
+      const current = await tx.managedFile.findUnique({ where: { id: file.id } });
+      if (!current || isFileDeletionFrozen(current) || current.storageKey !== file.storageKey ||
+          current.currentVersion !== file.currentVersion || current.status !== file.status ||
+          await tx.storageReplica.findFirst({ where: { projectId: file.projectId, storageKey: file.storageKey, status: 'DELETING' } })) {
+        throw new ConflictException('文件正在删除或已被其他操作更新，请刷新后重试。');
+      }
+      const changed = await tx.managedFile.updateMany({ where: { id: file.id, projectId: file.projectId,
+        storageKey: file.storageKey, currentVersion: file.currentVersion, status: file.status }, data });
+      if (changed.count !== 1) throw new ConflictException('文件已被其他操作更新，请刷新后重试。');
+      return (await tx.managedFile.findUnique({ where: { id: file.id }, include: { cdnConfig: true } }))!;
+    };
+    return transaction ? mutate(transaction) : this.prisma.$transaction(mutate);
+  }
+
+  private async restoreFilesIfWritable(files: ManagedFile[]): Promise<void> {
+    await this.prisma.$transaction(async tx => {
+      // Stable lock order also covers batches spanning several projects.
+      for (const file of [...files].sort((a, b) => `${a.projectId}/${a.id}`.localeCompare(`${b.projectId}/${b.id}`))) {
+        await this.updateFileIfWritable(file, { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null }, tx);
+      }
+    });
+  }
+
+  private async recycleFilesIfWritable(files: ManagedFile[], deletedAt: Date, purgeAt: Date): Promise<void> {
+    await this.prisma.$transaction(async tx => {
+      // Validate every current identity under the same locks as physical deletion.
+      // Any stale/frozen row aborts the batch before success audits or events.
+      for (const file of [...files].sort((a, b) => `${a.projectId}/${a.id}`.localeCompare(`${b.projectId}/${b.id}`))) {
+        await this.updateFileIfWritable(file, { status: FileStatus.RECYCLED, deletedAt, purgeAt }, tx);
+      }
+    });
+  }
+
   private async updateRevisionIfCurrent(
-    file: Pick<ManagedFile, 'id' | 'storageKey' | 'currentVersion'>,
+    file: ManagedFile,
     data: Prisma.ManagedFileUncheckedUpdateManyInput,
     status?: FileStatus,
+    restoredVersion?: number,
+    snapshot?: { actorId?: string; remark: string },
   ): Promise<FileWithStorage> {
-    return this.prisma.$transaction(async tx => {
+    const updated = await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${file.projectId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${file.id} FOR UPDATE`;
+      const head = await tx.managedFile.findUnique({ where: { id: file.id } });
+      if (head && isFileDeletionFrozen(head)) throw new ConflictException('文件正在彻底删除，请在回收站重试删除。');
+      if (await tx.storageReplica.findFirst({ where: { projectId: file.projectId, storageKey: file.storageKey, status: 'DELETING' }, select: { id: true } })) {
+        throw new ConflictException('文件正在彻底删除，请刷新后重试。');
+      }
+      if (typeof data.storageKey === 'string' && await tx.storageReplica.findFirst({ where: {
+        projectId: file.projectId, storageKey: data.storageKey, status: 'DELETING',
+      }, select: { id: true } })) throw new ConflictException('目标历史版本正在清理，请刷新后重试。');
+      if (restoredVersion !== undefined && !await tx.fileVersion.findUnique({ where: {
+        fileId_version: { fileId: file.id, version: restoredVersion },
+      }, select: { id: true } })) throw new ConflictException('目标历史版本已被清理，请刷新后重试。');
+      if (snapshot) await this.snapshotCurrentVersion(file, snapshot.actorId, snapshot.remark, tx);
       const changed = await tx.managedFile.updateMany({
-        where: { id: file.id, storageKey: file.storageKey, currentVersion: file.currentVersion, ...(status ? { status } : {}) }, data,
+        where: { id: file.id, storageKey: file.storageKey, currentVersion: file.currentVersion, ...(status || file.status ? { status: status ?? file.status } : {}) }, data,
       });
       if (changed.count !== 1) throw new ConflictException('文件已被其他操作更新，请刷新后重新执行。');
       await tx.fileDerivative.updateMany({ where: { fileId: file.id }, data: {
@@ -2271,6 +2291,12 @@ export class FilesService {
       if (!updated) throw new NotFoundException('文件已删除。');
       return updated;
     });
+    try { await this.storageService.pruneFileVersions(file.id); }
+    catch (error) {
+      this.logger.warn(`文件已保存，历史版本清理未完成 fileId=${file.id}`);
+      throw new ConflictException('文件内容已保存，但旧历史版本尚未全部清理；请刷新文件后重试清理。', { cause: error });
+    }
+    return updated;
   }
 
   private async nextFileRevision(fileId: string, currentVersion: number): Promise<number> {
@@ -2311,10 +2337,18 @@ export class FilesService {
     >,
     actorId?: string,
     remark?: string,
+    transaction?: Prisma.TransactionClient,
   ): Promise<void> {
     const version = Math.max(1, Number(file.currentVersion || 1));
+    const publish = async (tx: Prisma.TransactionClient) => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${file.projectId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${file.id} FOR UPDATE`;
+      const current = await tx.managedFile.findUnique({ where: { id: file.id } });
+      if (!current || isFileDeletionFrozen(current) || current.storageKey !== file.storageKey || current.currentVersion !== file.currentVersion) {
+        throw new ConflictException('文件已被其他操作更新，请刷新后重新执行。');
+      }
     try {
-      await this.prisma.fileVersion.upsert({
+      await tx.fileVersion.upsert({
         where: { fileId_version: { fileId: file.id, version } },
         create: {
           fileId: file.id,
@@ -2335,19 +2369,24 @@ export class FilesService {
         throw error;
       }
       // MySQL can race between the read and insert of Prisma's emulated upsert.
-      const saved = await this.prisma.fileVersion.findUnique({
+      const saved = await tx.fileVersion.findUnique({
         where: { fileId_version: { fileId: file.id, version } },
       });
       if (!saved || saved.storageKey !== file.storageKey || saved.size !== file.size || saved.checksum !== file.checksum) {
         throw new ConflictException('历史版本已被其他请求修改，请刷新后重试。');
       }
     }
+    // AuditLog.projectId takes a shared Project FK lock. Use the connection
+    // already holding FOR UPDATE and commit the snapshot and its audit together.
     await this.auditService.write({
       action: AuditAction.FILE_VERSION_CREATE,
       actorId,
       projectId: file.projectId,
       detail: { fileId: file.id, version },
-    });
+    }, tx);
+    };
+    if (transaction) await publish(transaction);
+    else await this.prisma.$transaction(publish);
   }
 
   async batchRecycle(dto: BatchFileOperationDto, user: RequestUser): Promise<Record<string, unknown>> {
@@ -2360,10 +2399,7 @@ export class FilesService {
     const retentionDays = await this.settingsService.getRecycleRetentionDays();
     const purgeAt = new Date(now.getTime() + retentionDays * 24 * 60 * 60 * 1000);
 
-    await this.prisma.managedFile.updateMany({
-      where: { id: { in: files.map((file) => file.id) }, status: FileStatus.ACTIVE },
-      data: { status: FileStatus.RECYCLED, deletedAt: now, purgeAt },
-    });
+    await this.recycleFilesIfWritable(files, now, purgeAt);
     const disabledShareCount = await this.disableFileShareLinks(files.map((file) => file.id));
 
     await this.writeBatchAudit(AuditAction.FILE_BATCH_DELETE, files, user.id, { disabledShareCount });
@@ -2392,10 +2428,7 @@ export class FilesService {
       throw new BadRequestException('只能批量恢复回收站中的文件。');
     }
 
-    await this.prisma.managedFile.updateMany({
-      where: { id: { in: files.map((file) => file.id) }, status: FileStatus.RECYCLED },
-      data: { status: FileStatus.ACTIVE, deletedAt: null, purgeAt: null },
-    });
+    await this.restoreFilesIfWritable(files);
 
     await this.writeBatchAudit(AuditAction.FILE_BATCH_RESTORE, files, user.id);
     for (const file of files) {
@@ -2846,12 +2879,16 @@ export class FilesService {
       range: parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
       unsatisfiable: parsedRange === 'unsatisfiable',
     };
-    if (meta.head || result.unsatisfiable) return { ...result, target: { type: 'stream' as const } };
+    if (meta.head || result.unsatisfiable) {
+      const target: StorageDownloadTarget = { type: 'stream' };
+      return { ...result, target, recordDownload: false };
+    }
     const range = result.range ? { start: result.range.start, end: result.range.end } : undefined;
     const target = await requireVerifiedShareTarget(
       await this.storageService.getDownloadTarget(share.file, 120, range, { preferRedirect: false }),
       result.range?.length ?? size,
     );
+    let recordDownload = false;
     try {
       if (meta.countDownload !== false) {
         if (!session) {
@@ -2864,13 +2901,13 @@ export class FilesService {
           kind: 'file-share',
         });
         }
-        await consumeShareDownload(this.prisma, share, 'file', session?.id);
+        recordDownload = await consumeShareDownload(this.prisma, share, 'file', session?.id);
       }
     } catch (error) {
       target.stream?.destroy();
       throw error;
     }
-    return { ...result, target };
+    return { ...result, target, recordDownload };
   }
 
   async createShareDownloadSession(
@@ -3214,17 +3251,14 @@ export class FilesService {
   }
 
   private async purgeFile(file: FileWithStorage, actorId?: string, source?: string): Promise<void> {
-    const removedKeys = await this.storageService.removeFileObjects(file.id);
+    const expected = { id: file.id, projectId: file.projectId, storageKey: file.storageKey, currentVersion: file.currentVersion };
+    const removedKeys = await this.storageService.removeFileObjects(file.id, { expectedHead: expected });
 
     // Hard-delete the record so the file truly disappears from active and recycle
     // listings. Share links are removed by the ShareLink.fileId cascade; count them
     // first only for the audit detail.
     const disabledShareCount = await this.prisma.shareLink.count({ where: { fileId: file.id } });
-    await this.prisma.$transaction(async tx => {
-      if (removedKeys.length) await tx.storageReplica.deleteMany({ where: { projectId: file.projectId,
-        storageKey: { in: removedKeys }, status: 'DELETING' } });
-      await tx.managedFile.delete({ where: { id: file.id } });
-    });
+    await this.storageService.finishFileDeletion(expected, removedKeys);
 
     await this.auditService.write({
       action: AuditAction.FILE_PURGE,
@@ -3470,10 +3504,6 @@ export class FilesService {
           previousBytes: nameMatch.status === FileStatus.ACTIVE ? Number(nameMatch.size) : 0,
         });
 
-        if (nameMatch.status === FileStatus.ACTIVE) {
-          await this.snapshotCurrentVersion(nameMatch, params.actorId, 'before-replace');
-        }
-
         const previousStorageKey = nameMatch.storageKey;
 
         const updated = await this.updateRevisionIfCurrent(nameMatch, {
@@ -3496,7 +3526,7 @@ export class FilesService {
             purgeAt: null,
             duplicateOfId: null,
             currentVersion: await this.nextFileRevision(nameMatch.id, nameMatch.currentVersion),
-        });
+        }, nameMatch.status, undefined, nameMatch.status === FileStatus.ACTIVE ? { actorId: params.actorId, remark: 'before-replace' } : undefined);
 
         // The old key is retained by FileVersion and must not be deleted here.
 
@@ -3592,15 +3622,11 @@ export class FilesService {
 
         if (strategy === 'reuse' && duplicateSource.status === FileStatus.RECYCLED) {
           await this.assertProjectQuota(params.projectId, size, params.actorId, { mode: 'create' });
-          const restoredDuplicate = await this.prisma.managedFile.update({
-            where: { id: duplicateSource.id },
-            data: {
+          const restoredDuplicate = await this.updateFileIfWritable(duplicateSource, {
               status: FileStatus.ACTIVE,
               deletedAt: null,
               purgeAt: null,
               duplicateOfId: duplicateSource.duplicateOfId ?? duplicateSource.id,
-            },
-            include: { cdnConfig: true },
           });
           await this.auditService.write({
             action: AuditAction.FILE_UPLOAD,

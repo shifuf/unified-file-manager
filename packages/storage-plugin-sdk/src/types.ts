@@ -11,7 +11,7 @@ export type StorageBackupParams = { key: string; size: number; checksum: string 
 export type StorageObjectFingerprint = { size: number; checksum: string; identity: string };
 export type StoredObject = { storageKey: string; publicUrl?: string | null };
 export type DownloadStorageIdentity = { configId: string; configName: string; provider: string };
-export type DownloadStorageSource = { strategy: 'CLOUD_PRIORITY'; selected: DownloadStorageIdentity; attempts: Array<DownloadStorageIdentity & { outcome: 'SELECTED' | 'FAILED' | 'SKIPPED'; reason?: string }>; omittedAttempts?: number };
+export type DownloadStorageSource = { strategy: 'CLOUD_PRIORITY'; selected: DownloadStorageIdentity; attempts: Array<DownloadStorageIdentity & { outcome: 'SELECTED' | 'FAILED' | 'SKIPPED'; reason?: string; route?: 'CDN' | 'ORIGIN' }>; omittedAttempts?: number };
 export type StorageDownloadTarget = { type: 'stream' | 'redirect'; url?: string; stream?: Readable; contentType?: string; contentLength?: number; verified?: boolean; checksum?: string; storageSource?: DownloadStorageSource };
 export type StorageByteRange = { start?: number; end?: number };
 export type StorageUsageSnapshot = { storageUsedBytes?: number | null; storageQuotaBytes?: number | null; trafficUsedBytes?: number | null; trafficQuotaBytes?: number | null; checkedAt?: string; message?: string };
@@ -38,6 +38,8 @@ export interface StorageAdapter {
   getObjectFingerprint?(config: RuntimeCdnConfig, key: string): Promise<StorageObjectFingerprint | null>;
   repairFile?(config: RuntimeCdnConfig, params: StorageUploadFileParams, corrupt: StorageObjectFingerprint): Promise<StoredObject>;
   getDownloadTarget?(config: RuntimeCdnConfig, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget>;
+  /** Optional CDN stream; host must verify the full object and fall back to origin on failure. */
+  getCdnDownloadTarget?(config: RuntimeCdnConfig, key: string): Promise<StorageDownloadTarget | null>;
   createDirectUpload?(config: RuntimeCdnConfig, params: DirectUploadParams, expiresSeconds: number): Promise<DirectUploadCredential | null>;
   getUsage?(config: RuntimeCdnConfig): Promise<StorageUsageSnapshot>;
   listRemoteFiles?(config: RuntimeCdnConfig, options: { parentId?: string; cursor?: string }): Promise<StorageRemotePage>;

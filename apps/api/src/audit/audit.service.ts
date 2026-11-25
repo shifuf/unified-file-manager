@@ -16,8 +16,8 @@ interface WriteAuditParams {
 export class AuditService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async write(params: WriteAuditParams): Promise<void> {
-    await this.prisma.auditLog.create({
+  async write(params: WriteAuditParams, transaction?: Prisma.TransactionClient): Promise<void> {
+    await (transaction ?? this.prisma).auditLog.create({
       data: {
         action: params.action,
         actorId: params.actorId,

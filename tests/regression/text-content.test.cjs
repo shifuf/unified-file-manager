@@ -15,6 +15,8 @@ function fixture(overrides = {}) {
   Object.assign(service, {
     projectAccessService: { assertProjectAccess: async (...args) => { accesses.push(args); } },
     prisma: {
+      $queryRaw: async () => [],
+      storageReplica: { findFirst: async () => null },
       managedFile: {
         findUnique: async () => ({ ...file }),
         updateMany: async ({ where, data }) => {
@@ -27,6 +29,7 @@ function fixture(overrides = {}) {
       fileDerivative: { updateMany: async () => ({ count: 0 }) },
     },
     storageService: {
+      pruneFileVersions: async () => {},
       getDownloadTarget: async () => ({ type: 'stream', stream: Readable.from([Buffer.from('old')]) }),
       upload: async (_p, data) => { uploads.push(data); return { storageKey: `new-${uploads.length}`, cdnConfigId: 'local', publicUrl: null }; },
     },

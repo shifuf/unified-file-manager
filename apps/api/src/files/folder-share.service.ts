@@ -22,6 +22,7 @@ import { SettingsService } from '../settings/settings.service';
 import { CreateShareLinkDto } from './dto/create-share-link.dto';
 import { ShareIpAbuseService } from './share-ip-abuse.service';
 import { StorageService } from '../storage/storage.service';
+import type { StorageDownloadTarget } from '../storage/storage.types';
 import { parseByteRange } from '../common/utils/http-range.util';
 import { consumeShareDownload, findShareDownloadSession, issueShareDownloadSession, requireVerifiedShareTarget, shareSessionIp } from './share-download-session.util';
 
@@ -229,18 +230,22 @@ export class FolderShareService {
     const result = { file, shareId: share.id, watermarkText: share.watermarkText,
       range: parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
       unsatisfiable: parsedRange === 'unsatisfiable' };
-    if (meta.head || result.unsatisfiable) return { ...result, target: { type: 'stream' as const } };
+    if (meta.head || result.unsatisfiable) {
+      const target: StorageDownloadTarget = { type: 'stream' };
+      return { ...result, target, recordDownload: false };
+    }
     const range = result.range ? { start: result.range.start, end: result.range.end } : undefined;
     const target = await requireVerifiedShareTarget(
       await this.storageService.getDownloadTarget(file, 120, range, { preferRedirect: false }), result.range?.length ?? size,
     );
+    let recordDownload = false;
     try {
       if (!meta.allowPreviewOnly) {
         if (!session) await this.assertDownloadRateLimit(share, file, meta.ip);
-        await consumeShareDownload(this.prisma, share, 'folder', session?.id);
+        recordDownload = await consumeShareDownload(this.prisma, share, 'folder', session?.id);
       }
     } catch (error) { target.stream?.destroy(); throw error; }
-    return { ...result, target };
+    return { ...result, target, recordDownload };
   }
 
   async createDownloadSession(token: string, fileId: string, password?: string, meta: { ip?: string } = {}) {

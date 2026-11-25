@@ -228,6 +228,34 @@ test('folder share download audit retains the authorizing share ID', async t => 
   assert.equal(f.auditRows[0].detail.shareId, 'folder-share');
 });
 
+for (const kind of ['file', 'folder']) {
+  test(`${kind} share resumed ranges record one logical download for one ticket`, async t => {
+    const f = await fixture(t, { maxDownloads: null });
+    const issueRoute = kind === 'file'
+      ? '/api/shares/file-token/download-session'
+      : '/api/folder-shares/folder-token/files/file/download-session';
+    const issued = await f.request(issueRoute, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(issued.status, 200);
+    const session = await issued.json();
+    const route = new URL(session.url, 'http://fixture.test');
+    const url = `${route.pathname}${route.search}`;
+    const first = await f.request(url, { headers: { Range: 'bytes=0-3' } });
+    assert.equal(first.status, 206);
+    assert.equal(await first.text(), '0123');
+    const resumed = await f.request(url, { headers: { Range: 'bytes=4-' } });
+    assert.equal(resumed.status, 206);
+    assert.equal(await resumed.text(), '456789');
+    assert.equal((kind === 'file' ? f.share : f.folder).downloadCount, 1);
+    assert.equal(f.auditRows.length, 1, 'range retries in the same browser download must not duplicate the download audit');
+    assert.equal(f.auditRows[0].detail.shareId, kind === 'file' ? 'share' : 'folder-share');
+    const issuedAgain = await f.request(issueRoute, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const next = new URL((await issuedAgain.json()).url, 'http://fixture.test');
+    const fresh = await f.request(`${next.pathname}${next.search}`);
+    assert.equal(await fresh.text(), '0123456789');
+    assert.equal(f.auditRows.length, 2, 'a new user download ticket must create its own audit');
+  });
+}
+
 test('single-file HEAD returns metadata without opening content or spending quota', async t => {
   const f = await fixture(t);
   const r = await f.request('/api/shares/file-token/download', { method: 'HEAD' });

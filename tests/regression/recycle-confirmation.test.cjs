@@ -13,10 +13,22 @@ test('expired recycle entries cannot be physically purged without confirmation',
 
 for(const provider of ['QINIU','UPYUN','ALIYUN','S3','CLOUDFLARE_R2']) {
   test(`${provider}: recycle preserves bytes until the explicit purge action`,async()=>{
-    const file={id:'file',projectId:'p',status:'ACTIVE',cdnConfig:{provider},storageKey:'own-key'};
+    const file={id:'file',projectId:'p',status:'ACTIVE',cdnConfig:{provider},storageKey:'own-key',currentVersion:1};
+    const prisma={
+      $queryRaw:async()=>[],
+      managedFile:{
+        findUnique:async()=>({...file}),
+        updateMany:async({where,data})=>{
+          if(Object.entries(where).some(([key,value])=>file[key]!==value))return {count:0};
+          Object.assign(file,data);return {count:1};
+        },
+      },
+      storageReplica:{findFirst:async()=>null},
+    };
+    prisma.$transaction=async callback=>callback(prisma);
     const service=Object.assign(Object.create(FilesService.prototype),{
-      findFileForUser:async()=>file,settingsService:{getRecycleRetentionDays:async()=>1},
-      prisma:{managedFile:{update:async({data})=>Object.assign(file,data)}},
+      projectAccessService:{assertProjectAccess:async()=>{}},settingsService:{getRecycleRetentionDays:async()=>1},
+      prisma,
       disableFileShareLinks:async()=>0,auditService:{write:async()=>{}},eventBus:{emit(){}},
       storageService:{remove:async()=>assert.fail('recycle must not delete bytes'),removeFileObjects:async()=>assert.fail('recycle must not delete bytes')},
     });

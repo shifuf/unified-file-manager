@@ -8,9 +8,11 @@ test('overlapping replacements cannot both claim success for one revision number
  const update=data=>(head={...head,...data});
  service.prisma={managedFile:{findFirst:async()=>({...head}),findUnique:async()=>({...head}),update:async({data})=>update(data),updateMany:async({where,data})=>{if(head.storageKey!==where.storageKey||head.currentVersion!==where.currentVersion)return {count:0};update(data);return {count:1};}},fileVersion:{findFirst:async()=>({version:Math.max(0,...snapshots.keys())})}};
  service.prisma.$transaction=async fn=>fn(service.prisma);
+ service.prisma.$queryRaw=async()=>[];service.prisma.storageReplica={findFirst:async()=>null};
  service.prisma.fileDerivative={updateMany:async()=>({count:0})};
  service.snapshotCurrentVersion=async f=>{if(!snapshots.has(f.currentVersion))snapshots.set(f.currentVersion,f.storageKey);};
  service.storageService={upload:async(_,p)=>{if(++arrived===2)release();await gate;return {storageKey:'p/'+p.originalName,cdnConfigId:'local',publicUrl:null};}};
+ service.storageService.pruneFileVersions=async()=>{};
  service.auditService={write:async()=>{}};service.eventBus={emit:()=>{}};service.toResponse=x=>x;service.buildStorageKey=(_,name)=>'p/'+name;
  const call=name=>service.replaceExistingFile({projectId:'p',projectName:'p',targetFileId:'f',buffer:Buffer.from(name),originalName:name,mimeType:'text/plain',size:3,folderPath:null,extension:'txt',category:'DOCUMENT',checksum:name});
  const results=await Promise.allSettled([call('one'),call('two')]);
@@ -22,7 +24,8 @@ test('overlapping replacements cannot both claim success for one revision number
 test('committing a changed file version invalidates old READY derivatives in the same transaction',async()=>{
  const s=Object.create(FilesService.prototype);let derivativeStatus='READY',inTransaction=false;
  const tx={managedFile:{updateMany:async()=>({count:1}),findUnique:async()=>({id:'f',storageKey:'new',currentVersion:2})},fileDerivative:{updateMany:async({data})=>{assert.equal(inTransaction,true);derivativeStatus=data.status;return {count:1};}}};
+ tx.$queryRaw=async()=>[];tx.storageReplica={findFirst:async()=>null};s.storageService={pruneFileVersions:async()=>{}};
  s.prisma={...tx,$transaction:async fn=>{inTransaction=true;try{return await fn(tx);}finally{inTransaction=false;}}};
- await s.updateRevisionIfCurrent({id:'f',storageKey:'old',currentVersion:1},{storageKey:'new',currentVersion:2});
+ await s.updateRevisionIfCurrent({id:'f',projectId:'p',storageKey:'old',currentVersion:1},{storageKey:'new',currentVersion:2});
  assert.equal(derivativeStatus,'FAILED');
 });
