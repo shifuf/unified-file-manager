@@ -130,6 +130,7 @@ export async function consumeShareDownload(
 
 /** ReplicaService normally returns verified streams. Verify legacy adapters before quota. */
 export async function requireVerifiedShareTarget(target: StorageDownloadTarget, expectedLength: number): Promise<StorageDownloadTarget> {
+  if (target.type === 'redirect' && target.url && target.verified === true && target.contentLength === expectedLength) return target;
   if (!target.stream || target.type !== 'stream') throw new NotFoundException('文件内容不可读取。');
   if (target.contentLength !== undefined && target.contentLength !== expectedLength) {
     target.stream.destroy();

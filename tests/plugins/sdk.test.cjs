@@ -62,3 +62,16 @@ test('all remote bundles load outside the repository with their declared contrac
     } finally { fs.rmSync(temp, { recursive: true, force: true }); }
   }
 });
+
+test('UPYUN browser CDN URL preserves object key and attachment intent, and refuses signed or missing domains', async () => {
+  const adapter = require(path.join(root, 'plugins/upyun/dist/index.cjs')).createAdapter();
+  const config = { id: 'up', provider: 'UPYUN', name: 'UPYUN', config: { domain: 'https://cdn.example.test', bucket: 'bucket' } };
+  assert.equal(await adapter.getCdnDownloadUrl(config, '目录/a b.txt', 120), 'https://cdn.example.test/%E7%9B%AE%E5%BD%95/a%20b.txt');
+  const url = new URL(await adapter.getCdnDownloadUrl(config, 'p/file', 120, '原始 file.txt'));
+  assert.equal(url.searchParams.get('_upd'), '原始 file.txt'); assert.equal(url.searchParams.has('_upt'), false);
+  for (const patch of [{ tokenSecret: 'secret' }, { secret: 'secret' }, { domain: '' }]) {
+    const disabled = { ...config, config: { ...config.config, ...patch } };
+    assert.equal(await adapter.getCdnDownloadUrl(disabled, 'p/file', 120, 'name'), null);
+    assert.equal(await adapter.getCdnDownloadTarget(disabled, 'p/file'), null);
+  }
+});

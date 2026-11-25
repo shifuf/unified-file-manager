@@ -79,6 +79,19 @@ test('public Range reuses one fully verified source without a second origin read
  assert.equal(original.destroyed, true);
 });
 
+test('public requests disable redirect before the initial Range or transform read', async () => {
+ for (const [headers, width] of [[{range:'bytes=2-5'}, undefined], [{}, '10']]) {
+  let options;
+  const c = new PublicFilesController({get:()=>''}, {getPublicDownloadTarget:async (...args)=>{options=args[4];return {file:{...file,category:width?'IMAGE':'VIDEO'},target:{type:'stream',stream:Readable.from(['0123456789']),verified:true},isOpenPublic:true};}}, {}, {}, {recordPublicAccess:()=>{}}, {record:()=>{}});
+  c.enforcePublicAccessPolicy=async()=> 'open';
+  const {r}=response();
+  // Rejecting at policy still exercises the request intent passed before storage I/O.
+  c.enforcePublicAccessPolicy=async()=>{throw new Error('stop after target');};
+  await assert.rejects(c.access('f',undefined,undefined,width,undefined,undefined,undefined,undefined,undefined,undefined,undefined,{headers,get:()=>undefined},r), /stop after target/);
+  assert.equal(options?.preferRedirect,false);
+ }
+});
+
 test('public 416 and 304 responses close their unused verified object streams', async () => {
  for (const headers of [{ range: 'bytes=100-200' }, { 'if-none-match': '"hash"' }]) {
   const original = Readable.from(['0123456789']);

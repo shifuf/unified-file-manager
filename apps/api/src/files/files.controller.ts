@@ -279,7 +279,8 @@ export class FilesController {
       parsed && typeof parsed === 'object'
         ? { start: parsed.start, end: parsed.end }
         : undefined;
-    const { file, target } = await this.filesService.getDownloadTarget(fileId, user, range);
+    const native = request.query?.native === '1';
+    const { file, target } = await this.filesService.getDownloadTarget(fileId, user, range, { preferRedirect: native && !range });
 
     this.downloadStatsService.record({
       projectId: file.projectId,
@@ -297,6 +298,14 @@ export class FilesController {
       rangeStart: parsed && typeof parsed === 'object' ? parsed.start : null,
       rangeEnd: parsed && typeof parsed === 'object' ? parsed.end : null,
     });
+
+    if (native && target.type === 'redirect' && target.url && !range) {
+      writeDownloadStorageHeader(response, target.storageSource);
+      this.setPrivateDownloadHeaders(response);
+      response.setHeader('X-UFM-Download-Mode', 'redirect');
+      response.json({ type: 'redirect', url: target.url });
+      return;
+    }
 
     await this.writeDownloadResponse(
       response,
@@ -562,7 +571,7 @@ export class FilesController {
     fileId: string,
     user: RequestUser,
   ): Promise<StorageDownloadTarget> {
-    const { target } = await this.filesService.getDownloadTarget(fileId, user);
+    const { target } = await this.filesService.getDownloadTarget(fileId, user, undefined, { preferRedirect: false });
 
     if (target.type === 'stream' && target.stream) {
       return target;
@@ -792,10 +801,14 @@ export class PublicFilesController {
     @Req() request: Request,
     @Res() response: Response,
   ): Promise<void> {
+    const transformOptions = parseImageTransformOptions(rawWidth, rawFormat, request.headers['accept'], rawHeight, rawX, rawY, rawCropWidth, rawCropHeight, rawPreset);
+    const attachment = request.query?.download === '1';
     const access = await this.filesService.getPublicDownloadTarget(
       fileId,
       expires === undefined ? undefined : Number(expires),
       signature,
+      undefined,
+      { preferRedirect: request.method !== 'HEAD' && !getRequestRangeHeader(request) && !hasImageTransform(transformOptions), attachment },
     );
     const { file, target, allowedDomains, isOpenPublic, signatureValid } = access;
 
@@ -836,17 +849,6 @@ export class PublicFilesController {
       userAgent: request.get('user-agent') ?? null,
       referer: request.get('referer') ?? null,
     });
-    const transformOptions = parseImageTransformOptions(
-      rawWidth,
-      rawFormat,
-      request.headers['accept'],
-      rawHeight,
-      rawX,
-      rawY,
-      rawCropWidth,
-      rawCropHeight,
-      rawPreset,
-    );
     const shouldTransform = file.category === 'IMAGE' && hasImageTransform(transformOptions);
     const fileSize = Number(file.size);
     const parsedRange = shouldTransform
@@ -995,7 +997,7 @@ export class PublicFilesController {
       inlineMimeType(file),
       fileSize,
       parsedRange && typeof parsedRange === 'object' ? parsedRange : null,
-      'inline',
+      attachment ? 'attachment' : 'inline',
       file.originalName,
     );
     pipeStreamToResponse(stream as Readable, response, (error) =>
@@ -1273,6 +1275,7 @@ export class PublicSharesController {
       ticket, expires: expires === undefined ? undefined : Number(expires),
       head, rangeHeader: getRequestRangeHeader(request),
       countDownload: disposition === 'attachment',
+      preferRedirect: request.method === 'GET',
     });
     if (unsatisfiable) { writeUnsatisfiableRange(response, Number(file.size)); return; }
     if (head) {
@@ -1341,6 +1344,11 @@ export class PublicSharesController {
     } = {},
   ): Promise<void> {
     writeDownloadStorageHeader(response, target.storageSource);
+    if (target.type === 'redirect' && target.url && target.verified === true && disposition === 'attachment' && !options.range && !options.watermarkText) {
+      response.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
+      response.redirect(target.url);
+      return;
+    }
     if (!target.stream) {
       response.status(404).send('File stream not found.');
       return;

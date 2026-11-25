@@ -2359,8 +2359,12 @@ async function disableShare(shareId: string): Promise<void> {
 async function download(file: ManagedFile): Promise<void> {
   downloadingIds.value = new Set([...downloadingIds.value, file.id]);
   try {
-    const { blob, source } = await fileApi.downloadWithSource(file.id);
-    saveBlob(blob, file.originalName);
+    const { blob, url, source } = await fileApi.downloadWithSource(file.id);
+    if (url) {
+      const anchor = document.createElement('a');
+      anchor.href = url; anchor.download = file.originalName; anchor.rel = 'noopener';
+      anchor.click();
+    } else if (blob) saveBlob(blob, file.originalName);
     downloadResults.value = [{ name: file.originalName, source, time: new Date().toLocaleString() }, ...downloadResults.value].slice(0, 20);
     if (source) ElMessage.success(`下载来源：${source.selected.configName}${source.selected.provider === 'LOCAL' ? '（本地兜底）' : ''}`);
   } finally {

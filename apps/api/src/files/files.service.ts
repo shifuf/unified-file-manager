@@ -31,7 +31,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ProjectAccessService } from '../projects/project-access.service';
 import { SearchService } from '../search/search.service';
 import { SettingsService } from '../settings/settings.service';
-import { StorageService } from '../storage/storage.service';
+import { StorageService, type StorageTargetOptions } from '../storage/storage.service';
 import { isFileDeletionFrozen } from '../storage/file-deletion.util';
 import type { StorageDownloadTarget } from '../storage/storage.types';
 import { TasksService } from '../tasks/tasks.service';
@@ -1675,6 +1675,7 @@ export class FilesService {
     fileId: string,
     user: RequestUser,
     range?: { start?: number; end?: number },
+    options: StorageTargetOptions = {},
   ) {
     const file = await this.findFileForUser(fileId, user);
 
@@ -1686,7 +1687,7 @@ export class FilesService {
       file,
       size: Number(file.size),
       target: await this.storageService.getDownloadTarget(file, undefined, range, {
-        preferRedirect: !range,
+        preferRedirect: !range, ...options, downloadName: file.originalName,
       }),
     };
   }
@@ -1997,6 +1998,7 @@ export class FilesService {
     expires?: number,
     signature?: string,
     range?: { start?: number; end?: number },
+    options: { preferRedirect?: boolean; attachment?: boolean } = {},
   ) {
     const hasSignature = expires !== undefined || signature !== undefined;
     const signatureValid =
@@ -2039,9 +2041,10 @@ export class FilesService {
       allowedDomains: normalizeDomainAllowlist(file.project.allowedDomains),
       isOpenPublic,
       signatureValid,
-      // Full-body public GET prefers CDN 302; Range/transform callers re-fetch as stream.
+      // Decide stream/redirect before reading so Range and transforms verify once.
       target: await this.storageService.getDownloadTarget(file, undefined, range, {
-        preferRedirect: !range,
+        preferRedirect: !range && options.preferRedirect !== false,
+        downloadName: options.attachment ? file.originalName : undefined,
       }),
     };
   }
@@ -2844,6 +2847,7 @@ export class FilesService {
     password?: string,
     meta: {
       countDownload?: boolean;
+      preferRedirect?: boolean;
       ip?: string;
       head?: boolean;
       rangeHeader?: string;
@@ -2885,7 +2889,10 @@ export class FilesService {
     }
     const range = result.range ? { start: result.range.start, end: result.range.end } : undefined;
     const target = await requireVerifiedShareTarget(
-      await this.storageService.getDownloadTarget(share.file, 120, range, { preferRedirect: false }),
+      await this.storageService.getDownloadTarget(share.file, 120, range, {
+        preferRedirect: !range && !share.watermarkText && meta.countDownload !== false && meta.preferRedirect !== false,
+        downloadName: meta.countDownload !== false ? share.file.originalName : undefined,
+      }),
       result.range?.length ?? size,
     );
     let recordDownload = false;

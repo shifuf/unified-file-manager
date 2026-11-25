@@ -40,6 +40,8 @@ export interface StorageAdapter {
   getDownloadTarget?(config: RuntimeCdnConfig, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget>;
   /** Optional CDN stream; host must verify the full object and fall back to origin on failure. */
   getCdnDownloadTarget?(config: RuntimeCdnConfig, key: string): Promise<StorageDownloadTarget | null>;
+  /** Optional browser URL, used only after the host verifies this object's CDN bytes. */
+  getCdnDownloadUrl?(config: RuntimeCdnConfig, key: string, expiresSeconds: number, downloadName?: string): Promise<string | null>;
   createDirectUpload?(config: RuntimeCdnConfig, params: DirectUploadParams, expiresSeconds: number): Promise<DirectUploadCredential | null>;
   getUsage?(config: RuntimeCdnConfig): Promise<StorageUsageSnapshot>;
   listRemoteFiles?(config: RuntimeCdnConfig, options: { parentId?: string; cursor?: string }): Promise<StorageRemotePage>;

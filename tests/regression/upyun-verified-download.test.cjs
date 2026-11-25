@@ -111,3 +111,53 @@ test('non-replica download history also retains CDN failure and origin success',
  assert.deepEqual(Buffer.concat(chunks), payload);
  assert.deepEqual(target.storageSource.attempts.map(({ route, outcome }) => ({ route, outcome })), [{ route: 'CDN', outcome: 'FAILED' }, { route: 'ORIGIN', outcome: 'SELECTED' }]);
 });
+
+for (const indexed of [false, true]) {
+ test(`preferred full CDN download redirects only after SHA verification (${indexed ? 'replica' : 'legacy'})`, async t => {
+  const f = await fixture(t, 'good');
+  const adapter = new UpyunAdapter();
+  const storage = new StorageService({ get: () => undefined }, f.db, { adapter: () => adapter }, indexed ? f.service : undefined);
+  const reader = indexed ? f.service : null;
+  let cleaned = 0, objectPath;
+  const original = ReplicaService.prototype.readVerified;
+  ReplicaService.prototype.readVerified = async function (...args) {
+   const object = await original.apply(this, args); objectPath = object.path;
+   const cleanup = object.cleanup; object.cleanup = async () => { cleaned++; await cleanup(); };
+   return object;
+  };
+  t.after(() => { ReplicaService.prototype.readVerified = original; });
+  const target = await storage.getDownloadTarget({ id: 'file', projectId: 'p', storageKey: 'p/object', mimeType: 'text/plain', originalName: '原始 name.txt', size: BigInt(payload.length), checksum, cdnConfig: f.config }, 120, undefined, { preferRedirect: true, downloadName: '原始 name.txt' });
+  assert.equal(target.type, 'redirect');
+  assert.equal(new URL(target.url).searchParams.get('_upd'), '原始 name.txt');
+  assert.equal(target.verified, true); assert.equal(target.checksum, checksum);
+  assert.equal(target.stream, undefined); assert.equal(cleaned, 1);
+  await assert.rejects(readFile(objectPath), { code: 'ENOENT' });
+  assert.deepEqual(f.calls, ['CDN']);
+  assert.equal(target.storageSource.attempts.at(-1).route, 'CDN');
+  assert.equal(f.config.manualTrafficUsedBytes, BigInt(payload.length));
+ });
+}
+
+for (const scenario of ['false', 'range', 'default', 'bad-hash', '403', 'url-error', 'url-null', 'signed', 'no-digest']) {
+ test(`preferred CDN download preserves verified stream for ${scenario}`, async t => {
+  const f = await fixture(t, scenario === '403' ? 403 : scenario, { secret: scenario === 'signed' ? 'test-secret' : undefined });
+  const adapter = new UpyunAdapter();
+  if (scenario === 'url-error') adapter.getCdnDownloadUrl = async () => { throw new Error('URL unavailable'); };
+  if (scenario === 'url-null') adapter.getCdnDownloadUrl = async () => null;
+  const storage = new StorageService({ get: () => undefined }, f.db, { adapter: () => adapter });
+  const range = scenario === 'range' ? { start: 2, end: 7 } : undefined;
+  const options = scenario === 'default' ? {} : { preferRedirect: scenario !== 'false' };
+  const target = await storage.getDownloadTarget({ id: 'file', projectId: 'p', storageKey: 'p/object', mimeType: 'text/plain', originalName: 'object', size: BigInt(payload.length), checksum: scenario === 'no-digest' ? undefined : checksum, cdnConfig: f.config }, 120, range, options);
+  assert.equal(target.type, 'stream'); assert.equal(target.verified, true);
+  const chunks = []; for await (const chunk of target.stream) chunks.push(chunk);
+  assert.deepEqual(Buffer.concat(chunks), range ? payload.subarray(2, 8) : payload);
+  assert.deepEqual(f.calls, scenario === 'signed' || scenario === 'no-digest' ? ['ORIGIN'] : scenario === 'bad-hash' || scenario === '403' ? ['CDN', 'ORIGIN'] : ['CDN']);
+ });
+}
+
+test('public inline CDN redirect does not request an attachment name', async t => {
+ const f = await fixture(t, 'good');
+ const storage = new StorageService({ get: () => undefined }, f.db, { adapter: () => new UpyunAdapter() });
+ const target = await storage.getDownloadTarget({ id: 'file', projectId: 'p', storageKey: 'p/object', mimeType: 'text/plain', originalName: 'name.txt', size: BigInt(payload.length), checksum, cdnConfig: f.config }, 120, undefined, { preferRedirect: true });
+ assert.equal(target.type, 'redirect'); assert.equal(new URL(target.url).searchParams.has('_upd'), false);
+});

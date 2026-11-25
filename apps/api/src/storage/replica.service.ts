@@ -14,7 +14,7 @@ import { decryptText } from './crypto.util';
 import { StorageAdapterRegistry } from './storage-registry.service';
 import { storageIdentity } from './download-source.util';
 import { StorageLimitError, StorageLimitsService, type ReadReservation, type UploadReservation } from './storage-limits.service';
-import type { StorageFileInput, StorageUploadResult } from './storage.service';
+import type { StorageFileInput, StorageTargetOptions, StorageUploadResult } from './storage.service';
 import type { DownloadStorageSource, RuntimeCdnConfig, StorageByteRange, StorageDownloadTarget, StorageObjectFingerprint, StorageUploadFileParams } from './storage.types';
 
 type ReplicaRow = {
@@ -129,7 +129,7 @@ export class ReplicaService {
     } finally { await object.cleanup(); }
   }
 
-  async getDownloadTargetForKey(file: StorageFileInput, key: string, range?: StorageByteRange): Promise<StorageDownloadTarget> {
+  async getDownloadTargetForKey(file: StorageFileInput, key: string, range?: StorageByteRange, options: StorageTargetOptions = {}, expiresSeconds = 3600): Promise<StorageDownloadTarget> {
     if (file.status === 'RECYCLED' && file.purgeAt?.getTime() === 0) throw new ConflictException('文件正在彻底删除，请在回收站重试删除。');
     const storageKey = normalizeKey(key);
     const rows = await this.table().findMany({ where: { projectId: file.projectId, storageKey }, include: { config: true } });
@@ -155,7 +155,7 @@ export class ReplicaService {
         const object = await this.readVerified(this.runtime(config), storageKey, row.size, row.checksum, undefined, { allowCdn: true });
         if (row.status !== 'READY') await this.recoverRead(file, this.runtime(config), storageKey, object);
         attempts.push(...(object.readAttempts ?? [{ outcome: 'SELECTED' as const }]).map(attempt => ({ ...storageIdentity(config), ...attempt })));
-        return { ...verifiedTarget(object, range, file.mimeType), storageSource: {
+        return { ...await this.verifiedDownloadTarget(this.runtime(config), storageKey, object, range, file.mimeType, options, expiresSeconds), storageSource: {
           strategy: 'CLOUD_PRIORITY', selected: storageIdentity(config), attempts,
         } };
       } catch (error) {
@@ -173,12 +173,28 @@ export class ReplicaService {
         const object = await this.readVerified(this.runtime(file.cdnConfig), storageKey, current ? file.size : undefined, current ? file.checksum : undefined, undefined, { allowCdn: true });
         await this.recoverRead(file, this.runtime(file.cdnConfig), storageKey, object);
         const selected = storageIdentity(file.cdnConfig);
-        return { ...verifiedTarget(object, range, file.mimeType), storageSource: {
+        return { ...await this.verifiedDownloadTarget(this.runtime(file.cdnConfig), storageKey, object, range, file.mimeType, options, expiresSeconds), storageSource: {
           strategy: 'CLOUD_PRIORITY', selected, attempts: [...attempts, ...(object.readAttempts ?? [{ outcome: 'SELECTED' as const }]).map(attempt => ({ ...selected, ...attempt }))],
         } };
       } catch { /* continue to an explicit unavailable-object response */ }
     }
     throw new NotFoundException('文件存储副本均不可读取，文件可能缺失或损坏。');
+  }
+
+  async verifiedDownloadTarget(config: RuntimeCdnConfig, key: string, object: VerifiedObject, range: StorageByteRange | undefined,
+    contentType: string, options: StorageTargetOptions = {}, expiresSeconds = 3600): Promise<StorageDownloadTarget> {
+    // An origin fallback certifies only origin bytes. Never redirect it back to
+    // the failed CDN, and never use the adapter's generic/private download URL.
+    if (options.preferRedirect === true && !range && object.readAttempts?.some(attempt => attempt.outcome === 'SELECTED' && attempt.route === 'CDN')) {
+      let url: string | null | undefined;
+      try { url = await this.registry.adapter(config.provider).getCdnDownloadUrl?.(config, key, expiresSeconds, options.downloadName); }
+      catch { /* URL generation is optional; keep the already verified stream. */ }
+      if (url) {
+        await object.cleanup();
+        return { type: 'redirect', url, verified: true, checksum: object.checksum, contentLength: object.size, contentType };
+      }
+    }
+    return verifiedTarget(object, range, contentType);
   }
 
   private async recoverRead(file: StorageFileInput, source: RuntimeCdnConfig, key: string, object: VerifiedObject): Promise<void> {

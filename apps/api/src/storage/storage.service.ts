@@ -9,7 +9,7 @@ import { decryptText, getSigningSecret, hmacSha256Base64Url } from './crypto.uti
 import { StorageAdapterRegistry } from './storage-registry.service';
 import { storageIdentity } from './download-source.util';
 import { FILE_DELETION_PURGE_AT, isFileDeletionFrozen } from './file-deletion.util';
-import { ReplicaService, verifiedTarget } from './replica.service';
+import { ReplicaService } from './replica.service';
 import { selectFailoverStorage } from './storage-policy.util';
 import { StorageLimitsService } from './storage-limits.service';
 import type {
@@ -35,6 +35,8 @@ export type StorageFileInput = {
 
 export type StorageTargetOptions = {
   preferRedirect?: boolean;
+  /** Set only for attachment downloads; public inline previews omit it. */
+  downloadName?: string;
 };
 
 export type StorageUploadResult = {
@@ -245,12 +247,12 @@ export class StorageService {
   async getDownloadTargetForKey(
     file: StorageFileInput,
     key: string,
-    _expiresSeconds = DEFAULT_URL_TTL_SECONDS,
+    expiresSeconds = DEFAULT_URL_TTL_SECONDS,
     range?: { start?: number; end?: number },
-    _options: StorageTargetOptions = {},
+    options: StorageTargetOptions = {},
   ): Promise<StorageDownloadTarget> {
     if (isFileDeletionFrozen(file)) throw new ConflictException('文件正在彻底删除，请在回收站重试删除。');
-    if (this.replicas) return this.replicas.getDownloadTargetForKey(file, key, range);
+    if (this.replicas) return this.replicas.getDownloadTargetForKey(file, key, range, options, expiresSeconds);
     const config = this.runtimeConfigForFile(file);
     const storageKey = normalizeStorageKey(key);
     const selected = storageIdentity(config);
@@ -260,7 +262,7 @@ export class StorageService {
     const current = storageKey === normalizeStorageKey(file.storageKey);
     const reader = new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
     const object = await reader.readVerified(config, storageKey, current ? file.size : undefined, current ? file.checksum : undefined, undefined, { allowCdn: true });
-    return { ...verifiedTarget(object, range, file.mimeType), storageSource: { ...storageSource,
+    return { ...await reader.verifiedDownloadTarget(config, storageKey, object, range, file.mimeType, options, expiresSeconds), storageSource: { ...storageSource,
       attempts: object.readAttempts?.map(attempt => ({ ...selected, ...attempt })) ?? storageSource.attempts,
     } };
   }

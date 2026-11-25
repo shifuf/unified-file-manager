@@ -548,15 +548,20 @@ export const fileApi = {
       timeout: 0,
     });
   },
-  async downloadWithSource(fileId: string): Promise<{ blob: Blob; source: DownloadStorageSource | null }> {
+  async downloadWithSource(fileId: string): Promise<{ blob: Blob | null; url?: string; source: DownloadStorageSource | null }> {
     const response = await http.get<unknown, AxiosResponse<Blob>>(`/files/${fileId}/download`, {
-      responseType: 'blob', timeout: 0, _withResponse: true,
+      responseType: 'blob', timeout: 0, _withResponse: true, params: { native: '1' },
     });
     let source: DownloadStorageSource | null = null;
     try {
       const raw = response.headers['x-ufm-download-storage'];
       if (typeof raw === 'string') source = JSON.parse(decodeURIComponent(raw)) as DownloadStorageSource;
     } catch { /* Download remains usable if an older server/proxy omits metadata. */ }
+    if (response.headers['x-ufm-download-mode'] === 'redirect') {
+      const result = JSON.parse(await response.data.text()) as { type?: string; url?: string };
+      if (result.type !== 'redirect' || !result.url || !/^https?:$/.test(new URL(result.url).protocol)) throw new Error('下载地址无效。');
+      return { blob: null, url: result.url, source };
+    }
     return { blob: response.data, source };
   },
   migrateLocalFiles(projectId: string) {

@@ -128,6 +128,7 @@ export interface StorageAdapter {
   ): Promise<StorageDownloadTarget>;
 
   getCdnDownloadTarget?(config: RuntimeCdnConfig, key: string): Promise<StorageDownloadTarget | null>;
+  getCdnDownloadUrl?(config: RuntimeCdnConfig, key: string, expiresSeconds: number, downloadName?: string): Promise<string | null>;
 
   objectExists?(config: RuntimeCdnConfig, key: string): Promise<boolean>;
 

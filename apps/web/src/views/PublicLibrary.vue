@@ -145,7 +145,9 @@ function downloadFile(file: ManagedFile): void {
     return;
   }
   const anchor = document.createElement('a');
-  anchor.href = file.accessUrl;
+  const url = new URL(file.accessUrl, window.location.href);
+  url.searchParams.set('download', '1');
+  anchor.href = url.toString();
   anchor.download = file.originalName;
   anchor.target = '_blank';
   anchor.rel = 'noopener';
