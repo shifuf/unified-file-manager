@@ -1,6 +1,8 @@
 import { createPinia } from 'pinia';
 import { createApp } from 'vue';
 
+import './config/site-name';
+
 // Full Element Plus styles: imperative APIs (ElMessage / ElMessageBox / ElNotification /
 // ElLoading) are imported in script and do not go through on-demand CSS resolvers.
 // Without this, toasts/dialogs render as unstyled plain text (bottom-left) or broken overlays.

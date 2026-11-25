@@ -1,14 +1,11 @@
 <template>
   <main class="share-page" :style="pageStyle">
+    <ShareBrandHeader :brand="brand" :site-name="siteName" />
+    <div class="share-content">
     <section class="share-panel" :style="panelStyle">
-      <div v-if="hasBrandHeader" class="brand-block">
-        <img v-if="brand.logoUrl" class="brand-logo" :src="brand.logoUrl" alt="" />
-        <div>
-          <div v-if="brand.title" class="brand-title" :style="{ color: brand.primaryColor }">{{ brand.title }}</div>
-          <div v-if="brand.subtitle" class="brand-subtitle">{{ brand.subtitle }}</div>
-        </div>
-      </div>
-
+      <SharePageState v-if="initialLoading" loading />
+      <SharePageState v-else-if="loadError" :error="loadError" @retry="loadShareInfo" />
+      <template v-else-if="shareInfo">
       <div class="share-header">
         <div>
           <h1 class="share-title">{{ shareInfo?.fileName || '文件分享' }}</h1>
@@ -117,34 +114,28 @@
           <el-tag v-else-if="shareInfo?.previewOnly" type="info">该分享仅支持在线预览</el-tag>
         </div>
       </el-form>
+      </template>
 
       <footer v-if="brand.footerText || brand.showPoweredBy" class="share-footer">
         <div v-if="brand.footerText">{{ brand.footerText }}</div>
         <div v-if="brand.showPoweredBy" class="powered-by">由统一文件管理提供</div>
       </footer>
     </section>
+    </div>
   </main>
 </template>
 
 <script setup lang="ts">
 import { ElMessage, ElMessageBox } from 'element-plus';
-import type { AxiosError } from 'axios';
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 
 import { publicShareApi } from '@/api/modules';
+import ShareBrandHeader from '@/components/ShareBrandHeader.vue';
+import SharePageState from '@/components/SharePageState.vue';
 import type { FileCategory, PublicShareInfo, SharePageBrand } from '@/types';
-
-const DEFAULT_BRAND: SharePageBrand = {
-  title: '',
-  subtitle: '',
-  logoUrl: '',
-  primaryColor: '#2563eb',
-  background: '#f8fafc',
-  panelBackground: '#ffffff',
-  footerText: '',
-  showPoweredBy: true,
-};
+import { DEFAULT_SHARE_BRAND as DEFAULT_BRAND, getPublicShareFailure, getShareSiteName, readPublicShareMessage } from '@/utils/public-share';
+import type { PublicShareFailure } from '@/utils/public-share';
 
 const TEXT_PREVIEW_EXTENSIONS = new Set([
   'txt',
@@ -175,6 +166,7 @@ const TEXT_PREVIEW_EXTENSIONS = new Set([
 ]);
 
 const route = useRoute();
+const siteName = getShareSiteName();
 const accessKey = computed(() => {
   if (route.name === 'share-access-custom') {
     const match = route.params.pathMatch;
@@ -195,6 +187,11 @@ const previewUrl = ref('');
 const previewText = ref<string | null>(null);
 const previewError = ref('');
 const unlocked = ref(false);
+const initialLoading = ref(true);
+const loadError = ref<PublicShareFailure | null>(null);
+let infoRequest = 0;
+let previewRequest = 0;
+let metadataController: globalThis.AbortController | undefined;
 const canSubmit = computed(() => Boolean(shareToken.value && shareInfo.value));
 const hasPreviewContent = computed(
   () => previewText.value !== null || Boolean(previewUrl.value),
@@ -203,7 +200,6 @@ const brand = computed<SharePageBrand>(() => ({
   ...DEFAULT_BRAND,
   ...(shareInfo.value?.brand || {}),
 }));
-const hasBrandHeader = computed(() => Boolean(brand.value.title || brand.value.subtitle || brand.value.logoUrl));
 const pageStyle = computed(() => ({
   background: brand.value.background || DEFAULT_BRAND.background,
 }));
@@ -232,24 +228,42 @@ const categoryOptions: Array<{ label: string; value: FileCategory }> = [
 ];
 
 async function loadShareInfo(): Promise<void> {
-  if (!accessKey.value) {
-    return;
-  }
-
+  const request = ++infoRequest;
+  ++previewRequest;
+  metadataController?.abort();
+  metadataController = new globalThis.AbortController();
+  initialLoading.value = true;
+  loadError.value = null;
+  shareInfo.value = null;
+  shareToken.value = '';
+  password.value = '';
+  unlocked.value = false;
+  previewing.value = false;
+  downloading.value = false;
+  previewText.value = null;
+  previewError.value = '';
+  revokePreviewUrl();
   try {
+    if (!accessKey.value) throw Object.assign(new Error('分享链接不可用'), { response: { status: 404 } });
+    const options = { _silent: true, signal: metadataController.signal };
     const info =
       route.name === 'share-access-custom' || accessKey.value.includes('/')
-        ? await publicShareApi.resolve(accessKey.value)
-        : await publicShareApi.get(accessKey.value);
+        ? await publicShareApi.resolve(accessKey.value, options)
+        : await publicShareApi.get(accessKey.value, options);
+    if (request !== infoRequest) return;
     shareInfo.value = info;
     shareToken.value = info.token;
+    initialLoading.value = false;
     // Passwordless shares auto-open preview for images/text/audio/video/PDF.
     if (info.previewable && !info.hasPassword && !isOfficeShare(info)) {
       unlocked.value = true;
       await previewShare();
     }
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '分享链接不可用。');
+    if (request !== infoRequest) return;
+    loadError.value = getPublicShareFailure(error);
+  } finally {
+    if (request === infoRequest) initialLoading.value = false;
   }
 }
 
@@ -281,16 +295,20 @@ async function previewShare(): Promise<void> {
     return;
   }
 
+  const request = ++previewRequest;
   previewing.value = true;
   previewError.value = '';
   try {
     const blob = await publicShareApi.preview(shareToken.value, password.value || undefined);
+    if (request !== previewRequest) return;
     if (blob.size === 0 && (shareInfo.value?.size ?? 0) > 0) {
       throw new Error('预览内容为空，请稍后重试或直接下载。');
     }
 
     if (shareInfo.value && isTextShare(shareInfo.value)) {
-      previewText.value = await blob.text();
+      const text = await blob.text();
+      if (request !== previewRequest) return;
+      previewText.value = text;
       revokePreviewUrl();
       unlocked.value = true;
       return;
@@ -300,12 +318,15 @@ async function previewShare(): Promise<void> {
     setPreviewBlob(blob, resolvePreviewMime(shareInfo.value));
     unlocked.value = true;
   } catch (error) {
+    if (request !== previewRequest) return;
+    const message = await readPublicShareMessage(error, '预览暂时无法加载，请重试或下载查看。');
+    if (request !== previewRequest) return;
     previewText.value = null;
     revokePreviewUrl();
-    previewError.value = error instanceof Error ? error.message : '预览失败。';
-    ElMessage.error(previewError.value);
+    previewError.value = message;
+    if (shareInfo.value?.hasPassword) unlocked.value = false;
   } finally {
-    previewing.value = false;
+    if (request === previewRequest) previewing.value = false;
   }
 }
 
@@ -326,15 +347,19 @@ async function downloadShare(): Promise<void> {
   }
 
   downloading.value = true;
+  const request = infoRequest;
   try {
     const session = await publicShareApi.createDownloadSession(
       shareToken.value,
       password.value || undefined,
     );
+    if (request !== infoRequest) return;
     triggerBrowserDownload(session.url, shareInfo.value?.fileName);
     ElMessage.success('已开始下载，可继续停留在本页。');
   } catch (error) {
-    const msg = extractShareErrorMessage(error);
+    if (request !== infoRequest) return;
+    const msg = await readPublicShareMessage(error, '下载暂时无法开始，请稍后重试。');
+    if (request !== infoRequest) return;
     if (isRateLimitOrBanMessage(msg)) {
       await ElMessageBox.alert(msg, '下载受限', {
         type: 'warning',
@@ -345,30 +370,12 @@ async function downloadShare(): Promise<void> {
       ElMessage.error(msg || '下载失败。');
     }
   } finally {
-    downloading.value = false;
+    if (request === infoRequest) downloading.value = false;
   }
 }
 
 function isRateLimitOrBanMessage(message: string): boolean {
   return /过于频繁|临时限制|禁止下载|拉黑|封禁|分钟后再试|限流/.test(message);
-}
-
-function extractShareErrorMessage(error: unknown): string {
-  const axiosError = error as AxiosError<{ message?: string | string[] }>;
-  const data = axiosError?.response?.data;
-  if (data && typeof data === 'object' && 'message' in data) {
-    const message = data.message;
-    if (Array.isArray(message)) {
-      return message.filter(Boolean).join('；');
-    }
-    if (typeof message === 'string' && message.trim()) {
-      return message;
-    }
-  }
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return '下载失败。';
 }
 
 /**
@@ -498,14 +505,27 @@ function categoryLabel(category: FileCategory): string {
 }
 
 onMounted(loadShareInfo);
-onBeforeUnmount(revokePreviewUrl);
+watch(() => [route.name, accessKey.value], () => { void loadShareInfo(); });
+onBeforeUnmount(() => {
+  ++infoRequest;
+  ++previewRequest;
+  metadataController?.abort();
+  revokePreviewUrl();
+});
 </script>
 
 <style scoped>
 .share-page {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
-  padding: 24px;
+}
+
+.share-content {
+  display: grid;
+  flex: 1;
+  width: 100%;
+  padding: 40px 24px;
   place-items: center;
 }
 
@@ -513,36 +533,6 @@ onBeforeUnmount(revokePreviewUrl);
   width: min(760px, 100%);
   padding: 24px;
   border-radius: 16px;
-}
-
-.brand-block {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 18px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid #e2e8f0;
-}
-
-.brand-logo {
-  width: 40px;
-  height: 40px;
-  object-fit: contain;
-  border-radius: 8px;
-  background: #f8fafc;
-}
-
-.brand-title {
-  font-size: 16px;
-  font-weight: 700;
-  line-height: 1.3;
-}
-
-.brand-subtitle {
-  margin-top: 2px;
-  color: #64748b;
-  font-size: 13px;
-  line-height: 1.4;
 }
 
 .share-header {
@@ -652,8 +642,8 @@ onBeforeUnmount(revokePreviewUrl);
 }
 
 @media (max-width: 640px) {
-  .share-page {
-    padding: 12px;
+  .share-content {
+    padding: 24px 12px;
   }
 
   .share-panel {

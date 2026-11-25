@@ -101,7 +101,7 @@ test('share preview treats a successful JSON response as content even with error
   const fn=source.slice(source.indexOf('async function previewShare()'),source.indexOf('/**',source.indexOf('async function previewShare()')));
   const extra=source.includes('async function looksLikeJsonError') ? source.slice(source.indexOf('async function looksLikeJsonError'),source.indexOf('function onMediaError')) : '';
   const content='{"statusCode":500,"message":"legitimate document"}';
-  const context={canSubmit:{value:true},previewing:{value:false},previewError:{value:''},previewText:{value:null},shareInfo:{value:{fileName:'update.json',size:content.length}},shareToken:{value:'t'},password:{value:''},unlocked:{value:false},publicShareApi:{preview:async()=>new Blob([content],{type:'application/json'})},isTextShare:()=>true,revokePreviewUrl:()=>{},setPreviewBlob:()=>{},ElMessage:{error:()=>{}},Blob};
+  const context={previewRequest:0,canSubmit:{value:true},previewing:{value:false},previewError:{value:''},previewText:{value:null},shareInfo:{value:{fileName:'update.json',size:content.length}},shareToken:{value:'t'},password:{value:''},unlocked:{value:false},publicShareApi:{preview:async()=>new Blob([content],{type:'application/json'})},isTextShare:()=>true,revokePreviewUrl:()=>{},setPreviewBlob:()=>{},ElMessage:{error:()=>{}},Blob};
   vm.createContext(context); vm.runInContext(ts.transpile(fn+extra),context); await context.previewShare();
   assert.equal(context.previewError.value,''); assert.equal(context.previewText.value,content);
 });

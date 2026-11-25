@@ -21,7 +21,7 @@ async function fixture(t, initial = []) {
     db[model] = { findMany: async () => tables[model].map(row => ({ ...row })), deleteMany: async () => { const count = tables[model].length; tables[model] = []; return { count }; }, createMany: async ({ data }) => { tables[model].push(...data); return { count: data.length }; } };
   }
   db.backup = {
-    findMany: async () => rows.map(row => ({ ...row })),
+    findMany: async (args = {}) => rows.filter(row => !args.where?.status || row.status === args.where.status).map(row => ({ ...row })),
     findUnique: async ({ where }) => rows.find(row => row.id === where.id) || null,
     create: async ({ data }) => { const row = { id: `backup-${rows.length}`, name: 'fixture', fileName: null, fileSize: 0n, checksum: null, tableCounts: null, tableRows: null, objectCount: 0, objectBytes: 0n, message: null, createdAt: new Date(), updatedAt: new Date(), finishedAt: null, ...data }; rows.push(row); return { ...row }; },
     update: async ({ where, data }) => { if (Buffer.byteLength(data.message || '', 'utf8') > 65535) throw new Error('Data too long for column message'); const row = rows.find(row => row.id === where.id); if (!row) throw new Error('Record not found'); Object.assign(row, data); return { ...row }; },
@@ -41,6 +41,20 @@ test('service startup marks interrupted backups failed while retaining completed
   assert.equal(result.find(row => row.id === 'complete').status, 'SUCCEEDED');
   assert.equal(result.find(row => row.id === 'waiting').status, 'PENDING');
   await f.service.remove('interrupted', user); assert.ok(!f.rows.some(row => row.id === 'interrupted'));
+});
+test('service startup also fails interrupted upload destinations without losing verified cloud copies', async t => {
+  const destination = { configId: 'drive', name: 'drive', provider: 'ALIYUN_DRIVE', storageKey: 'archive.gz', status: 'PENDING' };
+  const f = await fixture(t, [{ id: 'before-upload', status: 'RUNNING', destination }, { id: 'uploaded', status: 'RUNNING', destination: { ...destination, status: 'VERIFIED' } }]);
+  await f.service.onModuleInit();
+  assert.equal(f.rows[0].status, 'FAILED'); assert.equal(f.rows[0].destination.status, 'FAILED');
+  assert.equal(f.rows[1].status, 'FAILED'); assert.equal(f.rows[1].destination.status, 'VERIFIED');
+});
+test('previously failed backups do not present an unstarted upload as still pending', async t => {
+  const destination = { configId: 'drive', name: 'drive', provider: 'ALIYUN_DRIVE', storageKey: 'archive.gz', status: 'PENDING' };
+  const f = await fixture(t, [{ id: 'old-interrupted', status: 'FAILED', destination }, { id: 'cloud-safe', status: 'FAILED', destination: { ...destination, status: 'VERIFIED' } }]);
+  const views = await f.service.list(user);
+  assert.equal(views[0].destination.status, 'FAILED'); assert.equal(views[1].destination.status, 'VERIFIED');
+  assert.equal(f.rows[0].destination.status, 'PENDING', 'reading legacy status must not rewrite stored metadata');
 });
 test('long backup errors persist FAILED within MySQL TEXT limits instead of leaving RUNNING', async t => {
   const f = await fixture(t);

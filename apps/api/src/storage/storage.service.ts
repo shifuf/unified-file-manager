@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { CdnProvider, type CdnConfig } from '@prisma/client';
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 
 import { PrismaService } from '../prisma/prisma.service';
 import { decryptText, getSigningSecret, hmacSha256Base64Url } from './crypto.util';
@@ -16,6 +17,7 @@ import type {
   DirectUploadCredential,
   RuntimeCdnConfig,
   StorageDownloadTarget,
+  StorageUploadFileParams,
   StorageUploadParams,
 } from './storage.types';
 
@@ -49,6 +51,7 @@ export type StorageUploadResult = {
 
 const VAULT_PREFIX = 'vault:';
 const DEFAULT_URL_TTL_SECONDS = 3600;
+const FILE_UPLOAD_BUFFER_LIMIT = 32 * 1024 * 1024;
 
 @Injectable()
 export class StorageService {
@@ -325,6 +328,36 @@ export class StorageService {
     } finally { await this.limits.settleRead(reservation.verification, 0n); }
   }
 
+  /** Upload a verified disk archive without buffering it in application memory. */
+  async uploadFileToConfig(configId: string, params: StorageUploadFileParams): Promise<StorageUploadResult> {
+    const config = await this.findConfigById(configId);
+    const storageKey = normalizeStorageKey(params.key);
+    const adapter = this.registry.adapter(config.provider);
+    if (!adapter.uploadFile && params.size > FILE_UPLOAD_BUFFER_LIMIT) {
+      throw new Error('存储适配器未支持流式上传，超过 32MiB 的文件无法上传。');
+    }
+    const buffer = await readVerifiedUploadFile(params, !adapter.uploadFile);
+    const reservation = await this.limits.reserveUpload(config, params.size, storageKey);
+    try {
+      const result = adapter.uploadFile
+        ? await adapter.uploadFile(config, { ...params, key: storageKey })
+        : await adapter.upload(config, { key: storageKey, buffer: buffer!, mimeType: params.mimeType,
+          originalName: params.originalName, ...(params.project ? { project: params.project } : {}),
+          ...(params.folderPath !== undefined ? { folderPath: params.folderPath } : {}) });
+      if (normalizeStorageKey(result.storageKey) !== storageKey) throw new Error('上传目标返回了不同的不可变 key。');
+
+      if (config.provider !== CdnProvider.LOCAL) {
+        const reader = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
+        await reader.confirmStoredObject(config, storageKey, params.size, params.checksum, reservation.verification);
+      }
+      await this.limits.finishUpload(reservation, 'PRESENT');
+      return { cdnConfigId: config.id, storageKey: result.storageKey, publicUrl: result.publicUrl ?? null };
+    } catch (error) {
+      await this.limits.reconcileFailedUpload(reservation, config, storageKey);
+      throw error;
+    } finally { await this.limits.settleRead(reservation.verification, 0n); }
+  }
+
   async getActiveStorage(projectId: string): Promise<RuntimeCdnConfig> {
     const project = await this.prisma.project.findFirst({
       where: { id: projectId, deletedAt: null },
@@ -525,6 +558,23 @@ export class StorageService {
 
 function normalizeStorageKey(key: string): string {
   return key.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/{2,}/g, '/');
+}
+
+async function readVerifiedUploadFile(params: StorageUploadFileParams, collect: boolean): Promise<Buffer | undefined> {
+  if (!Number.isSafeInteger(params.size) || params.size < 0) throw new Error('上传源文件大小无效。');
+  const digest = createHash('sha256');
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of createReadStream(params.path)) {
+    const bytes = chunk as Buffer;
+    size += bytes.length;
+    if (size > params.size) throw new Error('上传源文件大小发生变化。');
+    digest.update(bytes);
+    if (collect) chunks.push(bytes);
+  }
+  if (size !== params.size) throw new Error('上传源文件大小发生变化。');
+  if (digest.digest('hex') !== params.checksum) throw new Error('上传源文件 SHA256 校验失败。');
+  return collect ? Buffer.concat(chunks, size) : undefined;
 }
 
 async function readStreamToBuffer(stream: Readable): Promise<Buffer> {

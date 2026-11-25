@@ -21,7 +21,7 @@ async function fixture(t, fail = false) {
     },
   };
   const service = new BackupService({ write: async () => {} }, { get: key => key === 'BACKUP_ROOT' ? root : undefined }, prisma, {
-    uploadToConfig: async (id, params) => { uploads.push({ id, params }); if (fail) throw new Error('cloud unavailable'); return { cdnConfigId: id, storageKey: params.key }; },
+    uploadFileToConfig: async (id, params) => { uploads.push({ id, params, bytes: await fs.readFile(params.path) }); if (fail) throw new Error('cloud unavailable'); return { cdnConfigId: id, storageKey: params.key }; },
   });
   service.buildArchive = async () => {
     const bytes = Buffer.from('test backup');
@@ -43,7 +43,10 @@ test('remote-only backup uploads through verified storage and removes local only
   const f = await fixture(t);
   const result = await f.service.create({ storageConfigId: 'drive', retainLocal: false }, user);
   assert.equal(f.uploads.length, 1);
-  assert.equal(f.uploads[0].params.buffer.toString(), 'test backup');
+  assert.equal(f.uploads[0].bytes.toString(), 'test backup');
+  assert.equal(f.uploads[0].params.size, 11);
+  assert.equal(f.uploads[0].params.checksum, createHash('sha256').update('test backup').digest('hex'));
+  assert.equal(f.uploads[0].params.buffer, undefined);
   assert.equal(result.status, 'SUCCEEDED');
   assert.equal(result.destination.status, 'VERIFIED');
   assert.equal(result.destination.configId, 'drive');

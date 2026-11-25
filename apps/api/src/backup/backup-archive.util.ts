@@ -1,9 +1,74 @@
-import { createHash } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { createHash, randomUUID } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { rename, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createGzip, gunzipSync } from 'node:zlib';
 import { BACKUP_FORMAT_VERSION, BACKUP_MODELS, isBackupScopeKey, modelsForScopes } from './backup.constants';
 import type { BACKUP_SCOPE_KEYS } from './backup.constants';
 
 export const MAX_BACKUP_EXPANDED_BYTES = 1024 * 1024 * 1024;
+export const MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024;
+
+/** Keep generated v1 archives within the same bounds accepted by import/restore. */
+export async function writeBackupArchive(path: string, chunks: AsyncIterable<string>): Promise<{ fileSize: number; checksum: string }> {
+  const partial = `${path}.${randomUUID()}.partial`;
+  const digest = createHash('sha256');
+  let expandedBytes = 0, fileSize = 0;
+  const expanded = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+    expandedBytes += chunk.length;
+    callback(expandedBytes > MAX_BACKUP_EXPANDED_BYTES ? new Error(`备份解压后超过 ${MAX_BACKUP_EXPANDED_BYTES} 字节上限。`) : null, chunk);
+  } });
+  const compressed = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+    fileSize += chunk.length;
+    if (fileSize > MAX_BACKUP_ARCHIVE_BYTES) { callback(new Error(`备份文件超过 ${MAX_BACKUP_ARCHIVE_BYTES} 字节上限。`)); return; }
+    digest.update(chunk); callback(null, chunk);
+  } });
+  try {
+    await pipeline(Readable.from(chunks, { objectMode: false }), expanded, createGzip({ level: 9 }), compressed, createWriteStream(partial, { flags: 'wx' }));
+    await rename(partial, path);
+    return { fileSize, checksum: digest.digest('hex') };
+  } catch (error) {
+    await rm(partial, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export class BackupObjectLimitError extends Error {}
+
+/** Stage one object so read failures cannot leave half a JSON entry in the archive. */
+export async function spoolBackupObject(stream: Readable, root: string, maxBytes: number): Promise<{ path: string; size: number; cleanup: () => Promise<void> }> {
+  const path = join(root, `.ufm-backup-object-${randomUUID()}.partial`);
+  const cleanup = async (): Promise<void> => { await rm(path, { force: true }); };
+  let size = 0;
+  const meter = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+    size += chunk.length;
+    callback(size > maxBytes ? new BackupObjectLimitError('本地对象超过备份上限。') : null, chunk);
+  } });
+  try {
+    await pipeline(stream, meter, createWriteStream(path, { flags: 'wx' }));
+    return { path, size, cleanup };
+  } catch (error) {
+    await cleanup().catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Base64 padding belongs only at the end, including when stream chunks split triples. */
+export async function* backupBase64(chunks: AsyncIterable<Buffer>): AsyncGenerator<string> {
+  let carry = Buffer.alloc(0);
+  for await (const chunk of chunks) {
+    for (let offset = 0; offset < chunk.length; offset += 48 * 1024) {
+      const part = chunk.subarray(offset, offset + 48 * 1024);
+      const bytes = carry.length ? Buffer.concat([carry, part]) : part;
+      const length = bytes.length - bytes.length % 3;
+      if (length) yield bytes.subarray(0, length).toString('base64');
+      carry = Buffer.from(bytes.subarray(length));
+    }
+  }
+  if (carry.length) yield carry.toString('base64');
+}
 
 export function decompressBackupBuffer(buffer: Buffer, maxOutputBytes = MAX_BACKUP_EXPANDED_BYTES): Buffer {
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {

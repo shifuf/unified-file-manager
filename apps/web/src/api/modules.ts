@@ -897,12 +897,12 @@ function postFormWithProgress(
 }
 
 export const publicShareApi = {
-  get(token: string) {
-    return http.get<unknown, PublicShareInfo>(`/shares/${token}`);
+  get(token: string, options: ReadOptions = {}) {
+    return http.get<unknown, PublicShareInfo>(`/shares/${encodeURIComponent(token)}`, options);
   },
   /** Resolve by multi-segment customPath (e.g. docs/readme) or token. */
-  resolve(path: string) {
-    return http.get<unknown, PublicShareInfo>('/shares/resolve', { params: { path } });
+  resolve(path: string, options: ReadOptions = {}) {
+    return http.get<unknown, PublicShareInfo>('/shares/resolve', { ...options, params: { path } });
   },
   download(token: string, password?: string) {
     return http.post<unknown, Blob>(`/shares/${token}/download`, compactParams({ password }), {
@@ -922,6 +922,7 @@ export const publicShareApi = {
     return http.post<unknown, Blob>(`/shares/${token}/preview`, compactParams({ password }), {
       responseType: 'blob',
       timeout: 0,
+      _silent: true,
     });
   },
 };

@@ -3,7 +3,7 @@ import { createReadStream, existsSync } from 'node:fs';
 import type { ReadStream } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
-import { gzipSync } from 'node:zlib';
+import { Readable } from 'node:stream';
 
 import {
   BadRequestException,
@@ -33,7 +33,7 @@ import {
 } from './backup.constants';
 import type { CreateBackupDto } from './dto/create-backup.dto';
 import type { RestoreBackupDto } from './dto/restore-backup.dto';
-import { decompressBackupBuffer, validateBackupPayload, verifyBackupChecksum } from './backup-archive.util';
+import { backupBase64, BackupObjectLimitError, decompressBackupBuffer, MAX_BACKUP_ARCHIVE_BYTES, spoolBackupObject, validateBackupPayload, verifyBackupChecksum, writeBackupArchive } from './backup-archive.util';
 import { StorageAdapterRegistry } from '../storage/storage-registry.service';
 
 type BackupRow = Record<string, unknown>;
@@ -115,7 +115,7 @@ export type BackupArchive = {
 };
 
 const DEFAULT_MAX_OBJECT_BYTES = 512 * 1024 * 1024;
-const MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024;
+const BACKUP_PAGE_SIZE = 200;
 
 /**
  * Full logical backups: every Prisma model is exported into a gzipped JSON
@@ -140,11 +140,19 @@ export class BackupService implements OnModuleInit {
   async onModuleInit(): Promise<void> {
     // Archive creation runs inside the request in this API process. A stored
     // RUNNING record at startup has no surviving task that can complete it.
-    const result = await this.prisma.backup.updateMany({
-      where: { status: 'RUNNING' },
-      data: { status: 'FAILED', message: '服务重启中断了备份，请重新创建。', finishedAt: new Date() },
-    });
-    if (result.count) this.logger.warn(`已恢复 ${result.count} 条中断备份的失败状态。`);
+    const interrupted = await this.prisma.backup.findMany({ where: { status: 'RUNNING' }, select: { id: true, destination: true } });
+    let count = 0;
+    for (const record of interrupted) {
+      const destination = this.destinationOf(record);
+      const result = await this.prisma.backup.updateMany({
+        where: { id: record.id, status: 'RUNNING' },
+        data: { status: 'FAILED', message: '服务重启中断了备份，请重新创建。', finishedAt: new Date(),
+          ...(destination ? { destination: { ...destination, status: destination.status === 'VERIFIED' ? 'VERIFIED' : 'FAILED' } as unknown as Prisma.InputJsonValue } : {}),
+        },
+      });
+      count += result.count;
+    }
+    if (count) this.logger.warn(`已恢复 ${count} 条中断备份的失败状态。`);
   }
 
   async list(user: RequestUser): Promise<BackupView[]> {
@@ -194,9 +202,9 @@ export class BackupService implements OnModuleInit {
       if (destination) {
         destination = { ...destination, status: 'UPLOADING' };
         await this.prisma.backup.update({ where: { id: record.id }, data: { destination: destination as unknown as Prisma.InputJsonValue } });
-        const buffer = await readFile(this.archivePath(result.fileName));
-        await this.storageService.uploadToConfig(destination.configId, {
-          key: destination.storageKey, buffer, mimeType: 'application/gzip', originalName: result.fileName,
+        await this.storageService.uploadFileToConfig(destination.configId, {
+          key: destination.storageKey, path: this.archivePath(result.fileName), size: result.fileSize, checksum: result.checksum,
+          mimeType: 'application/gzip', originalName: result.fileName,
         });
         destination = { ...destination, status: 'VERIFIED' };
         await this.prisma.backup.update({ where: { id: record.id }, data: { destination: destination as unknown as Prisma.InputJsonValue } });
@@ -494,105 +502,111 @@ export class BackupService implements OnModuleInit {
     warnings: string[];
   }> {
     const warnings: string[] = [];
-    const tables: Record<string, BackupRow[]> = {};
     const rowCounts: Record<string, number> = {};
-    const selectedModels = modelsForScopes(scopes);
-
-    for (const model of selectedModels) {
-      const rows = await this.delegate(model).findMany();
-      tables[model] = rows.map((row) => {
-        const serialized = this.toJsonRow(model, row);
-        this.assertRowSerializable(model, row, serialized);
-        return serialized;
-      });
-      rowCounts[model] = rows.length;
-    }
-
-    const objects = includeObjects && scopes.includes('projects')
-      ? await this.collectObjects(warnings)
-      : [];
-
-    const payload: BackupPayload = {
-      formatVersion: BACKUP_FORMAT_VERSION,
-      createdAt: new Date().toISOString(),
-      scopes,
-      tables,
-      objects,
-      warnings,
-      plugins: scopes.includes('storage') && this.registry ? await Promise.all(this.registry.store.list().filter(p => p.available).map(async p => ({
-        id: p.id, version: p.version, sha256: p.sha256,
-        ...(includeObjects ? { data: (await this.registry.store.package(p.id)).toString('base64') } : {}),
-      }))) : [],
-    };
-
-    const buffer = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'), { level: 9 });
+    const objectStats = { count: 0, bytes: 0 };
     const fileName = `ufm-backup-${this.stamp()}-${backupId}.json.gz`;
     const root = this.backupRoot();
     await mkdir(root, { recursive: true });
-    await writeFile(resolve(root, fileName), buffer);
+    const result = await writeBackupArchive(resolve(root, fileName), this.archiveChunks(includeObjects, scopes, root, rowCounts, objectStats, warnings));
 
     return {
       fileName,
-      fileSize: buffer.byteLength,
-      checksum: createHash('sha256').update(buffer).digest('hex'),
+      ...result,
       tableCounts: { ...rowCounts },
       tableRows: { ...rowCounts },
-      objectCount: objects.length,
-      objectBytes: objects.reduce((sum, entry) => sum + entry.size, 0),
+      objectCount: objectStats.count,
+      objectBytes: objectStats.bytes,
       warnings,
     };
   }
 
-  /** Read LOCAL objects so a restore can rebuild the file tree without the provider. */
-  private async collectObjects(warnings: string[]): Promise<BackupObjectEntry[]> {
+  private async *archiveChunks(includeObjects: boolean, scopes: BackupScopeKey[], root: string,
+    rowCounts: Record<string, number>, objectStats: { count: number; bytes: number }, warnings: string[]): AsyncGenerator<string> {
+    yield `{"formatVersion":${BACKUP_FORMAT_VERSION},"createdAt":${JSON.stringify(new Date().toISOString())},"scopes":${JSON.stringify(scopes)},"tables":{`;
+    let separator = '';
+    for (const model of modelsForScopes(scopes)) {
+      yield `${separator}${JSON.stringify(model)}:[`;
+      let rowSeparator = ''; rowCounts[model] = 0;
+      for await (const row of this.readRows(model)) {
+        const serialized = this.toJsonRow(model, row);
+        this.assertRowSerializable(model, row, serialized);
+        yield rowSeparator + JSON.stringify(serialized);
+        rowSeparator = ','; rowCounts[model]++;
+      }
+      yield ']'; separator = ',';
+    }
+    yield '},"objects":[';
+    if (includeObjects && scopes.includes('projects')) yield* this.objectChunks(root, objectStats, warnings);
+    yield '],"plugins":[';
+    separator = '';
+    if (scopes.includes('storage') && this.registry) {
+      for (const plugin of this.registry.store.list().filter(item => item.available)) {
+        const metadata = JSON.stringify({ id: plugin.id, version: plugin.version, sha256: plugin.sha256 });
+        if (includeObjects) {
+          const bytes = await this.registry.store.package(plugin.id);
+          yield separator + metadata.slice(0, -1) + ',"data":"';
+          yield* backupBase64(Readable.from([bytes]));
+          yield '"}';
+        } else yield separator + metadata;
+        separator = ',';
+      }
+    }
+    yield `],"warnings":${JSON.stringify(warnings)}}`;
+  }
+
+  /** Keyset pages keep every table bounded, including composite and non-id primary keys. */
+  private async *readRows(model: BackupModelName): AsyncGenerator<BackupRow> {
+    const keys = model === 'projectStorageBinding' ? ['projectId', 'configId'] : [model === 'systemSetting' ? 'key' : 'id'];
+    let after: BackupRow | undefined;
+    while (true) {
+      const where = after ? keys.length === 1 ? { [keys[0]]: { gt: after[keys[0]] } } : {
+        OR: keys.map((key, index) => ({ ...Object.fromEntries(keys.slice(0, index).map(previous => [previous, after![previous]])), [key]: { gt: after![key] } })),
+      } : undefined;
+      const rows = await this.delegate(model).findMany({ take: BACKUP_PAGE_SIZE, orderBy: keys.map(key => ({ [key]: 'asc' })), ...(where ? { where } : {}) });
+      for (const row of rows) yield row;
+      if (rows.length < BACKUP_PAGE_SIZE) return;
+      const last = rows[rows.length - 1];
+      after = Object.fromEntries(keys.map(key => [key, last[key]]));
+    }
+  }
+
+  /** Stage and encode one LOCAL object at a time, with a hard bound while reading. */
+  private async *objectChunks(root: string, stats: { count: number; bytes: number }, warnings: string[]): AsyncGenerator<string> {
     const maxBytes = this.configService.get<number>('BACKUP_MAX_OBJECT_BYTES', DEFAULT_MAX_OBJECT_BYTES);
     const limit = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0
       ? Number(maxBytes)
       : DEFAULT_MAX_OBJECT_BYTES;
 
-    const files = await this.prisma.managedFile.findMany({
-      where: { status: { not: 'DELETED' }, cdnConfig: { provider: 'LOCAL' } },
-      include: { cdnConfig: true },
-    });
-
-    const entries: BackupObjectEntry[] = [];
-    let total = 0;
-
-    for (const file of files) {
-      if (total >= limit) {
-        warnings.push(`本地对象超过 ${Math.round(limit / 1024 / 1024)}MB 上限，其余文件未打包。`);
-        break;
-      }
-
-      try {
-        const target = await this.storageService.getDownloadTarget(file, 300, undefined, {
-          preferRedirect: false,
-        });
-        if (!target.stream) {
+    const warnLimit = (): void => { warnings.push(`本地对象超过 ${Math.round(limit / 1024 / 1024)}MB 上限，其余文件未打包。`); };
+    let after: string | undefined;
+    while (true) {
+      const files = await this.prisma.managedFile.findMany({
+        where: { status: { not: 'DELETED' }, cdnConfig: { provider: 'LOCAL' }, ...(after ? { id: { gt: after } } : {}) },
+        orderBy: { id: 'asc' }, take: BACKUP_PAGE_SIZE, include: { cdnConfig: true },
+      });
+      for (const file of files) {
+        if (stats.bytes >= limit || (file.size !== undefined && Number(file.size) > limit - stats.bytes)) { warnLimit(); return; }
+        let object: Awaited<ReturnType<typeof spoolBackupObject>>;
+        try {
+          const target = await this.storageService.getDownloadTarget(file, 300, undefined, { preferRedirect: false });
+          if (!target.stream) { warnings.push(`读取 ${file.originalName} 失败：未提供文件流。`); continue; }
+          object = await spoolBackupObject(target.stream, root, limit - stats.bytes);
+        } catch (error) {
+          if (error instanceof BackupObjectLimitError) { warnLimit(); return; }
+          warnings.push(`读取 ${file.originalName} 失败：${this.errorMessage(error)}`);
           continue;
         }
-
-        const buffer = await this.readStream(target.stream);
-        if (total + buffer.byteLength > limit) {
-          warnings.push(`本地对象超过 ${Math.round(limit / 1024 / 1024)}MB 上限，其余文件未打包。`);
-          break;
-        }
-
-        total += buffer.byteLength;
-        entries.push({
-          cdnConfigId: file.cdnConfigId ?? '',
-          storageKey: file.storageKey,
-          mimeType: file.mimeType,
-          originalName: file.originalName,
-          size: buffer.byteLength,
-          data: buffer.toString('base64'),
-        });
-      } catch (error) {
-        warnings.push(`读取 ${file.originalName} 失败：${this.errorMessage(error)}`);
+        try {
+          const metadata = JSON.stringify({ cdnConfigId: file.cdnConfigId ?? '', storageKey: file.storageKey, mimeType: file.mimeType, originalName: file.originalName, size: object.size });
+          yield (stats.count ? ',' : '') + metadata.slice(0, -1) + ',"data":"';
+          yield* backupBase64(createReadStream(object.path));
+          yield '"}';
+          stats.count++; stats.bytes += object.size;
+        } finally { await object.cleanup(); }
       }
+      if (files.length < BACKUP_PAGE_SIZE) return;
+      after = files[files.length - 1].id;
     }
-
-    return entries;
   }
 
   private readPayload(raw: string): BackupPayload {
@@ -699,13 +713,14 @@ export class BackupService implements OnModuleInit {
   }
 
   private toView(record: Backup): BackupView {
+    const destination = this.destinationOf(record);
     return {
       id: record.id,
       name: record.name,
       status: record.status,
       includeObjects: record.includeObjects,
       retainLocal: record.retainLocal !== false,
-      destination: this.destinationOf(record),
+      destination: record.status === 'FAILED' && destination && destination.status !== 'VERIFIED' ? { ...destination, status: 'FAILED' } : destination,
       fileName: record.fileName,
       fileSize: Number(record.fileSize),
       checksum: record.checksum,
@@ -724,7 +739,7 @@ export class BackupService implements OnModuleInit {
     };
   }
 
-  private destinationOf(record: Backup): BackupDestination | null {
+  private destinationOf(record: Pick<Backup, 'destination'>): BackupDestination | null {
     const value = record.destination;
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     return value as unknown as BackupDestination;
@@ -809,11 +824,4 @@ export class BackupService implements OnModuleInit {
     return message.length > 8_000 ? `${message.slice(0, 8_000)}…（错误信息已截断）` : message;
   }
 
-  private async readStream(stream: NodeJS.ReadableStream): Promise<Buffer> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of stream) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as unknown as Uint8Array));
-    }
-    return Buffer.concat(chunks);
-  }
 }
