@@ -345,6 +345,41 @@ export class DriveObjects {
       return stored;
     });
   }
+  private async uploadedParts(binding: Binding, saved: ObjectState, size: number): Promise<Set<number>> {
+    const count = Math.max(1, Math.ceil(size / CHUNK_SIZE)), uploaded = new Set<number>();
+    let marker = 0, sequential = false;
+    for (let page = 0; page < 100; page++) {
+      let result: CloudItem;
+      try {
+        result = await this.client.request(binding.accountId, '/v2/file/list_uploaded_parts', {
+          drive_id: binding.driveId, file_id: saved.fileId, upload_id: saved.uploadId, limit: 100,
+          ...(marker ? { part_number_marker: marker } : {}),
+        });
+      } catch {
+        throw new Error('无法确认已上传分片：上传会话失效或服务不支持查询，已停止续传以避免覆盖已有分片。');
+      }
+      if (result.file_id !== saved.fileId || result.upload_id !== saved.uploadId || !Array.isArray(result.uploaded_parts)
+        || result.uploaded_parts.length > 100) throw new Error('已上传分片的会话或列表信息不一致。');
+      sequential ||= result.parallel_upload === false;
+      let last = marker;
+      for (const part of result.uploaded_parts) {
+        const number = part?.part_number, expected = Math.min(CHUNK_SIZE, size - (number - 1) * CHUNK_SIZE);
+        if (!Number.isSafeInteger(number) || number < 1 || number > count || number <= last || uploaded.has(number)
+          || part.part_size !== expected) throw new Error('已上传分片的编号或大小校验失败，已停止续传。');
+        uploaded.add(number); last = number;
+      }
+      const next = Number(result.next_part_number_marker ?? 0);
+      if (!Number.isSafeInteger(next) || next < 0 || next > count || next && (next <= marker || next < last || !result.uploaded_parts.length)) {
+        throw new Error('已上传分片的分页游标异常。');
+      }
+      if (!next) {
+        if (sequential && [...uploaded].some((number, index) => number !== index + 1)) throw new Error('顺序上传的已确认分片不连续，已停止续传。');
+        return uploaded;
+      }
+      marker = next;
+    }
+    throw new Error('已上传分片查询超过分页上限，已停止续传。');
+  }
   private async uploadObject(config: RuntimeCdnConfig, params: StorageUploadFileParams, cloudName?: string, fixedParent?: string) {
     const binding = this.binding(config), id = this.stateKey(binding, params.key, cloudName);
     return this.client.context.withLock(id, async () => {
@@ -377,6 +412,7 @@ export class DriveObjects {
       if (count > 10_000) throw new Error('文件超过当前分片上传支持的大小。');
       const parts = Array.from({ length: count }, (_, index) => ({ part_number: index + 1 }));
       let urls: Array<{ part_number: number; upload_url: string }>;
+      let confirmed = new Set<number>();
       if (!saved?.uploadId) {
         const parent = fixedParent || (params.project ? await this.projectFolder(config, params.project) : await this.folder(binding, true));
         const state = await this.client.fresh(binding.accountId);
@@ -396,28 +432,37 @@ export class DriveObjects {
         if (saved.ready) return { storageKey: params.key };
         urls = created.part_info_list || [];
       } else {
-        const renewed = await this.client.request(binding.accountId, '/v2/file/get_upload_url', {
-          drive_id: binding.driveId, file_id: saved.fileId, upload_id: saved.uploadId, part_info_list: parts,
-        });
+        confirmed = await this.uploadedParts(binding, saved, params.size);
+        const missing = parts.filter(part => !confirmed.has(part.part_number));
+        const renewed = missing.length ? await this.client.request(binding.accountId, '/v2/file/get_upload_url', {
+          drive_id: binding.driveId, file_id: saved.fileId, upload_id: saved.uploadId, part_info_list: missing,
+        }) : {};
         urls = renewed.part_info_list || [];
       }
       for (const part of parts) {
+        if (confirmed.has(part.part_number)) continue;
         let url = urls.find(item => item.part_number === part.part_number)?.upload_url;
         for (let attempt = 0; attempt < 3; attempt++) {
           if (!url) throw new Error('网盘没有返回分片上传地址。');
           const uploadUrl = checkedDownloadUrl(url);
           const start = (part.part_number - 1) * CHUNK_SIZE, end = Math.min(params.size, start + CHUNK_SIZE);
           const stream = params.size ? createReadStream(params.path, { start, end: end - 1 }) : Readable.from([]);
-          let ok = false;
+          let ok = false, status = 0;
           try {
             const response = await this.client.transport(uploadUrl, { method: 'PUT', body: stream as unknown as BodyInit,
               duplex: 'half', headers: { 'content-length': String(end - start) }, signal: AbortSignal.timeout(120_000), redirect: 'error' } as RequestInit);
             await response.body?.cancel();
-            ok = response.ok;
-            if (!ok && ![403, 408, 429, 500, 502, 503, 504].includes(response.status)) throw new DriveError('PartUploadFailed', response.status);
+            ok = response.ok; status = response.status;
           } catch (error) { if (error instanceof DriveError) throw error; }
           finally { stream.destroy(); }
           if (ok) break;
+          if (status && ![403, 408, 409, 429, 500, 502, 503, 504].includes(status)) throw new DriveError('PartUploadFailed', status);
+          // A timeout can occur after the server accepted a sequential part.
+          // Confirm the server checkpoint before retrying; a 409 alone is never
+          // sufficient proof that the expected bytes have already arrived.
+          confirmed = await this.uploadedParts(binding, saved, params.size);
+          if (confirmed.has(part.part_number)) break;
+          if (status === 409) throw new DriveError('PartUploadFailed', status);
           if (attempt === 2) throw new Error('网盘分片上传失败，任务稍后可重试。');
           const renewed = await this.client.request(binding.accountId, '/v2/file/get_upload_url', {
             drive_id: binding.driveId, file_id: saved.fileId, upload_id: saved.uploadId, part_info_list: [part],

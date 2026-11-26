@@ -109,6 +109,7 @@ export interface LocalFileMigrationSummary {
 @Injectable()
 export class FilesService {
   private readonly logger = new Logger(FilesService.name);
+  private retentionCursor = '';
   private readonly sharePasswordAttemptLimiter = new InMemoryAttemptLimiter({
     maxAttempts: 5,
     windowMs: 15 * 60 * 1000,
@@ -2461,6 +2462,7 @@ export class FilesService {
 
     let purged = 0;
     let failed = 0;
+    const failures: Array<{ fileId: string; error: string }> = [];
 
     for (const file of files) {
       try {
@@ -2468,6 +2470,7 @@ export class FilesService {
         purged += 1;
       } catch {
         failed += 1;
+        failures.push({ fileId: file.id, error: '存储对象未全部删除，请检查存储连接、插件和删除权限后重试。' });
       }
     }
 
@@ -2478,7 +2481,8 @@ export class FilesService {
       actorId: user.id,
       projectId: this.singleProjectId(files),
       status: failed > 0 ? 'FAILED' : 'COMPLETED',
-      result: { total: files.length, purged, failed },
+      detail: { fileIds: files.map(file => file.id), failedFileIds: failures.map(item => item.fileId), failures, actorId: user.id },
+      result: { total: files.length, purged, failed, failures },
       error: failed > 0 ? `${failed} 个文件删除失败` : undefined,
     });
 
@@ -2521,7 +2525,7 @@ export class FilesService {
       detail: { fileId, shareId: share.id, expiresAt: dto.expiresAt, maxDownloads: dto.maxDownloads, customPath },
     });
 
-    return this.toShareResponse(share, publicBaseUrl, true);
+    return (await this.toAdminShareResponses([share], publicBaseUrl))[0];
   }
 
   async createShareLinkForProject(
@@ -2570,7 +2574,7 @@ export class FilesService {
       orderBy: { createdAt: 'desc' },
     });
 
-    return shares.map((share) => this.toShareResponse(share, publicBaseUrl, true));
+    return this.toAdminShareResponses(shares, publicBaseUrl);
   }
 
   async listShareLinksForProject(
@@ -2635,7 +2639,7 @@ export class FilesService {
     });
 
     return {
-      items: shares.map((share) => this.toShareResponse(share, publicBaseUrl, true)),
+      items: await this.toAdminShareResponses(shares, publicBaseUrl),
       total,
       page,
       pageSize,
@@ -2665,6 +2669,16 @@ export class FilesService {
       detail: { fileId: share.fileId, shareId },
     });
 
+    return { success: true };
+  }
+
+  async deleteShareLink(shareId: string, user: RequestUser): Promise<{ success: boolean }> {
+    const share = await this.prisma.shareLink.findUnique({ where: { id: shareId }, include: { file: true } });
+    if (!share) throw new NotFoundException('分享链接不存在。');
+    await this.projectAccessService.assertProjectAccess(user, share.file.projectId, true);
+    await this.prisma.shareLink.delete({ where: { id: shareId } });
+    await this.auditService.write({ action: AuditAction.FILE_SHARE_DELETE, actorId: user.id,
+      projectId: share.file.projectId, detail: { fileId: share.fileId, shareId, permanent: true } });
     return { success: true };
   }
 
@@ -2719,7 +2733,7 @@ export class FilesService {
       },
     });
 
-    return this.toShareResponse(updated, publicBaseUrl, true);
+    return (await this.toAdminShareResponses([updated], publicBaseUrl))[0];
   }
 
   async updateShareLinkForProject(
@@ -2964,10 +2978,27 @@ export class FilesService {
     return true;
   }
 
-  /** Compatibility for old schedulers: physical deletion now requires an
-   * explicit single-file or batch purge request from the recycle bin. */
+  /** Provider failures retain the frozen file and replica index for the next
+   * maintenance pass; a failed object must never disappear from management. */
   async purgeExpiredRecycledFiles(): Promise<{ scanned: number; purged: number; failed: number }> {
-    return { scanned: 0, purged: 0, failed: 0 };
+    const summary = { scanned: 0, purged: 0, failed: 0 };
+    const now = new Date();
+    let cursor = this.retentionCursor;
+    // Bound each pass so a disconnected provider cannot monopolize maintenance.
+    for (let page = 0; page < 5; page++) {
+      const files = await this.prisma.managedFile.findMany({ where: {
+        status: FileStatus.RECYCLED, purgeAt: { lte: now }, ...(cursor ? { id: { gt: cursor } } : {}),
+      }, orderBy: { id: 'asc' }, take: 50, include: { cdnConfig: true } });
+      for (const file of files) {
+        summary.scanned++;
+        try { await this.purgeFile(file, undefined, 'retention'); summary.purged++; }
+        catch { summary.failed++; }
+      }
+      if (files.length < 50) { this.retentionCursor = ''; break; }
+      cursor = files[files.length - 1].id;
+      this.retentionCursor = cursor;
+    }
+    return summary;
   }
 
   async findFileForUser(fileId: string, user: RequestUser, requireAdmin = false): Promise<FileWithStorage> {
@@ -3259,7 +3290,8 @@ export class FilesService {
 
   private async purgeFile(file: FileWithStorage, actorId?: string, source?: string): Promise<void> {
     const expected = { id: file.id, projectId: file.projectId, storageKey: file.storageKey, currentVersion: file.currentVersion };
-    const removedKeys = await this.storageService.removeFileObjects(file.id, { expectedHead: expected });
+    const removedKeys = await this.storageService.removeFileObjects(file.id, { expectedHead: expected,
+      ...(source === 'retention' ? { expectedExpiry: { deletedAt: file.deletedAt, purgeAt: file.purgeAt, asOf: new Date() } } : {}) });
 
     // Hard-delete the record so the file truly disappears from active and recycle
     // listings. Share links are removed by the ShareLink.fileId cascade; count them
@@ -3984,6 +4016,11 @@ export class FilesService {
     } as T) as unknown as Prisma.ShareLinkGetPayload<T> | null;
   }
 
+  private async toAdminShareResponses(shares: Parameters<FilesService['toShareResponse']>[0][], publicBaseUrl?: string): Promise<Record<string, unknown>[]> {
+    const storages = await this.storageService.describeDownloadStorages(shares.map(share => share.file));
+    return shares.map(share => this.toShareResponse(share, publicBaseUrl, true, storages.get(share.file.id) ?? null));
+  }
+
   private toShareResponse(
     share: {
       id: string;
@@ -4003,6 +4040,7 @@ export class FilesService {
     },
     publicBaseUrl?: string,
     includeAdminAccessInfo = false,
+    accessStorage = share.file.cdnConfig,
   ): Record<string, unknown> {
     const siteUrl = resolvePublicBaseUrl(this.configService.get<string>('PUBLIC_URL'), publicBaseUrl);
     const appPublicUrl = siteUrl;
@@ -4018,12 +4056,12 @@ export class FilesService {
       fileName: share.file.originalName,
       fileSize: Number(share.file.size),
       ...(includeAdminAccessInfo ? {
-        storageProvider: share.file.cdnConfig?.provider ?? null,
-        storageConfigName: share.file.cdnConfig?.name ?? null,
+        storageProvider: accessStorage?.provider ?? null,
+        storageConfigName: accessStorage?.name ?? null,
         accessRoute: getAdminAccessRoute(
-          share.file.cdnConfig?.provider,
-          share.file.cdnConfig?.config && typeof share.file.cdnConfig.config === 'object' && !Array.isArray(share.file.cdnConfig.config)
-            ? share.file.cdnConfig.config as Record<string, unknown>
+          accessStorage?.provider,
+          accessStorage?.config && typeof accessStorage.config === 'object' && !Array.isArray(accessStorage.config)
+            ? accessStorage.config as Record<string, unknown>
             : null,
         ),
       } : {}),

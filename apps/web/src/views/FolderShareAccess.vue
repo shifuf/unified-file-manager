@@ -45,12 +45,9 @@
       </div>
       </template>
 
-      <footer v-if="brand.footerText || brand.showPoweredBy" class="share-footer">
-        <div v-if="brand.footerText">{{ brand.footerText }}</div>
-        <div v-if="brand.showPoweredBy" class="powered-by">由统一文件管理提供</div>
-      </footer>
     </section>
     </div>
+    <SiteFooter :text="brand.footerText" :show-brand="brand.showPoweredBy" :site-name="siteName" />
   </main>
 </template>
 
@@ -62,6 +59,7 @@ import { useRoute } from 'vue-router';
 import { http } from '@/api/http';
 import ShareBrandHeader from '@/components/ShareBrandHeader.vue';
 import SharePageState from '@/components/SharePageState.vue';
+import SiteFooter from '@/components/SiteFooter.vue';
 import type { SharePageBrand } from '@/types';
 import { saveBlob } from '@/utils/io';
 import { DEFAULT_SHARE_BRAND as DEFAULT_BRAND, getPublicShareFailure, getShareSiteName, readPublicShareMessage } from '@/utils/public-share';
@@ -267,18 +265,6 @@ onBeforeUnmount(() => {
 .muted {
   color: #94a3b8;
   font-size: 12px;
-}
-.share-footer {
-  margin-top: 18px;
-  padding-top: 12px;
-  border-top: 1px solid #e2e8f0;
-  color: #94a3b8;
-  font-size: 12px;
-  text-align: center;
-  line-height: 1.5;
-}
-.powered-by {
-  margin-top: 4px;
 }
 @media (max-width: 640px) {
   .share-content { padding: 24px 12px; }

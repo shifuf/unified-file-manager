@@ -18,7 +18,8 @@ docker compose --profile full up -d --build
 
 - 后台：`${PUBLIC_URL}${ADMIN_LOGIN_PATH}`（默认 `/console-login`）
 - 改登录路径：改 `ADMIN_LOGIN_PATH` 后 `docker compose restart web`
-- 库初始化：单次迁移 `20260719000000_init`。旧库需先 `docker volume rm ufm_mysql_data` 再装
+- 数据库：API 启动时使用 `prisma migrate deploy` 执行尚未应用的完整迁移链；空库和已有库使用同一流程。升级前备份，保留原数据库卷，不删除旧库。
+- 版本与更新说明见 `CHANGELOG.md`。单一结构 SQL、校验清单及安全导入边界见 `scripts/sql/README.md`；已有数据库不要导入 `schema.sql`。
 
 ## 不包含
 

@@ -184,7 +184,7 @@ function resetTotpDialog(): void {
 <style scoped>
 .login-page {
   display: grid;
-  min-height: 100vh;
+  min-height: 0;
   place-items: center;
   padding: 24px;
   background:

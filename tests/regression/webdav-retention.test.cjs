@@ -26,6 +26,7 @@ function fixture() {
     managedFolder: { findFirst: async ({ where }) => where.path === 'backups' ? { id: 'folder' } : null, findMany: async () => [{ path: 'backups' }] },
     $queryRaw: async () => [],
     cdnConfig: { findMany: async () => [file.cdnConfig] },
+    fileDerivative: { findFirst: async () => null },
     storageReplica: { findMany: async () => [], createMany: async () => ({ count: 0 }), updateMany: async () => ({ count: 0 }), deleteMany: async () => ({ count: 0 }) },
   };
   db.$transaction = async callback => callback(db);

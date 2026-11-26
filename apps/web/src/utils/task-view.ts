@@ -22,6 +22,19 @@ export function canDeleteTask(task: { status: string }): boolean {
   return ['COMPLETED', 'FAILED', 'CANCELED'].includes(task.status);
 }
 
+export function canRetryTask(task: { status: string; type: string; projectId?: string | null; detail?: unknown; result?: unknown }): boolean {
+  if (task.status !== 'FAILED') return false;
+  if (['STORAGE_MIGRATION', 'STORAGE_REPLICA_SYNC'].includes(task.type)) return true;
+  if (task.type !== 'FILE_BATCH_PURGE' || !task.projectId) return false;
+  const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+  const validIds = (value: unknown): boolean => Array.isArray(value) && value.length > 0 && value.length <= 1000
+    && value.every(id => typeof id === 'string' && !!id.trim() && id.length <= 128);
+  const detail = record(task.detail), result = record(task.result);
+  return validIds(detail.failedFileIds) || validIds(detail.fileIds)
+    || [detail.failures, result.failures].some(failures => Array.isArray(failures) && validIds(failures.map(failure => record(failure).fileId)));
+}
+
 export function taskTagType(status: string): 'success' | 'warning' | 'danger' | 'info' {
   if (status === 'COMPLETED') return 'success';
   if (status === 'FAILED') return 'danger';

@@ -828,12 +828,18 @@
                 <el-tag :type="shareStatusMeta(row.status).type" size="small">{{ shareStatusMeta(row.status).label }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="220" :fixed="pinActions ? 'right' : false">
+            <el-table-column label="操作" width="280" :fixed="pinActions ? 'right' : false">
               <template #default="{ row }">
                 <el-button link type="primary" @click="copyText(row.url)">复制</el-button>
                 <el-button link type="primary" @click="copyText(row.downloadUrl)">直链</el-button>
-                <el-button link type="primary" @click="editShare(row)">编辑</el-button>
-                <el-button v-if="row.enabled" link type="danger" @click="disableShare(row.id)">停用</el-button>
+                <el-button link type="primary" :disabled="pendingShareIds.has(row.id)" @click="editShare(row)">编辑</el-button>
+                <el-button
+                  link
+                  :type="row.enabled ? 'warning' : 'success'"
+                  :disabled="pendingShareIds.has(row.id)"
+                  @click="setShareEnabled(row, !row.enabled)"
+                >{{ row.enabled ? '停用' : '启用' }}</el-button>
+                <el-button link type="danger" :disabled="pendingShareIds.has(row.id)" @click="deleteShare(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -1013,6 +1019,7 @@ async function readDialog<T>(key: string, fetch: (signal: globalThis.AbortSignal
 const uploading = toRef(uploadQueueState, 'active');
 const editing = ref(false);
 const sharing = ref(false);
+const pendingShareIds = ref(new Set<string>());
 const moving = ref(false);
 const uploadProgress = toRef(uploadQueueState, 'progress');
 const isDragging = ref(false);
@@ -1043,7 +1050,7 @@ const pageTitle = computed(() =>
 );
 const pageSubtitle = computed(() =>
   isRecycleBin.value
-    ? '本地及云存储对象保留，可恢复文件；确认彻底删除后才清理全部存储副本，不会到期自动删除。'
+    ? '保留期内可恢复文件；系统按回收站保留天数定期彻底清理到期文件及存储副本，删除失败会保留并重试。'
     : '汇总查看全部项目文件，也可以选择单个项目后上传、预览、下载和回收文件。'
 );
 const folderBreadcrumbs = computed(() => {
@@ -2343,17 +2350,54 @@ function validateShareForm(isEditing: boolean): boolean {
   return true;
 }
 
-async function disableShare(shareId: string): Promise<void> {
-  if (!shareFile.value) {
-    return;
-  }
+async function setShareEnabled(share: ShareLink, enabled: boolean): Promise<void> {
+  if (!shareFile.value || pendingShareIds.value.has(share.id)) return;
   const current = captureProjectContext();
   const fileId = shareFile.value.id;
+  pendingShareIds.value.add(share.id);
+  try {
+    if (!enabled) {
+      await ElMessageBox.confirm('停用后该分享链接无法继续访问，可随时重新启用。', '停用分享', {
+        type: 'warning',
+        confirmButtonText: '停用',
+        cancelButtonText: '取消',
+      });
+    }
+    if (!current() || shareFile.value?.id !== fileId) return;
+    await fileApi.updateShare(share.id, { enabled });
+    if (!current() || shareFile.value?.id !== fileId) return;
+    if (editingShareId.value === share.id) shareForm.enabled = enabled;
+    ElMessage.success(enabled ? '分享链接已启用。' : '分享链接已停用。');
+    await loadShares(fileId);
+  } catch {
+    // Confirmation dismissal is silent; HTTP errors are shown by the interceptor.
+  } finally {
+    pendingShareIds.value.delete(share.id);
+  }
+}
 
-  await fileApi.disableShare(shareId);
-  if (!current()) return;
-  ElMessage.success('分享链接已停用。');
-  await loadShares(fileId);
+async function deleteShare(share: ShareLink): Promise<void> {
+  if (!shareFile.value || pendingShareIds.value.has(share.id)) return;
+  const current = captureProjectContext();
+  const fileId = shareFile.value.id;
+  pendingShareIds.value.add(share.id);
+  try {
+    await ElMessageBox.confirm('删除后该分享链接将无法访问，分享记录不可恢复。只删除分享记录，不会删除源文件。', '删除分享', {
+      type: 'warning',
+      confirmButtonText: '删除分享',
+      cancelButtonText: '取消',
+    });
+    if (!current() || shareFile.value?.id !== fileId) return;
+    await fileApi.deleteShare(share.id);
+    if (!current() || shareFile.value?.id !== fileId) return;
+    if (editingShareId.value === share.id) resetShareForm();
+    ElMessage.success('分享已删除，源文件已保留。');
+    await loadShares(fileId);
+  } catch {
+    // Confirmation dismissal is silent; HTTP errors are shown by the interceptor.
+  } finally {
+    pendingShareIds.value.delete(share.id);
+  }
 }
 
 async function download(file: ManagedFile): Promise<void> {

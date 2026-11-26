@@ -620,6 +620,9 @@ export const fileApi = {
   disableShare(shareId: string) {
     return http.delete<unknown, { success: boolean }>(`/file-shares/${shareId}`);
   },
+  deleteShare(shareId: string) {
+    return http.delete<unknown, { success: boolean }>(`/file-shares/${shareId}/permanent`);
+  },
   listAllShares(params: {
     projectId?: string;
     keyword?: string;

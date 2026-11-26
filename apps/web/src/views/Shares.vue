@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">分享管理</h1>
-        <p class="page-subtitle">集中查看分享链接、有效期、下载次数、自定义后缀与访问控制。</p>
+        <p class="page-subtitle">集中查看分享链接、有效期、下载次数、自定义后缀与访问控制。存储来源优先使用可用副本，访问时可自动回退。</p>
       </div>
       <el-button :icon="Refresh" @click="reload">刷新</el-button>
     </div>
@@ -38,7 +38,7 @@
               <div class="file-cell">
                 <span>{{ row.fileName }}</span>
                 <span class="muted">{{ row.projectName || row.projectId }} · {{ formatSize(row.fileSize) }}</span>
-                <span v-if="row.accessRoute" class="muted">{{ row.storageConfigName || row.storageProvider }} · {{ row.accessRoute.label }} · {{ row.accessRoute.host || '无加速域名' }}</span>
+                <span v-if="row.accessRoute" class="muted">优先来源：{{ row.storageConfigName || row.storageProvider }} · {{ row.accessRoute.label }} · {{ row.accessRoute.host || '无加速域名' }}</span>
               </div>
             </template>
           </el-table-column>
@@ -68,12 +68,18 @@
               <el-tag :type="shareStatusMeta(row.status).type">{{ shareStatusMeta(row.status).label }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="250">
+          <el-table-column label="操作" :fixed="pinActions ? 'right' : false" width="310">
             <template #default="{ row }">
               <el-button link type="primary" @click="copyText(row.url)">复制分享页</el-button>
               <el-button link type="primary" @click="copyText(row.downloadUrl)">复制直链</el-button>
-              <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
-              <el-button v-if="row.enabled" link type="danger" @click="disableShare(row)">停用</el-button>
+              <el-button link type="primary" :disabled="pendingShareIds.has(row.id)" @click="openEdit(row)">编辑</el-button>
+              <el-button
+                link
+                :type="row.enabled ? 'warning' : 'success'"
+                :disabled="pendingShareIds.has(row.id)"
+                @click="setShareEnabled(row, !row.enabled)"
+              >{{ row.enabled ? '停用' : '启用' }}</el-button>
+              <el-button link type="danger" :disabled="pendingShareIds.has(row.id)" @click="deleteShare(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -208,6 +214,7 @@ const route = useRoute();
 const router = useRouter();
 const loading = ref(false);
 const submitting = ref(false);
+const pendingShareIds = ref(new Set<string>());
 const editVisible = ref(false);
 const projects = ref<Project[]>([]);
 const editingShare = ref<ShareLink | null>(null);
@@ -364,15 +371,46 @@ async function submitEdit(): Promise<void> {
   }
 }
 
-async function disableShare(share: ShareLink): Promise<void> {
-  await ElMessageBox.confirm('停用后该分享链接无法继续访问。', '停用分享', {
-    type: 'warning',
-    confirmButtonText: '停用',
-    cancelButtonText: '取消',
-  });
-  await fileApi.disableShare(share.id);
-  ElMessage.success('分享已停用。');
-  await reload();
+async function setShareEnabled(share: ShareLink, enabled: boolean): Promise<void> {
+  if (pendingShareIds.value.has(share.id)) return;
+  pendingShareIds.value.add(share.id);
+  try {
+    if (!enabled) {
+      await ElMessageBox.confirm('停用后该分享链接无法继续访问，可随时重新启用。', '停用分享', {
+        type: 'warning',
+        confirmButtonText: '停用',
+        cancelButtonText: '取消',
+      });
+    }
+    await fileApi.updateShare(share.id, { enabled });
+    ElMessage.success(enabled ? '分享已启用。' : '分享已停用。');
+    await reload();
+  } catch {
+    // Confirmation dismissal is silent; HTTP errors are shown by the interceptor.
+  } finally {
+    pendingShareIds.value.delete(share.id);
+  }
+}
+
+async function deleteShare(share: ShareLink): Promise<void> {
+  if (pendingShareIds.value.has(share.id)) return;
+  pendingShareIds.value.add(share.id);
+  try {
+    await ElMessageBox.confirm('删除后该分享链接将无法访问，分享记录不可恢复。只删除分享记录，不会删除源文件。', '删除分享', {
+      type: 'warning',
+      confirmButtonText: '删除分享',
+      cancelButtonText: '取消',
+    });
+    await fileApi.deleteShare(share.id);
+    if (editingShare.value?.id === share.id) editVisible.value = false;
+    if (pageResult.items.length === 1 && pageResult.page > 1) pageResult.page--;
+    ElMessage.success('分享已删除，源文件已保留。');
+    await reload();
+  } catch {
+    // Confirmation dismissal is silent; HTTP errors are shown by the interceptor.
+  } finally {
+    pendingShareIds.value.delete(share.id);
+  }
 }
 
 onMounted(async () => {

@@ -32,9 +32,6 @@
       </div>
     </section>
 
-    <footer class="home-footer">
-      <span>统一文件管理系统</span>
-    </footer>
   </main>
 </template>
 
@@ -45,7 +42,6 @@
 <style scoped>
 .home {
   display: flex;
-  min-height: 100vh;
   flex-direction: column;
   background: var(--color-background);
 }
@@ -139,13 +135,6 @@
   color: #64748b;
   font-size: 13px;
   line-height: 1.7;
-}
-
-.home-footer {
-  padding: 22px;
-  color: #94a3b8;
-  font-size: 13px;
-  text-align: center;
 }
 
 @media (max-width: 760px) {

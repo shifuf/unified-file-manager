@@ -20,7 +20,7 @@ function fixture(provider = 'CLOUDFLARE_R2') {
     fileVersion: { findFirst: async () => null }, fileDerivative: { findFirst: async () => null },
     storageReplica: {
       createMany: async () => ({count:0}),
-      findMany: async () => rows,
+      findMany: async ({where}={}) => rows.filter(row=>!where?.storageKey?.in||where.storageKey.in.includes(row.storageKey)),
       updateMany: async ({data}) => { rows.forEach(r=>Object.assign(r,data)); return {count:rows.length}; },
       deleteMany: async () => {rows.length=0;return {count:8};},
       findFirst: async () => rows.find(r=>r.status==='DELETING') || null,
@@ -31,7 +31,7 @@ function fixture(provider = 'CLOUDFLARE_R2') {
   const registry={adapter:()=>({remove:async(c,k)=>{assert.equal(transactionDepth,0,'provider network must run outside DB locks');if(removeGate && c.id==='r2'){const gate=removeGate;removeGate=null;removeStarted();await gate;} if(failCloud&&c.id==='r2')throw Error('secret remote error');objects.delete(c.id+':'+k);},objectExists:async(c,k)=>objects.has(c.id+':'+k)})};
   const storage=new StorageService({get:()=>undefined},db,registry,undefined,{releaseDeletedObject:async()=>{}});
   const service=Object.assign(Object.create(FilesService.prototype),{prisma:db,storageService:storage,auditService:{write:async()=>{}},eventBus:{emit(){}},logger:{warn(){}}});
-  return {file,objects,rows,storage,service,setShared:()=>shared={id:'other'},setFailure:v=>failCloud=v,isDeleted:()=>deleted,
+  return {file,objects,rows,storage,service,db,setShared:()=>shared={id:'other'},setFailure:v=>failCloud=v,isDeleted:()=>deleted,
     pauseRemove:()=>{removeGate=new Promise(resolve=>releaseRemove=resolve);return new Promise(resolve=>removeStarted=resolve);},resumeRemove:()=>releaseRemove?.()};
 }
 
@@ -88,4 +88,21 @@ test('permanent deletion retains objects referenced by another file',async()=>{
 test('active replica upload blocks physical deletion until its lease finishes',async()=>{
   const f=fixture();f.rows[1].leaseOwner='worker';f.rows[1].leaseUntil=new Date(Date.now()+60000);
   await assert.rejects(f.service.purgeFile(f.file),/同步.*重试/);assert.equal(f.objects.size,8);assert.equal(f.isDeleted(),false);
+});
+
+test('permanent deletion preserves segments referenced by another HLS manifest',async()=>{
+  const f=fixture();f.db.fileDerivative.findFirst=async({where})=>where.kind==='HLS'?{id:'other-hls'}:null;
+  await f.service.purgeFile(f.file);assert(f.objects.has('local:p/hls/part.ts'));assert(f.objects.has('r2:p/hls/part.ts'));
+});
+
+test('disabled storage still permits authorized physical deletion with its retained configuration',async()=>{
+  const f=fixture();f.rows.forEach(row=>row.config.enabled=false);
+  await f.service.purgeFile(f.file);assert.equal(f.objects.size,0);assert.equal(f.isDeleted(),true);
+});
+
+test('retention cannot purge a stale expiry after restore and recycle renews its deadline',async()=>{
+  const f=fixture();f.file.currentVersion=1;f.file.deletedAt=new Date('2020-01-01');f.file.purgeAt=new Date('2020-01-02');
+  const selected={...f.file};f.file.deletedAt=new Date();f.file.purgeAt=new Date(Date.now()+86400000);
+  await assert.rejects(f.service.purgeFile(selected,undefined,'retention'),e=>e.getStatus?.()===409);
+  assert.equal(f.isDeleted(),false);assert.equal(f.objects.size,8);assert.equal(f.file.status,'RECYCLED');
 });

@@ -98,7 +98,8 @@ export class StorageService {
   /** Freeze indexed copies before touching bytes. Keep the index on failure so retry
    * can finish even after some providers have already removed their objects. */
   async removeFileObjects(fileId: string, options: { historyOnly?: boolean; allowActive?: boolean;
-    expectedHead?: { storageKey: string; currentVersion: number } } = {}): Promise<string[]> {
+    expectedHead?: { storageKey: string; currentVersion: number };
+    expectedExpiry?: { deletedAt: Date | null; purgeAt: Date | null; asOf: Date } } = {}): Promise<string[]> {
     const plan = await this.prisma.$transaction(async tx => {
       const initial = await tx.managedFile.findUnique({ where: { id: fileId } });
       if (!initial) return { projectId: '', keys: [] as string[], versionIds: [] as string[], targets: [] as Array<{ config: CdnConfig; key: string }> };
@@ -113,6 +114,11 @@ export class StorageService {
       }
       if (options.expectedHead && (file.storageKey !== options.expectedHead.storageKey || file.currentVersion !== options.expectedHead.currentVersion)) {
         throw new ConflictException('文件内容已变化，请刷新后重试彻底删除。');
+      }
+      if (options.expectedExpiry && (!file.purgeAt || file.purgeAt > options.expectedExpiry.asOf
+        || file.purgeAt.getTime() !== options.expectedExpiry.purgeAt?.getTime()
+        || file.deletedAt?.getTime() !== options.expectedExpiry.deletedAt?.getTime())) {
+        throw new ConflictException('文件回收时间已变化，保留新的回收站期限。');
       }
       const versions = options.historyOnly ? [...file.versions].sort((a, b) => b.version - a.version).slice(3) : file.versions;
       const versionIds = options.historyOnly ? versions.map(version => version.id) : [];
@@ -147,7 +153,15 @@ export class StorageService {
         const shared = await tx.managedFile.findFirst({ where: { id: { not: fileId }, OR: [
           { storageKey: key }, { versions: { some: { storageKey: key } } }, { derivatives: { some: { storageKey: key } } },
         ] }, select: { id: true } });
-        if (shared) origins.delete(key);
+        if (shared) { origins.delete(key); continue; }
+        const segments = key.split('/');
+        const membership = segments.slice(0, -1).map((_, index) => ({ AND: [
+          { meta: { path: '$.segmentPrefix', equals: segments.slice(0, index + 1).join('/') } },
+          { meta: { path: '$.files', array_contains: segments.slice(index + 1).join('/') } },
+        ] }));
+        if (membership.length && await tx.fileDerivative.findFirst({ where: {
+          fileId: { not: fileId }, kind: 'HLS', OR: membership,
+        }, select: { id: true } })) origins.delete(key);
       }
       const keys = [...origins.keys()];
       await tx.$queryRaw`SELECT id FROM StorageReplica WHERE projectId = ${file.projectId} FOR UPDATE`;
@@ -206,6 +220,11 @@ export class StorageService {
 
   async pruneFileVersions(fileId: string): Promise<void> {
     await this.removeFileObjects(fileId, { historyOnly: true });
+  }
+
+  async describeDownloadStorages(files: StorageFileInput[]): Promise<Map<string, CdnConfig | null>> {
+    const replicas = this.replicas ?? new ReplicaService(this.configService, this.prisma, this.registry, this.limits);
+    return replicas.describeDownloadStorages(files);
   }
 
   async deleteDavFile(fileId: string): Promise<void> {

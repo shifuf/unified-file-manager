@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
 
 import { LifecycleModule } from '../lifecycle/lifecycle.module';
+import { FilesModule } from '../files/files.module';
 import { PrismaModule } from '../prisma/prisma.module';
 import { MaintenanceService } from './maintenance.service';
 
 @Module({
-  imports: [PrismaModule, LifecycleModule],
+  imports: [PrismaModule, LifecycleModule, FilesModule],
   providers: [MaintenanceService],
 })
 export class MaintenanceModule {}

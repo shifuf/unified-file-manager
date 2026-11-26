@@ -97,6 +97,7 @@ if (-not $OutputRoot) {
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$applicationVersion = (Get-Content -LiteralPath (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
 $packageName = "ufm-deploy-$stamp"
 $packageDir = Join-Path $OutputRoot $packageName
 
@@ -133,6 +134,7 @@ $rootFiles = @(
   ".dockerignore",
   ".env.example",
   "README.md",
+  "CHANGELOG.md",
   "LICENSE"
 )
 foreach ($file in $rootFiles) {
@@ -167,8 +169,6 @@ Ensure-Dir $webDst
 
 Copy-FileSafe (Join-Path $webSrc "package.json") (Join-Path $webDst "package.json")
 Copy-FileSafe (Join-Path $webSrc "tsconfig.json") (Join-Path $webDst "tsconfig.json")
-Copy-FileSafe (Join-Path $webSrc "tsconfig.app.json") (Join-Path $webDst "tsconfig.app.json")
-Copy-FileSafe (Join-Path $webSrc "tsconfig.node.json") (Join-Path $webDst "tsconfig.node.json")
 Copy-FileSafe (Join-Path $webSrc "vite.config.ts") (Join-Path $webDst "vite.config.ts")
 Copy-FileSafe (Join-Path $webSrc "index.html") (Join-Path $webDst "index.html")
   Copy-FileSafe (Join-Path $webSrc "docker-entrypoint.sh") (Join-Path $webDst "docker-entrypoint.sh")
@@ -206,6 +206,7 @@ Write-Step "copy helper scripts"
 $scriptsDst = Join-Path $packageDir "scripts"
 Ensure-Dir $scriptsDst
 Copy-FileSafe (Join-Path $repoRoot "scripts\generate-crypto-key.ps1") (Join-Path $scriptsDst "generate-crypto-key.ps1")
+Copy-TreeFiltered -SourceDir (Join-Path $repoRoot "scripts\sql") -DestDir (Join-Path $scriptsDst "sql")
 
 Write-Step "create data placeholders"
   # Named volumes hold runtime data; only keep empty data/ placeholder
@@ -229,6 +230,7 @@ if (Test-Path -LiteralPath $deployTemplate) {
 
 Write-Step "write package-manifest.json"
 $manifest = [ordered]@{
+  applicationVersion = $applicationVersion
   packageName = $packageName
   generatedAt = (Get-Date).ToString("o")
   repoRoot = $repoRoot

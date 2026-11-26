@@ -4,11 +4,29 @@ const path = require('node:path');
 require('ts-node').register({ project: path.resolve(__dirname, '../../apps/api/tsconfig.json'), transpileOnly: true });
 const { FilesService } = require('../../apps/api/src/files/files.service.ts');
 
-test('expired recycle entries cannot be physically purged without confirmation', async () => {
-  const service=Object.create(FilesService.prototype);let removed=0;
-  Object.assign(service,{prisma:{managedFile:{findMany:async()=>[{id:'expired',status:'RECYCLED',purgeAt:new Date(0)}]}},purgeFile:async()=>{removed++;}});
-  const result=await service.purgeExpiredRecycledFiles();
-  assert.equal(removed,0);assert.deepEqual(result,{scanned:0,purged:0,failed:0});
+test('retention cleanup purges expired recycle entries, preserves future and active files, and retries failures', async () => {
+  const service=Object.create(FilesService.prototype), removed=[], queries=[];
+  const rows=[
+    {id:'expired',status:'RECYCLED',purgeAt:new Date(0)},
+    {id:'retry',status:'RECYCLED',purgeAt:new Date(0)},
+    {id:'future',status:'RECYCLED',purgeAt:new Date(Date.now()+86400000)},
+    {id:'active',status:'ACTIVE',purgeAt:new Date(0)},
+  ];
+  let fail=true;
+  Object.assign(service,{
+    prisma:{managedFile:{findMany:async args=>{queries.push(args);return rows.filter(row=>row.status===args.where.status&&row.purgeAt<=args.where.purgeAt.lte);}}},
+    purgeFile:async(file,actor,source)=>{
+      assert.equal(actor,undefined);assert.equal(source,'retention');
+      if(file.id==='retry'&&fail)throw Error('provider offline');
+      removed.push(file.id);rows.splice(rows.findIndex(row=>row.id===file.id),1);
+    },
+  });
+  assert.deepEqual(await service.purgeExpiredRecycledFiles(),{scanned:2,purged:1,failed:1});
+  assert.deepEqual(removed,['expired']);assert.deepEqual(rows.map(row=>row.id),['retry','future','active']);
+  fail=false;
+  assert.deepEqual(await service.purgeExpiredRecycledFiles(),{scanned:1,purged:1,failed:0});
+  assert.deepEqual(removed,['expired','retry']);assert.deepEqual(rows.map(row=>row.id),['future','active']);
+  assert.ok(queries.every(query=>query.where.status==='RECYCLED'&&query.take<=100));
 });
 
 for(const provider of ['QINIU','UPYUN','ALIYUN','S3','CLOUDFLARE_R2']) {

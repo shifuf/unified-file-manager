@@ -1,6 +1,6 @@
 {
   "name": "unified-file-manager",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "license": "MIT",
   "description": "Multi-project unified file management platform.",
@@ -26,6 +26,9 @@
     "format": "prettier --write .",
     "prisma:generate": "npm --workspace apps/api run prisma:generate",
     "db:migrate": "npm --workspace apps/api run db:migrate",
+    "db:deploy": "npm --workspace apps/api run db:deploy",
+    "db:sql": "node scripts/sql/generate-schema.cjs",
+    "db:sql:check": "node scripts/sql/generate-schema.cjs --check",
     "db:seed": "npm --workspace apps/api run db:seed",
     "package:deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-deploy.ps1",
     "package:deploy:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-deploy.ps1 -SkipBuild",

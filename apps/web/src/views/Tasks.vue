@@ -60,7 +60,7 @@
               <el-button v-if="row.type === 'STORAGE_MIGRATION' && row.status === 'RUNNING'" link type="warning" @click="pauseTask(row)">暂停</el-button>
               <el-button v-if="row.type === 'STORAGE_MIGRATION' && row.status === 'PAUSED'" link type="success" @click="resumeTask(row)">继续</el-button>
               <el-button v-if="['RUNNING', 'PAUSED'].includes(row.status)" link type="danger" @click="cancelTask(row)">取消</el-button>
-              <el-button v-if="row.status === 'FAILED'" link type="primary" @click="retryTask(row)">重试</el-button>
+              <el-button v-if="canRetryTask(row)" link type="primary" @click="retryTask(row)">重试</el-button>
               <el-button v-if="canDeleteTask(row)" link type="danger" :disabled="deleting" @click="removeTask(row)">删除</el-button>
             </template>
           </el-table-column>
@@ -126,7 +126,7 @@ import TableViewport from '@/components/TableViewport.vue';
 
 import { projectApi, taskApi } from '@/api/modules';
 import type { PageResult, Project, TaskItem } from '@/types';
-import { canDeleteTask, taskStatusLabel, taskStatusOptions, taskTagType, taskTypeLabel, taskTypeOptions } from '@/utils/task-view';
+import { canDeleteTask, canRetryTask, taskStatusLabel, taskStatusOptions, taskTagType, taskTypeLabel, taskTypeOptions } from '@/utils/task-view';
 
 const route = useRoute();
 const router = useRouter();
@@ -188,7 +188,7 @@ async function resumeTask(task: TaskItem): Promise<void> {
 
 async function retryTask(task: TaskItem): Promise<void> {
   await taskApi.retry(task.id);
-  ElMessage.success('任务已登记重试。');
+  ElMessage.success('重试任务已进入执行队列，请查看实际进度和结果。');
   await reload();
 }
 

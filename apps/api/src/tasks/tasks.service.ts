@@ -6,6 +6,7 @@ import type { RequestUser } from '../common/types/request-user.type';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProjectAccessService } from '../projects/project-access.service';
 import { ListTasksDto } from './dto/list-tasks.dto';
+import { purgeRetryFileIds } from './file-purge.util';
 
 export interface CreateTaskParams {
   projectId?: string;
@@ -206,7 +207,13 @@ export class TasksService {
       : [];
     const migrationRetry = task.type === 'STORAGE_MIGRATION';
     const replicaRetry = task.type === 'STORAGE_REPLICA_SYNC';
-    const scheduledRetry = migrationRetry || replicaRetry;
+    const purgeRetry = task.type === 'FILE_BATCH_PURGE';
+    if (!migrationRetry && !replicaRetry && !purgeRetry) {
+      throw new BadRequestException('此任务不支持直接重试，请回到对应功能页重新执行。');
+    }
+    if (purgeRetry && !task.projectId) {
+      throw new BadRequestException('此删除任务缺少项目和文件清单，请回到回收站重新选择文件。');
+    }
     const retryDetail: Prisma.InputJsonValue = migrationRetry
       ? {
           ...originalDetail,
@@ -226,22 +233,27 @@ export class TasksService {
           ? { ...originalDetail, phase: 'SCANNING', cursor: '', scanned: 0, queued: 0, rescanRequested: false, retryReplicas: true,
               replicaTotal: 0, replicaReady: 0, replicaPending: 0, replicaFailed: 0, retriedFromTaskId: task.id }
           : { ...originalDetail, cursor: String(originalDetail.cursor ?? ''), retriedFromTaskId: task.id }
-        : { retriedFromTaskId: task.id, originalDetail: task.detail };
+        : {
+            retriedFromTaskId: task.id,
+            fileIds: purgeRetryFileIds(originalDetail, this.asRecord(task.result)),
+            actorId: user.id,
+            nextIndex: 0,
+            deleted: 0,
+            alreadyAbsent: 0,
+            failedFileIds: [],
+            failures: [],
+          };
     const retried = await this.prisma.task.create({
       data: {
         projectId: task.projectId,
         type: task.type,
         title: `${task.title}（重试）`,
-        status: scheduledRetry ? 'RUNNING' : 'COMPLETED',
-        progress: scheduledRetry ? 0 : 100,
+        status: 'RUNNING',
+        progress: 0,
         leaseOwner: null,
         leaseUntil: null,
         detail: retryDetail,
-        result: scheduledRetry ? undefined : {
-          retryNotice: '该任务已重新登记；涉及外部副作用的任务请在对应功能页重新执行。',
-          originalError: task.error,
-        },
-        finishedAt: scheduledRetry ? null : new Date(),
+        finishedAt: null,
       },
       include: { project: { select: { id: true, name: true } } },
     });

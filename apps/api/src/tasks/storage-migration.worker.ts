@@ -75,6 +75,14 @@ export class StorageMigrationWorker implements OnModuleInit, OnModuleDestroy {
     const task = await this.prisma.task.findUnique({ where: { id: candidate.id } });
     if (!task || task.status !== 'RUNNING') return;
     const detail = this.parseDetail(task.detail);
+    if (!detail.sourceConfigId || !detail.targetConfigId) {
+      await this.prisma.task.updateMany({
+        where: { id: task.id, status: 'RUNNING', leaseOwner: this.workerId },
+        data: { status: 'FAILED', error: '迁移任务缺少有效的来源或目标存储配置，请重新创建迁移任务。',
+          finishedAt: new Date(), leaseOwner: null, leaseUntil: null },
+      });
+      return;
+    }
     const batchSize = Math.min(100, Math.max(1, detail.batchSize ?? 20));
     const retryIds = detail.retryFileIds;
     const files = retryIds
@@ -101,21 +109,28 @@ export class StorageMigrationWorker implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    if (files.length === 0) {
+    // Retry checkpoints count requested IDs, not returned DB rows. An absent
+    // record is an idempotent skip, not evidence that later IDs are finished.
+    const attempts = retryIds
+      ? retryIds.slice(detail.retryIndex ?? 0, (detail.retryIndex ?? 0) + batchSize)
+        .map(fileId => ({ fileId, file: files.find(file => file.id === fileId) }))
+      : files.map(file => ({ fileId: file.id, file }));
+    if (attempts.length === 0) {
       await this.finish(task.id, detail);
       return;
     }
 
-    for (const file of files) {
+    for (const { fileId, file } of attempts) {
       const latestTask = await this.prisma.task.findUnique({ where: { id: task.id }, select: { status: true, leaseOwner: true } });
       if (!latestTask || latestTask.status !== 'RUNNING' || latestTask.leaseOwner !== this.workerId) return;
       const base = this.progressOnly(detail);
       let outcome: 'migrated' | 'skipped' | 'failed' = 'failed';
       let errorMessage: string | undefined;
       try {
-        if (file.cdnConfigId !== detail.sourceConfigId || !file.cdnConfig) {
+        if (!file || file.cdnConfigId !== detail.sourceConfigId) {
           outcome = 'skipped';
         } else {
+          if (!file.cdnConfig) throw new Error('来源存储配置不可用，文件尚未迁移。');
           const fileInput: StorageFileInput = {
             id: file.id,
             projectId: file.projectId,
@@ -137,8 +152,8 @@ export class StorageMigrationWorker implements OnModuleInit, OnModuleDestroy {
         errorMessage = error instanceof Error ? error.message : String(error);
       }
       const next = recordMigrationAttempt(base, {
-        fileId: file.id,
-        fileName: file.originalName,
+        fileId,
+        fileName: file?.originalName,
         outcome,
         error: errorMessage,
       });

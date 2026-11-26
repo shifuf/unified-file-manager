@@ -34,7 +34,11 @@ npm run plugins:install
 
 指定 API 地址示例：`npm run plugins:install -- --url http://127.0.0.1:3000`。远程 API 必须使用 HTTPS。重复执行会安装当前源码中的插件版本，失败时会明确退出，修复后可重试。
 
-当前发布：**v0.2.2**。变更见 [更新记录](CHANGELOG.md)，自动化回归及真实云验收见 [测试说明](tests/acceptance/README.md)。
+当前正式版本：**v0.3.0**（2026-11-26）。变更见 [更新记录](CHANGELOG.md)，自动化回归及真实云验收见 [测试说明](tests/acceptance/README.md)。
+
+本版汇总 v0.2.2 之后的目录与存储管理、可安装存储插件、文本在线编辑、最近三份历史版本、又拍云 CDN 下载、公开分享错误页和流式全量备份；同时统一应用版本与 SQL 分发入口。存储插件和插件 SDK 保持各自版本。
+
+数据库安装和升级统一执行 `npm run db:deploy`，原有迁移历史保持不变。需要单一 SQL 文件进行空库评审或初始化时，使用 [合并结构 SQL 与操作说明](scripts/sql/README.md)；`npm run db:sql` 可重建，`npm run db:sql:check` 可检查产物是否与源码一致。**已有数据库不能重复导入结构快照，也不要删除数据库卷。**
 
 **账号模型：单一超级管理员**（`.env` 中 `ADMIN_USERNAME` / `ADMIN_PASSWORD`）。业务系统通过各项目的 AppID 与签名密钥对接，不提供多租户成员控制台。
 
@@ -45,16 +49,20 @@ npm run plugins:install
 | 能力 | 说明 |
 |------|------|
 | 项目 / 开放 API | AppID + HMAC 签名（v2 绑定 body hash） |
-| 上传 | 普通上传、分片上传、CDN 直传 presign |
+| 上传 | 普通上传、分片上传、本地安全副本与远端副本同步；插件 SDK 提供签名直传能力，宿主直传业务入口保持禁用 |
 | 分享 | 文件 / 文件夹分享（密码、IP、水印、次数、过期、自定义路径） |
+| 分享异常 | 过期、失效、密码与访问限制显示统一公开错误页，支持重新验证 |
+| 文件编辑与历史 | 文本在线预览/编辑、并发版本检查；保留最近三份历史版本并保护仍被引用的对象 |
+| 存储管理 | 全局配置绑定项目、容量/文件数限制、远端文件同步、插件独立安装与升级 |
 | 公开库 | `/library/:slug` |
 | 检索 | Meilisearch（可选）+ SQL 回退 |
 | 媒体 | 图片变换/缩略图；视频封面；可选 HLS/转码（Docker API 镜像含 ffmpeg） |
 | Office 预览 | 配置 `OFFICE_PREVIEW_BASE_URL`（如 KKFileView） |
 | 运维 | 配额、通知、Webhook、生命周期、访问热点、审计日志 |
+| 回收与任务 | 按保留期自动清理回收站；删除失败保留记录供重试，迁移/删除任务跟踪实际执行状态 |
 | 下载统计 | 每次下载记录文件、来源、IP、字节数；按日/来源/文件汇总，控制台可查 |
 | WebDAV | 每个项目独立账号密码；英文／数字自定义地址或随机地址，兼容 `/api/dav/{projectId}`，支持 PROPFIND / GET / PUT / MKCOL / DELETE / MOVE / COPY |
-| 备份 | 控制台一键全量备份（全部数据表 + 可选本地文件实体），可下载 / 恢复（merge、replace）/ 删除 |
+| 备份 | 流式导出全量数据表、可选本地实体和插件包；可选择远端目的地及是否保留本地包，支持下载 / 恢复（merge、replace）/ 删除；阿里云盘可通过独立备份插件使用 |
 
 ---
 
@@ -134,7 +142,7 @@ docker compose --profile full up -d --build
 首次启动会自动：
 
 1. 启动 MySQL / Redis / Meilisearch  
-2. 构建并启动 API（执行 **单次** 库初始化迁移 `20260719000000_init`、确保管理员账号）  
+2. 构建并启动 API（使用 `prisma migrate deploy` 按顺序执行全部尚未应用的迁移，确保管理员账号）
 3. 启动 Web（Nginx 反代 `/api`，并按 `ADMIN_LOGIN_PATH` 生成 `runtime-config.js`）
 
 查看状态：

@@ -1,5 +1,5 @@
 /* UFM shell service worker: shell + offline page only; never cache /api. */
-const CACHE = 'ufm-shell-v2';
+const CACHE = 'ufm-shell-v0.3.0';
 const PRECACHE = [
   '/',
   '/offline.html',

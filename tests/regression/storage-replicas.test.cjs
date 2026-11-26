@@ -59,7 +59,8 @@ function fixture() {
       for(const order of Array.isArray(orderBy)?orderBy:orderBy?[orderBy]:[])for(const[key,direction]of Object.entries(order)){if(a[key]<b[key])return direction==='asc'?-1:1;if(a[key]>b[key])return direction==='asc'?1:-1;}return 0;
     }).slice(0,take),findFirst:async({where})=>tasks.find(t=>matches(t,where))||null,findUnique:async({where})=>tasks.find(t=>matches(t,where))||null, create:async({data})=>{const t={id:`task${tasks.length}`,leaseOwner:null,leaseUntil:null,createdAt:new Date(),updatedAt:new Date(),...data};tasks.push(t);return t;},updateMany:async({where,data})=>{const found=tasks.filter(t=>matches(t,where));for(const t of found)Object.assign(t,data,{updatedAt:new Date()});return{count:found.length};}},
     $queryRaw:async()=>[],
-    managedFile: { findMany: async () => [], findFirst: async ({where}) => ({id:where.id,status:'ACTIVE'}) },
+    managedFile: { findMany: async () => [], findFirst: async ({where}) => ({id:where.id,status:'ACTIVE'}),
+      findUnique: async ({where}) => ({id:where.id,projectId:'p',storageKey:'p/object',status:'ACTIVE'}) },
     fileVersion: { findFirst: async () => null },
     fileDerivative: { findFirst: async () => null, findMany: async () => [] },
     $transaction: async fn => fn(db),
@@ -213,7 +214,7 @@ test('worker uploads and confirms a backup with metadata without reading cloud b
 
 test('manual copy and inspection confirm backup metadata without cloud content reads', async () => {
   const f = backupFixture(), service = replicas(f); row(f, 'local'); f.objects.set('local:p/object', bytes);
-  const file = { projectId: 'p', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: 'test' };
+  const file = { id: 'f', projectId: 'p', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: 'test' };
   await service.copyToConfig(file, 'cloud-a');
   const target = f.records.find(r => r.configId === 'cloud-a'); assert.equal(target.status, 'READY');
   await service.inspectProject('p'); assert.equal(target.status, 'READY'); assert.ok(!f.reads.includes('cloud-a'));
@@ -225,7 +226,7 @@ test('manual cloud copy includes the current database project name and file fold
   const f = backupFixture(); row(f, 'local'); f.objects.set('local:p/object', bytes);
   f.db.managedFile.findFirst = async () => ({ projectId: 'p', storageKey: 'p/object', folderPath: '原始资料/年度' });
   f.db.project.findFirst = async () => ({ id: 'p', name: '项目改名后' });
-  await replicas(f).copyToConfig({ projectId: 'p', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: '原始资料.txt' }, 'cloud-a');
+  await replicas(f).copyToConfig({ id: 'f', projectId: 'p', storageKey: 'p/object', size: BigInt(bytes.length), checksum: hash(bytes), mimeType: 'text/plain', originalName: '原始资料.txt' }, 'cloud-a');
   assert.deepEqual(f.uploadContexts, [{ configId: 'cloud-a', project: { id: 'p', name: '项目改名后' }, folderPath: '原始资料/年度' }]);
 });
 
@@ -826,4 +827,44 @@ test('HLS manifest recovery still verifies indexed bytes and refuses a backup-on
     await replicas(f).runBatch('verify-hls-origin');
     assert.equal(target.status, backupOnly ? 'MISSING' : 'FAILED'); assert.deepEqual(f.metadataUploads, []);
   }
+});
+
+test('download falls back to verified local bytes when cloud rows exist but local index is missing', async () => {
+  const f=fixture();f.configs[1].enabled=false;row(f,'cloud-a');f.objects.set('local:p/object',bytes);
+  const target=await replicas(f).getDownloadTargetForKey({id:'f',projectId:'p',storageKey:'p/object',mimeType:'text/plain',size:BigInt(bytes.length),checksum:hash(bytes),cdnConfig:f.configs[1]},'p/object');
+  assert.deepEqual(await collect(target),bytes);assert.equal(target.storageSource.selected.configId,'local');
+  assert.equal(f.records.find(r=>r.configId==='local').status,'READY');
+});
+
+test('storage description follows verified enabled bound clouds and then local without reading bytes', async () => {
+  const f=fixture();const file={id:'f',projectId:'p',storageKey:'p/object',cdnConfig:f.configs[1]};
+  for(const id of ['cloud-a','cloud-b','local'])row(f,id).verifiedAt=new Date();
+  const service=replicas(f);f.registry.adapter=()=>{throw Error('listing must not touch object bytes')};
+  assert.equal((await service.describeDownloadStorages([file])).get('f').id,'cloud-a');
+  f.configs[1].enabled=false;assert.equal((await service.describeDownloadStorages([file])).get('f').id,'cloud-b');
+  f.configs[2].unbound=true;assert.equal((await service.describeDownloadStorages([file])).get('f').id,'local');
+  assert.equal(file.cdnConfig.id,'cloud-a','immutable head remains unchanged');
+});
+
+test('storage description excludes unverified backups and frozen deletion keys', async () => {
+  const f=backupFixture();const file={id:'f',projectId:'p',storageKey:'p/object'};
+  row(f,'cloud-a').verifiedAt=new Date();row(f,'cloud-b');row(f,'local').verifiedAt=new Date();
+  const service=replicas(f);assert.equal((await service.describeDownloadStorages([file])).get('f').id,'local');
+  f.records[0].status='DELETING';assert.equal((await service.describeDownloadStorages([file])).get('f'),null);
+});
+
+test('migration copy leases its replica while provider upload is in flight',async()=>{
+ const f=fixture();row(f,'local');f.objects.set('local:p/object',bytes);const base=f.registry.adapter;
+ f.db.managedFile.findUnique=async()=>({id:'f',projectId:'p',storageKey:'p/object',status:'ACTIVE'});
+ f.registry.adapter=provider=>{const adapter=base(provider),upload=adapter.upload;return {...adapter,upload:async(c,p)=>{const target=f.records.find(r=>r.configId===c.id);assert.ok(target?.leaseOwner);assert.ok(target.leaseUntil>new Date());return upload(c,p)}}};
+ await replicas(f).copyToConfig({id:'f',projectId:'p',storageKey:'p/object',mimeType:'text/plain',size:BigInt(bytes.length),checksum:hash(bytes)},'cloud-a');
+ const target=f.records.find(r=>r.configId==='cloud-a');assert.equal(target.status,'READY');assert.equal(target.leaseOwner,null);
+});
+
+test('migration copy never recreates a DELETING replica after losing its lease',async()=>{
+ const f=fixture();row(f,'local');const target=row(f,'cloud-a','PENDING');f.objects.set('local:p/object',bytes);const base=f.registry.adapter;
+ f.db.managedFile.findUnique=async()=>({id:'f',projectId:'p',storageKey:'p/object',status:'ACTIVE'});
+ f.registry.adapter=provider=>{const adapter=base(provider),upload=adapter.upload;return {...adapter,upload:async(c,p)=>{const result=await upload(c,p);target.status='DELETING';target.leaseOwner=null;return result}}};
+ await assert.rejects(replicas(f).copyToConfig({id:'f',projectId:'p',storageKey:'p/object',mimeType:'text/plain',size:BigInt(bytes.length),checksum:hash(bytes)},'cloud-a'),e=>e.getStatus?.()===409);
+ assert.equal(target.status,'DELETING');
 });

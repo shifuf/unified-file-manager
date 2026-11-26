@@ -63,6 +63,7 @@
         <div class="admin-page-frame">
           <router-view />
         </div>
+        <SiteFooter />
       </el-main>
       <el-button
         v-show="mainScrollTop > 240"
@@ -297,6 +298,7 @@ import {
 } from '@/api/modules';
 import { useAuthStore } from '@/stores/auth';
 import { copyText } from '@/utils/io';
+import SiteFooter from '@/components/SiteFooter.vue';
 
 import AdminNavigation from './AdminNavigation.vue';
 import AdminNotifications from './AdminNotifications.vue';
@@ -699,6 +701,8 @@ onBeforeUnmount(() => {
 }
 
 .admin-main {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -710,6 +714,7 @@ onBeforeUnmount(() => {
 }
 
 .admin-page-frame {
+  flex: 1 0 auto;
   container: admin-page / inline-size;
   width: 100%;
   max-width: 1600px;

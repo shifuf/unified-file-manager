@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CdnProvider, type CdnConfig, type Prisma } from '@prisma/client';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -178,7 +178,48 @@ export class ReplicaService {
         } };
       } catch { /* continue to an explicit unavailable-object response */ }
     }
+    // Legacy imports can have cloud indexes without a LOCAL row. Verify the
+    // safety copy before declaring the object unavailable, then repair its index.
+    if (!rows.some(row => row.config?.provider === CdnProvider.LOCAL)) {
+      try {
+        const local = await this.getLocalStorage(file.projectId);
+        const current = storageKey === normalizeKey(file.storageKey);
+        const reference = rows.find(row => row.checksum);
+        const object = await this.readVerified(local, storageKey, current ? file.size ?? reference?.size : reference?.size,
+          current ? file.checksum ?? reference?.checksum : reference?.checksum);
+        await this.recoverRead(file, local, storageKey, object);
+        const selected = storageIdentity(local);
+        return { ...await this.verifiedDownloadTarget(local, storageKey, object, range, file.mimeType, options, expiresSeconds),
+          storageSource: { strategy: 'CLOUD_PRIORITY', selected, attempts: [...attempts, { ...selected, outcome: 'SELECTED' }] } };
+      } catch { /* retain an explicit unavailable response if no verified copy exists */ }
+    }
     throw new NotFoundException('文件存储副本均不可读取，文件可能缺失或损坏。');
+  }
+
+  /** Metadata-only forecast of the same read policy; listing shares must never
+   * download every object or expose the original, possibly retired, source. */
+  async describeDownloadStorages(files: StorageFileInput[]): Promise<Map<string, CdnConfig | null>> {
+    const result = new Map<string, CdnConfig | null>();
+    if (!files.length) return result;
+    const projects = [...new Set(files.map(file => file.projectId))];
+    const allowed = new Map(await Promise.all(projects.map(async id => [id, await this.boundCloudIds(id)] as const)));
+    const rows = await this.table().findMany({ where: { OR: files.map(file => ({ projectId: file.projectId, storageKey: normalizeKey(file.storageKey) })) }, include: { config: true } });
+    const local = await this.prisma.cdnConfig.findFirst({ where: { enabled: true, provider: CdnProvider.LOCAL, projectId: null }, orderBy: [{ priority: 'asc' }, { id: 'asc' }] });
+    for (const file of files) {
+      const indexed = rows.filter(row => row.projectId === file.projectId && row.storageKey === normalizeKey(file.storageKey));
+      if (indexed.some(row => row.status === 'DELETING') || (file.status === 'RECYCLED' && file.purgeAt?.getTime() === 0)) {
+        result.set(file.id, null); continue;
+      }
+      const eligible = indexed.filter(row => row.config && row.status === 'READY' && row.verifiedAt && !this.isBackupOnly(row.config.provider)
+        && (row.config.provider === CdnProvider.LOCAL || (row.config.enabled && allowed.get(file.projectId)?.has(row.configId))))
+        .sort((a, b) => Number(a.config!.provider === CdnProvider.LOCAL) - Number(b.config!.provider === CdnProvider.LOCAL)
+          || a.config!.priority - b.config!.priority || a.configId.localeCompare(b.configId));
+      const origin = file.cdnConfig;
+      const legacy = !indexed.length && origin && !this.isBackupOnly(origin.provider)
+        && (origin.provider === CdnProvider.LOCAL || (origin.enabled && allowed.get(file.projectId)?.has(origin.id))) ? origin : null;
+      result.set(file.id, eligible[0]?.config ?? legacy ?? local ?? null);
+    }
+    return result;
   }
 
   async verifiedDownloadTarget(config: RuntimeCdnConfig, key: string, object: VerifiedObject, range: StorageByteRange | undefined,
@@ -465,7 +506,7 @@ export class ReplicaService {
     const attempts: VerifiedReadAttempt[] = [];
     // Only a known digest can certify CDN bytes. Keep origin reads for legacy
     // objects without a checksum and for adapters that expose no CDN candidate.
-    const tryCdn = Boolean(options.allowCdn && checksum && adapter.getCdnDownloadTarget);
+    const tryCdn = Boolean(options.allowCdn && checksum && typeof adapter.getCdnDownloadTarget === 'function');
     for (let attempt = 0; attempt < (tryCdn ? 2 : 1); attempt++) {
       const ticket = (attempt === 0 ? reservation : undefined) ?? await this.limits.reserveRead(config, size);
       let route: 'CDN' | 'ORIGIN' = tryCdn && attempt === 0 ? 'CDN' : 'ORIGIN';
@@ -555,24 +596,49 @@ export class ReplicaService {
 
   async copyToConfig(file: StorageFileInput, targetConfigId: string): Promise<StorageUploadResult> {
     const target = await this.prisma.cdnConfig.findFirst({ where: { id: targetConfigId } });
-    if (!target) throw new NotFoundException('目标存储配置不存在。');
-    const downloaded = await this.getDownloadTargetForKey(file, file.storageKey);
-    const object = await spoolVerifiedStream(downloaded.stream!, file.size, file.checksum);
+    if (!target?.enabled) throw new NotFoundException('目标存储配置不存在或已停用。');
+    const owner = `copy:${randomUUID()}`;
+    const claimed = await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM Project WHERE id = ${file.projectId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM ManagedFile WHERE id = ${file.id} FOR UPDATE`;
+      const head = await tx.managedFile.findUnique({ where: { id: file.id } });
+      if (!head || head.projectId !== file.projectId || head.storageKey !== file.storageKey || head.status !== 'ACTIVE') {
+        throw new ConflictException('文件内容或状态已变化，请刷新后重试迁移。');
+      }
+      await tx.$queryRaw`SELECT id FROM StorageReplica WHERE projectId = ${file.projectId} AND storageKey = ${file.storageKey} FOR UPDATE`;
+      const table = this.table(tx);
+      if (await table.findFirst({ where: { projectId: file.projectId, storageKey: file.storageKey,
+        OR: [{ status: 'DELETING' }, { leaseUntil: { gt: new Date() } }] } })) {
+        throw new ConflictException('文件正在删除或同步，请稍后重试迁移。');
+      }
+      return table.upsert({ where: { projectId_storageKey_configId: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id } },
+        create: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id, size: BigInt(file.size ?? 0),
+          checksum: file.checksum ?? null, status: 'PENDING', leaseOwner: owner, leaseUntil: new Date(Date.now() + LEASE_MS) },
+        update: { leaseOwner: owner, leaseUntil: new Date(Date.now() + LEASE_MS) },
+      });
+    });
+    const heartbeat = setInterval(() => { void this.renewLease(claimed.id, owner); }, 30_000);
+    heartbeat.unref?.();
+    let object: VerifiedObject | undefined;
     let reservation: UploadReservation | undefined;
     try {
+      const downloaded = await this.getDownloadTargetForKey(file, file.storageKey);
+      object = await spoolVerifiedStream(downloaded.stream!, file.size, file.checksum);
       const metadata = await this.metadataForReplica(file);
       reservation = await this.uploadDisk(this.runtime(target), file.storageKey, object, file.mimeType, file.originalName, metadata);
       await this.confirmStoredObject(this.runtime(target), file.storageKey, object.size, object.checksum, reservation.verification);
       await this.limits.finishUpload(reservation, 'PRESENT');
-      await this.table().upsert({ where: { projectId_storageKey_configId: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id } },
-        create: { projectId: file.projectId, storageKey: file.storageKey, configId: target.id, size: BigInt(object.size), checksum: object.checksum, status: 'READY', verifiedAt: new Date() },
-        update: { status: 'READY', checksum: object.checksum, verifiedAt: new Date(), lastError: null },
-      });
+      const published = await this.table().updateMany({ where: { id: claimed.id, leaseOwner: owner,
+        leaseUntil: { gt: new Date() }, status: { not: 'DELETING' } }, data: { size: BigInt(object.size), status: 'READY',
+        checksum: object.checksum, verifiedAt: new Date(), lastError: null, leaseOwner: null, leaseUntil: null } });
+      if (published.count !== 1) throw new ConflictException('迁移租约已失效，未覆盖删除状态，请检查副本后重试。');
       return { cdnConfigId: target.id, storageKey: file.storageKey, publicUrl: null };
     } catch (error) {
       if (reservation) await this.limits.reconcileFailedUpload(reservation, this.runtime(target), file.storageKey);
+      await this.table().updateMany({ where: { id: claimed.id, leaseOwner: owner, status: { not: 'DELETING' } },
+        data: { status: 'FAILED', verifiedAt: null, lastError: safeError(error), nextAttemptAt: new Date(Date.now() + 30_000), leaseOwner: null, leaseUntil: null } });
       throw error;
-    } finally { await object.cleanup(); }
+    } finally { clearInterval(heartbeat); await object?.cleanup(); }
   }
 
   async listProject(projectId: string, cursor?: string, requestedLimit = 100,

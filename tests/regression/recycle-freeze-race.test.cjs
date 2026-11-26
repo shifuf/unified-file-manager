@@ -81,7 +81,7 @@ function fixture({ lifecycle = false } = {}) {
   });
   return { files, stale, provider, objects, audits, events,
     dav: new WebdavFileService(db, storage, {}, files, eventBus),
-    lifecycle: new LifecycleService(db, access, audit, eventBus),
+    lifecycle: new LifecycleService(db, access, audit, eventBus, { getRecycleRetentionDays: async () => 30 }),
     head: () => head, change: data => { head = { ...head, ...data }; },
     fail: () => { failProvider = true; }, recover: () => { failProvider = false; } };
 }

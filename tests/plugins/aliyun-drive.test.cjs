@@ -77,6 +77,8 @@ function fakeProvider(downloadDomain = 'download-fixture.aliyuncs.com', uploadDo
       moves.push({ ...body }); item.parent_file_id = body.to_parent_file_id; return json(item);
     }
     if (url.pathname === '/v2/file/get') return json(item);
+    if (url.pathname === '/v2/file/list_uploaded_parts') return json({ file_id: body.file_id, upload_id: body.upload_id,
+      uploaded_parts: item.bytes?.length ? [{ part_number: 1, part_size: item.bytes.length }] : [], next_part_number_marker: 0 });
     if (url.pathname === '/v2/file/complete') { item.status = 'available'; return json(item); }
     if (url.pathname === '/v2/file/get_download_url') return json({ url: `https://${downloadDomain}/${body.file_id}` });
     throw new Error(`unexpected route ${url.pathname}`);

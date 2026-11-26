@@ -1,0 +1,62 @@
+{
+  "formatVersion": 1,
+  "applicationVersion": "0.3.0",
+  "prismaVersion": "6.19.3",
+  "sourceLineEndings": "LF",
+  "schemaSha256": "723df8c99822ec8c1e08ff628aed484df356aff99b8d794e2997c5f9522cc448",
+  "sqlSha256": "d3901e57b9f018c02dc08901a05cd18e704af5b60bd227aaf0d4d58546054c79",
+  "migrations": [
+    {
+      "name": "20260719000000_init",
+      "sha256": "55ee3c21449fd22ac903758452724bc6aad1281a2fe9ea73937bf3ed94aee300"
+    },
+    {
+      "name": "20260720000000_webdav_and_download_stats",
+      "sha256": "14d330bc15bcbb2af42135a98c2eb23544aa57af2d4d078f537d13f6c3ebf1f7"
+    },
+    {
+      "name": "20260721000000_backup_scopes",
+      "sha256": "f6d1042e90101cbe95e95bcb20e2287c5ee93870712bcd034f3d371897927438"
+    },
+    {
+      "name": "20261027000000_storage_quota_policy",
+      "sha256": "5730523fe3aed06f4fe54b248df0a0f47dbaea966be122c9cc957f73dfb7152f"
+    },
+    {
+      "name": "20261027010000_storage_migration_worker",
+      "sha256": "ef1408fabc3528f6f59e773e24546cf9c81ad0c8f172caae2a55ad17f70231ad"
+    },
+    {
+      "name": "20261113000000_global_storage_bindings",
+      "sha256": "2881b5ddac5dbd6fb0db256df5421bea5cd2f28757b09928facc13be38d8104e"
+    },
+    {
+      "name": "20261113010000_backfill_local_fallback",
+      "sha256": "4272e009e2a8cfb77bb268ef356a1ae9fcbfbfffdcc2fd9ed5f1a408f165d1b5"
+    },
+    {
+      "name": "20261113020000_storage_replicas_and_share_sessions",
+      "sha256": "8f414b3773771bd36c48b9d67186d1631235f025e8685b5d5e76c28fdeec4c2c"
+    },
+    {
+      "name": "20261114000000_webdav_custom_slug",
+      "sha256": "6d6689e2116cafb1b284e6f2cb76c88b12eb1138ed3ed7e148419e634b80bb56"
+    },
+    {
+      "name": "20261114010000_optional_storage_limits",
+      "sha256": "71ecf0309f43700f90ac784e0cb78786352d68ddc1b19db61e80083b78b294ea"
+    },
+    {
+      "name": "20261114020000_storage_usage_baseline",
+      "sha256": "96f9b945386bf5cb7ef750bd1af965f6b1095da194b527aab1622807ac018de4"
+    },
+    {
+      "name": "20261116000000_storage_plugins",
+      "sha256": "51a6113ed0240fdb28f481ca5f9555e88c4a73c6eef0869bd19de9d6696989b0"
+    },
+    {
+      "name": "20261118000000_backup_destination",
+      "sha256": "d486d18b94c6e48034f0b54e8e9287cd3160bd945df4f43cedba0a583dcf7a89"
+    }
+  ]
+}

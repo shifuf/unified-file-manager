@@ -116,12 +116,9 @@
       </el-form>
       </template>
 
-      <footer v-if="brand.footerText || brand.showPoweredBy" class="share-footer">
-        <div v-if="brand.footerText">{{ brand.footerText }}</div>
-        <div v-if="brand.showPoweredBy" class="powered-by">由统一文件管理提供</div>
-      </footer>
     </section>
     </div>
+    <SiteFooter :text="brand.footerText" :show-brand="brand.showPoweredBy" :site-name="siteName" />
   </main>
 </template>
 
@@ -133,6 +130,7 @@ import { useRoute } from 'vue-router';
 import { publicShareApi } from '@/api/modules';
 import ShareBrandHeader from '@/components/ShareBrandHeader.vue';
 import SharePageState from '@/components/SharePageState.vue';
+import SiteFooter from '@/components/SiteFooter.vue';
 import type { FileCategory, PublicShareInfo, SharePageBrand } from '@/types';
 import { DEFAULT_SHARE_BRAND as DEFAULT_BRAND, getPublicShareFailure, getShareSiteName, readPublicShareMessage } from '@/utils/public-share';
 import type { PublicShareFailure } from '@/utils/public-share';
@@ -620,21 +618,6 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
-}
-
-.share-footer {
-  margin-top: 20px;
-  padding-top: 14px;
-  border-top: 1px solid #e2e8f0;
-  color: #94a3b8;
-  font-size: 12px;
-  line-height: 1.5;
-  text-align: center;
-}
-
-.powered-by {
-  margin-top: 4px;
-  opacity: 0.85;
 }
 
 .muted {

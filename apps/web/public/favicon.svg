@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="UFM">
-  <rect width="128" height="128" rx="28" fill="#2563eb"/>
-  <path d="M34 36h20v56c0 12 8 20 22 20s22-8 22-20V36h20v56c0 24-18 40-42 40S34 116 34 92V36z" fill="#fff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="统一文件管理：多存储文件夹">
+  <rect width="64" height="64" rx="14" fill="#2563eb"/>
+  <path d="M12 19a4 4 0 0 1 4-4h13l6 7h13a4 4 0 0 1 4 4v21a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4Z" fill="#fff"/>
+  <path d="M23 33v6h18v-6M32 39v7" fill="none" stroke="#2563eb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

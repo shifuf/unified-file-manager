@@ -3,6 +3,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { FilesService } from '../files/files.service';
 
 import { LifecycleService } from '../lifecycle/lifecycle.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -19,22 +20,26 @@ import { PrismaService } from '../prisma/prisma.service';
 export class MaintenanceService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(MaintenanceService.name);
   private timer?: ReturnType<typeof setInterval>;
+  private startupTimer?: ReturnType<typeof setTimeout>;
+  private running = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly lifecycleService: LifecycleService,
+    private readonly filesService: FilesService,
   ) {}
 
   onModuleInit(): void {
     const minutes = Math.max(5, Number(this.configService.get<number>('MAINTENANCE_INTERVAL_MINUTES', 30)) || 30);
-    const startupTimer = setTimeout(() => void this.runCleanup(), 60 * 1000);
-    startupTimer.unref?.();
+    this.startupTimer = setTimeout(() => void this.runCleanup(), 60 * 1000);
+    this.startupTimer.unref?.();
     this.timer = setInterval(() => void this.runCleanup(), minutes * 60 * 1000);
     this.timer.unref?.();
   }
 
   onModuleDestroy(): void {
+    if (this.startupTimer) clearTimeout(this.startupTimer);
     if (this.timer) {
       clearInterval(this.timer);
     }
@@ -43,6 +48,8 @@ export class MaintenanceService implements OnModuleInit, OnModuleDestroy {
   async runCleanup(): Promise<{ nonces: number; refreshTokens: number; auditLogs: number; staleUploads: number }> {
     const now = new Date();
     const summary = { nonces: 0, refreshTokens: 0, auditLogs: 0, staleUploads: 0 };
+    if (this.running) return summary;
+    this.running = true;
 
     try {
       const nonces = await this.prisma.openApiNonce.deleteMany({ where: { expiresAt: { lte: now } } });
@@ -66,6 +73,10 @@ export class MaintenanceService implements OnModuleInit, OnModuleDestroy {
       } catch (error) {
         this.logger.warn(`生命周期策略执行失败：${error instanceof Error ? error.message : String(error)}`);
       }
+      try {
+        const recycled = await this.filesService.purgeExpiredRecycledFiles();
+        if (recycled.scanned) this.logger.log(`回收站到期清理：scanned=${recycled.scanned} purged=${recycled.purged} failed=${recycled.failed}`);
+      } catch { this.logger.warn('回收站到期清理失败，将在下次维护重试。'); }
 
       if (summary.nonces || summary.refreshTokens || summary.auditLogs || summary.staleUploads) {
         this.logger.log(
@@ -74,7 +85,7 @@ export class MaintenanceService implements OnModuleInit, OnModuleDestroy {
       }
     } catch (error) {
       this.logger.warn(`定时清理失败：${error instanceof Error ? error.message : String(error)}`);
-    }
+    } finally { this.running = false; }
 
     return summary;
   }

@@ -468,6 +468,11 @@ export class FilesController {
     return this.filesService.disableShareLink(shareId, user);
   }
 
+  @Delete('file-shares/:shareId/permanent')
+  deleteShareLink(@Param('shareId') shareId: string, @CurrentUser() user: RequestUser): ReturnType<FilesService['deleteShareLink']> {
+    return this.filesService.deleteShareLink(shareId, user);
+  }
+
   @Put('file-shares/:shareId')
   updateShareLink(
     @Param('shareId') shareId: string,

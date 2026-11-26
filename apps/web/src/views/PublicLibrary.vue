@@ -175,6 +175,8 @@ onMounted(reload);
 
 <style scoped>
 .library-page {
+  width: 100%;
+  min-width: 0;
   max-width: 1100px;
   margin: 0 auto;
   padding: 32px 20px 48px;
@@ -207,6 +209,7 @@ onMounted(reload);
 
 .library-toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 18px;
 }

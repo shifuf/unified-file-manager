@@ -12,6 +12,7 @@ import { DOMAIN_EVENTS } from '../events/domain-events';
 import { EventBusService } from '../events/event-bus.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProjectAccessService } from '../projects/project-access.service';
+import { SettingsService } from '../settings/settings.service';
 
 @Injectable()
 export class LifecycleService {
@@ -20,6 +21,7 @@ export class LifecycleService {
     private readonly projectAccessService: ProjectAccessService,
     private readonly auditService: AuditService,
     private readonly eventBus: EventBusService,
+    private readonly settingsService: SettingsService,
   ) {}
 
   async list(projectId: string, user: RequestUser) {
@@ -132,6 +134,7 @@ export class LifecycleService {
         : isUnderFolder(file.folderPath, policy.folderPath),
     );
 
+    const retentionDays = policy.action === 'PURGE' ? 0 : await this.settingsService.getRecycleRetentionDays();
     const now = new Date();
     let affected = 0;
     for (const file of matched) {
@@ -144,7 +147,7 @@ export class LifecycleService {
           status: FileStatus.RECYCLED,
           deletedAt: now,
           // Soft-mark for maintenance; provider I/O stays outside transactions.
-          purgeAt: policy.action === 'PURGE' ? now : new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+          purgeAt: new Date(now.getTime() + retentionDays * 24 * 60 * 60 * 1000),
         },
       });
       if (changed.count !== 1) continue;
